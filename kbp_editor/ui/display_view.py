@@ -1,0 +1,602 @@
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+from PySide6.QtCore import Qt, QRectF, Signal
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEvent
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollBar,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ..model import (
+    DEFAULT_GAP_THRESHOLD_CS,
+    DEFAULT_OPTIMIZED_LEAD_IN_CS,
+    KbpProject,
+    Line,
+)
+
+
+LABEL_COL_W = 220
+RULER_H = 28
+ROW_H = 28
+PAGE_GAP = 10
+HANDLE_HIT_PX = 8
+
+
+class _DisplayTimelineCanvas(QWidget):
+    """Interactive horizontal Display/Remove timeline canvas."""
+
+    playhead_scrubbed = Signal(float)
+    selection_changed = Signal(int, int)      # page_idx, line_idx
+    project_mutated = Signal(str)             # undo action description
+    viewport_changed = Signal(float, float)   # start_cs, span_cs
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.project: Optional[KbpProject] = None
+        self.playhead_cs: float = 0.0
+        self.selected_page: int = 0
+        self.selected_line: int = 0
+
+        self.px_per_cs: float = 0.25  # 25 px per second
+        self.scroll_x_cs: float = 0.0
+        self.scroll_y_px: int = 0
+
+        self.page_display_mode: bool = False
+        self.page_removal_mode: bool = False
+
+        self._rows: List[Tuple[int, int, int, Line]] = []
+        self._content_h: int = 0
+
+        self._drag_mode: Optional[str] = None  # "scrub", "start", "end", "pan"
+        self._drag_page: int = 0
+        self._drag_line: int = 0
+        self._drag_changed: bool = False
+        self._pan_start_x: float = 0.0
+        self._pan_start_scroll: float = 0.0
+
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_project(self, project: Optional[KbpProject]) -> None:
+        self.project = project
+        self._rebuild_rows()
+        self.update()
+
+    def _rebuild_rows(self) -> None:
+        self._rows.clear()
+        if not self.project:
+            self._content_h = 0
+            return
+        y = RULER_H + 6
+        for p_idx, page in enumerate(self.project.pages):
+            for l_idx, line in enumerate(page.lines):
+                self._rows.append((y, p_idx, l_idx, line))
+                y += ROW_H
+            y += PAGE_GAP
+        self._content_h = y
+
+    def view_span_cs(self) -> float:
+        return max(100.0, (self.width() - LABEL_COL_W) / max(1e-6, self.px_per_cs))
+
+    def _emit_viewport(self) -> None:
+        self.viewport_changed.emit(self.scroll_x_cs, self.view_span_cs())
+
+    def set_scroll_x_cs(self, cs: float) -> None:
+        self.scroll_x_cs = max(0.0, float(cs))
+        self._emit_viewport()
+        self.update()
+
+    def center_on_cs(self, cs: float) -> None:
+        self.set_scroll_x_cs(cs - self.view_span_cs() * 0.5)
+
+    def scroll_to_row(self, page_idx: int, line_idx: int) -> None:
+        for raw_y, p_idx, l_idx, line in self._rows:
+            if p_idx == page_idx and l_idx == line_idx:
+                mid_cs = (line.display_start + line.display_end) * 0.5
+                self.center_on_cs(mid_cs)
+                # Also ensure vertically visible
+                if raw_y - self.scroll_y_px < RULER_H or raw_y - self.scroll_y_px + ROW_H > self.height():
+                    self.scroll_y_px = max(0, raw_y - RULER_H - 60)
+                self.update()
+                return
+
+    def cs_to_x(self, cs: float) -> float:
+        return LABEL_COL_W + (cs - self.scroll_x_cs) * self.px_per_cs
+
+    def x_to_cs(self, x: float) -> int:
+        return max(0, int(round(self.scroll_x_cs + (x - LABEL_COL_W) / max(1e-6, self.px_per_cs))))
+
+    def x_to_cs_float(self, x: float) -> float:
+        return max(0.0, self.scroll_x_cs + (x - LABEL_COL_W) / max(1e-6, self.px_per_cs))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._emit_viewport()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        w = self.width()
+        h = self.height()
+        painter.fillRect(0, 0, w, h, QColor(24, 26, 31))
+
+        if not self.project:
+            painter.setPen(QColor(150, 155, 165))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Drag & drop a .kbp file anywhere to edit Display / Remove windows.")
+            return
+
+        self._paint_grid(painter, w, h)
+        self._paint_rows(painter, w, h)
+        self._paint_ruler(painter, w)
+        self._paint_playhead(painter, h)
+
+    def _paint_grid(self, painter: QPainter, w: int, h: int) -> None:
+        step_cs = 100
+        if self.px_per_cs < 0.08:
+            step_cs = 1000
+        elif self.px_per_cs < 0.2:
+            step_cs = 500
+        elif self.px_per_cs > 1.0:
+            step_cs = 50
+
+        start_cs = int(self.scroll_x_cs // step_cs) * step_cs
+        end_cs = self.x_to_cs(w) + step_cs
+        painter.setPen(QPen(QColor(42, 46, 54), 1))
+        for t in range(start_cs, end_cs + 1, step_cs):
+            x = int(self.cs_to_x(t))
+            if x >= LABEL_COL_W:
+                painter.drawLine(x, RULER_H, x, h)
+
+    def _paint_ruler(self, painter: QPainter, w: int) -> None:
+        painter.fillRect(0, 0, w, RULER_H, QColor(33, 37, 44))
+        painter.setPen(QColor(70, 75, 86))
+        painter.drawLine(0, RULER_H - 1, w, RULER_H - 1)
+        painter.drawLine(LABEL_COL_W, 0, LABEL_COL_W, self.height())
+
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.setPen(QColor(175, 182, 195))
+        painter.drawText(8, 0, LABEL_COL_W - 16, RULER_H, Qt.AlignmentFlag.AlignVCenter, "Page / Line (click to jump)")
+
+        step_cs = 500 if self.px_per_cs < 0.2 else (100 if self.px_per_cs < 1.0 else 50)
+        start_cs = int(self.scroll_x_cs // step_cs) * step_cs
+        end_cs = self.x_to_cs(w) + step_cs
+        for t in range(start_cs, end_cs + 1, step_cs):
+            x = int(self.cs_to_x(t))
+            if x >= LABEL_COL_W:
+                painter.setPen(QColor(95, 102, 115))
+                painter.drawLine(x, RULER_H - 7, x, RULER_H - 1)
+                sec = t / 100.0
+                lbl = f"{int(sec // 60)}:{sec % 60:04.1f}"
+                painter.setPen(QColor(185, 192, 205))
+                painter.drawText(x + 3, 2, 60, RULER_H - 6, Qt.AlignmentFlag.AlignVCenter, lbl)
+
+    def _paint_rows(self, painter: QPainter, w: int, h: int) -> None:
+        font = QFont("Segoe UI", 8)
+        painter.setFont(font)
+
+        for raw_y, p_idx, l_idx, line in self._rows:
+            y = raw_y - self.scroll_y_px
+            if y + ROW_H < RULER_H or y > h:
+                continue
+
+            is_selected = (p_idx == self.selected_page and l_idx == self.selected_line)
+            is_sel_page = (p_idx == self.selected_page)
+
+            if is_selected:
+                bg = QColor(44, 58, 78)
+            elif is_sel_page:
+                bg = QColor(32, 37, 46)
+            else:
+                bg = QColor(27, 30, 36) if p_idx % 2 == 0 else QColor(23, 25, 31)
+            painter.fillRect(0, y, w, ROW_H - 2, bg)
+
+            painter.save()
+            painter.setClipRect(0, y, LABEL_COL_W - 2, ROW_H)
+            prefix = f"P{p_idx + 1} L{l_idx + 1} [{line.style}] "
+            txt = prefix + line.full_text.strip()
+            painter.setPen(QColor(240, 244, 250) if is_selected else QColor(185, 192, 205))
+            painter.drawText(8, y, LABEL_COL_W - 14, ROW_H - 2, Qt.AlignmentFlag.AlignVCenter, txt)
+            painter.restore()
+
+            painter.save()
+            painter.setClipRect(LABEL_COL_W + 1, y, w - LABEL_COL_W, ROW_H)
+
+            x_disp_start = self.cs_to_x(line.display_start)
+            x_syl_start = self.cs_to_x(line.first_syl_start)
+            x_syl_end = self.cs_to_x(line.last_syl_end)
+            x_disp_end = self.cs_to_x(line.display_end)
+
+            bar_y = y + 4
+            bar_h = ROW_H - 10
+
+            if x_syl_start > x_disp_start:
+                lead_color = QColor(85, 130, 105) if (l_idx == 0 and self.project and self.project.is_optimized_lead_in_page(p_idx)) else QColor(108, 114, 126)
+                painter.fillRect(QRectF(x_disp_start, bar_y, x_syl_start - x_disp_start, bar_h), lead_color)
+
+            painter.fillRect(QRectF(x_syl_start, bar_y, max(2.0, x_syl_end - x_syl_start), bar_h), QColor(235, 132, 34))
+
+            if x_disp_end > x_syl_end:
+                painter.fillRect(QRectF(x_syl_end, bar_y, x_disp_end - x_syl_end, bar_h), QColor(108, 114, 126))
+
+            border_c = QColor(255, 255, 255) if is_selected else QColor(55, 60, 70)
+            painter.setPen(QPen(border_c, 1))
+            painter.drawRect(QRectF(x_disp_start, bar_y, max(2.0, x_disp_end - x_disp_start), bar_h))
+
+            painter.fillRect(QRectF(x_disp_start - 2, bar_y - 1, 4, bar_h + 2), QColor(120, 210, 255))
+            painter.fillRect(QRectF(x_disp_end - 2, bar_y - 1, 4, bar_h + 2), QColor(255, 190, 110))
+            painter.restore()
+
+    def _paint_playhead(self, painter: QPainter, h: int) -> None:
+        x = self.cs_to_x(self.playhead_cs)
+        if x >= LABEL_COL_W:
+            painter.setPen(QPen(QColor(255, 70, 90), 2))
+            painter.drawLine(int(round(x)), 0, int(round(x)), h)
+
+    def _hit_test(self, x: float, y: float) -> Tuple[Optional[str], int, int]:
+        if y < RULER_H and x >= LABEL_COL_W:
+            return ("scrub", self.selected_page, self.selected_line)
+        for raw_y, p_idx, l_idx, line in self._rows:
+            ry = raw_y - self.scroll_y_px
+            if ry <= y <= ry + ROW_H:
+                if x < LABEL_COL_W:
+                    return ("select", p_idx, l_idx)
+                x_s = self.cs_to_x(line.display_start)
+                x_e = self.cs_to_x(line.display_end)
+                if abs(x - x_s) <= HANDLE_HIT_PX:
+                    return ("start", p_idx, l_idx)
+                if abs(x - x_e) <= HANDLE_HIT_PX:
+                    return ("end", p_idx, l_idx)
+                return ("select_scrub", p_idx, l_idx)
+        return (None, self.selected_page, self.selected_line)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if not self.project:
+            return
+        pos = event.position()
+
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
+            self._drag_mode = "pan"
+            self._pan_start_x = pos.x()
+            self._pan_start_scroll = self.scroll_x_cs
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        hit, p_idx, l_idx = self._hit_test(pos.x(), pos.y())
+        if hit is None:
+            return
+
+        if hit in ("select", "select_scrub", "start", "end"):
+            self.selected_page = p_idx
+            self.selected_line = l_idx
+            self.selection_changed.emit(p_idx, l_idx)
+
+        if hit == "select":
+            # Clicking the left label immediately jumps the timeline to that line!
+            self.scroll_to_row(p_idx, l_idx)
+        elif hit in ("scrub", "select_scrub"):
+            self._drag_mode = "scrub"
+            cs = self.x_to_cs_float(pos.x())
+            self.playhead_cs = cs
+            self.playhead_scrubbed.emit(cs)
+            self.update()
+        elif hit in ("start", "end"):
+            self._drag_mode = hit
+            self._drag_page = p_idx
+            self._drag_line = l_idx
+            self._drag_changed = False
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if not self.project:
+            return
+        pos = event.position()
+
+        if self._drag_mode is None:
+            hit, _, _ = self._hit_test(pos.x(), pos.y())
+            if hit in ("start", "end"):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif hit == "select":
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+
+        if self._drag_mode == "pan":
+            dx = pos.x() - self._pan_start_x
+            self.set_scroll_x_cs(self._pan_start_scroll - dx / max(1e-6, self.px_per_cs))
+            return
+
+        if self._drag_mode == "scrub":
+            cs = self.x_to_cs_float(pos.x())
+            self.playhead_cs = cs
+            self.playhead_scrubbed.emit(cs)
+            self.update()
+            return
+
+        cs = self.x_to_cs(pos.x())
+        page = self.project.pages[self._drag_page]
+        line = page.lines[self._drag_line]
+
+        if self._drag_mode == "start":
+            if self.page_display_mode:
+                clamped = min(cs, page.first_syl_start)
+                for ln in page.lines:
+                    ln.display_start = max(0, min(clamped, ln.first_syl_start))
+            else:
+                line.display_start = max(0, min(cs, line.first_syl_start))
+            self._drag_changed = True
+            self.update()
+        elif self._drag_mode == "end":
+            if self.page_removal_mode:
+                clamped = max(cs, page.last_syl_end)
+                for ln in page.lines:
+                    ln.display_end = max(clamped, ln.last_syl_end)
+            else:
+                line.display_end = max(cs, line.last_syl_end)
+            self._drag_changed = True
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._drag_mode == "pan":
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif self._drag_mode in ("start", "end") and self._drag_changed:
+            kind = "Display Start" if self._drag_mode == "start" else "Display End"
+            scope = f"Page {self._drag_page + 1}" if (
+                (self._drag_mode == "start" and self.page_display_mode)
+                or (self._drag_mode == "end" and self.page_removal_mode)
+            ) else f"P{self._drag_page + 1} L{self._drag_line + 1}"
+            self.project_mutated.emit(f"Adjust {kind} ({scope})")
+        self._drag_mode = None
+        self._drag_changed = False
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            factor = 1.2 if delta > 0 else 1.0 / 1.2
+            mouse_cs = self.x_to_cs_float(event.position().x())
+            self.px_per_cs = max(0.03, min(4.0, self.px_per_cs * factor))
+            self.set_scroll_x_cs(mouse_cs - (event.position().x() - LABEL_COL_W) / self.px_per_cs)
+        elif event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            step = -delta / max(0.05, self.px_per_cs) * 0.4
+            self.set_scroll_x_cs(self.scroll_x_cs + step)
+        else:
+            self.scroll_y_px = max(0, min(max(0, self._content_h - self.height() + 40), self.scroll_y_px - int(delta * 0.5)))
+            self.update()
+
+
+class DisplayRemoveView(QWidget):
+    """Display / Remove Window tab with Reset to Default & Optimized Windows controls."""
+
+    playhead_scrubbed = Signal(float)
+    selection_changed = Signal(int, int)
+    project_mutated = Signal(str)
+    viewport_changed = Signal(float, float)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.project: Optional[KbpProject] = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        bar1 = QHBoxLayout()
+        self._page_disp_cb = QCheckBox("Page Display")
+        self._page_disp_cb.setToolTip("Drag one left handle to move display_start for the entire page")
+        self._page_disp_cb.toggled.connect(self._on_modes_changed)
+        bar1.addWidget(self._page_disp_cb)
+
+        self._page_rem_cb = QCheckBox("Page Removal")
+        self._page_rem_cb.setToolTip("Drag one right handle to move display_end for the entire page")
+        self._page_rem_cb.toggled.connect(self._on_modes_changed)
+        bar1.addWidget(self._page_rem_cb)
+
+        self._follow_cb = QCheckBox("Follow Playhead")
+        self._follow_cb.setChecked(True)
+        bar1.addWidget(self._follow_cb)
+
+        bar1.addSpacing(12)
+        btn_snap_s = QPushButton("Snap Start → Playhead")
+        btn_snap_s.clicked.connect(self._snap_start_to_playhead)
+        bar1.addWidget(btn_snap_s)
+
+        btn_snap_e = QPushButton("Snap End → Playhead")
+        btn_snap_e.clicked.connect(self._snap_end_to_playhead)
+        bar1.addWidget(btn_snap_e)
+
+        btn_dup = QPushButton("Duplicate Page")
+        btn_dup.clicked.connect(self._duplicate_selected_page)
+        bar1.addWidget(btn_dup)
+        bar1.addStretch()
+
+        bar2 = QHBoxLayout()
+        btn_reset_page = QPushButton("Reset Page to Default")
+        btn_reset_page.clicked.connect(lambda: self._reset_windows(all_pages=False))
+        bar2.addWidget(btn_reset_page)
+
+        btn_reset_all = QPushButton("Reset All to Default")
+        btn_reset_all.clicked.connect(lambda: self._reset_windows(all_pages=True))
+        bar2.addWidget(btn_reset_all)
+
+        bar2.addSpacing(14)
+        bar2.addWidget(QLabel("➣➣➣ Lead-in (cs):"))
+        self._opt_lead_spin = QSpinBox()
+        self._opt_lead_spin.setRange(0, 300)
+        self._opt_lead_spin.setValue(DEFAULT_OPTIMIZED_LEAD_IN_CS)
+        self._opt_lead_spin.setFixedWidth(64)
+        bar2.addWidget(self._opt_lead_spin)
+
+        bar2.addWidget(QLabel("Gap ≥ (cs):"))
+        self._gap_spin = QSpinBox()
+        self._gap_spin.setRange(50, 2000)
+        self._gap_spin.setSingleStep(50)
+        self._gap_spin.setValue(DEFAULT_GAP_THRESHOLD_CS)
+        self._gap_spin.setFixedWidth(70)
+        bar2.addWidget(self._gap_spin)
+
+        btn_opt_page = QPushButton("Optimize Page")
+        btn_opt_page.clicked.connect(lambda: self._optimize_windows(all_pages=False))
+        bar2.addWidget(btn_opt_page)
+
+        btn_opt_all = QPushButton("Optimized Windows (All)")
+        btn_opt_all.setStyleSheet("background-color: #2d6a4f; color: white; font-weight: bold; padding: 4px 10px;")
+        btn_opt_all.clicked.connect(lambda: self._optimize_windows(all_pages=True))
+        bar2.addWidget(btn_opt_all)
+        bar2.addStretch()
+
+        self.canvas = _DisplayTimelineCanvas(self)
+        self.canvas.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
+        self.canvas.selection_changed.connect(self.selection_changed.emit)
+        self.canvas.project_mutated.connect(self.project_mutated.emit)
+        self.canvas.viewport_changed.connect(self._on_canvas_viewport)
+
+        self._hscroll = QScrollBar(Qt.Orientation.Horizontal, self)
+        self._hscroll.valueChanged.connect(self._on_hscroll)
+
+        root.addLayout(bar1)
+        root.addLayout(bar2)
+        root.addWidget(self.canvas, 1)
+        root.addWidget(self._hscroll)
+
+    def set_project(self, project: Optional[KbpProject], preserve_view: bool = False) -> None:
+        old_page = self.canvas.selected_page
+        old_line = self.canvas.selected_line
+        old_sx = self.canvas.scroll_x_cs
+        old_sy = self.canvas.scroll_y_px
+
+        self.project = project
+        self.canvas.set_project(project)
+        if project:
+            max_cs = max(1000, project.total_duration_cs + 500)
+            self._hscroll.blockSignals(True)
+            self._hscroll.setRange(0, max_cs)
+            self._hscroll.setPageStep(int(self.canvas.view_span_cs()))
+            if preserve_view:
+                p_idx = min(old_page, max(0, len(project.pages) - 1))
+                l_idx = min(old_line, max(0, len(project.pages[p_idx].lines) - 1)) if project.pages else 0
+                self.canvas.selected_page = p_idx
+                self.canvas.selected_line = l_idx
+                self.canvas.scroll_y_px = old_sy
+                self.canvas.set_scroll_x_cs(old_sx)
+                self._hscroll.setValue(int(old_sx))
+            self._hscroll.blockSignals(False)
+
+    def set_playhead_cs(self, cs: float, follow_if_playing: bool = False) -> None:
+        self.canvas.playhead_cs = cs
+        if follow_if_playing and self._follow_cb.isChecked():
+            span = self.canvas.view_span_cs()
+            if cs > self.canvas.scroll_x_cs + span * 0.85 or cs < self.canvas.scroll_x_cs:
+                self.canvas.set_scroll_x_cs(cs - span * 0.15)
+                return
+        self.canvas.update()
+
+    def set_selection(self, page_idx: int, line_idx: int, scroll_to: bool = False) -> None:
+        self.canvas.selected_page = page_idx
+        self.canvas.selected_line = line_idx
+        if scroll_to:
+            self.canvas.scroll_to_row(page_idx, line_idx)
+        else:
+            self.canvas.update()
+
+    def jump_to_cs(self, cs: float) -> None:
+        self.canvas.center_on_cs(cs)
+
+    def zoom(self, factor: float) -> None:
+        center_cs = self.canvas.scroll_x_cs + self.canvas.view_span_cs() * 0.5
+        self.canvas.px_per_cs = max(0.03, min(4.0, self.canvas.px_per_cs * factor))
+        self.canvas.center_on_cs(center_cs)
+
+    def _on_canvas_viewport(self, start_cs: float, span_cs: float) -> None:
+        self._hscroll.blockSignals(True)
+        self._hscroll.setPageStep(max(100, int(span_cs)))
+        self._hscroll.setValue(int(start_cs))
+        self._hscroll.blockSignals(False)
+        self.viewport_changed.emit(start_cs, span_cs)
+
+    def _on_modes_changed(self) -> None:
+        self.canvas.page_display_mode = self._page_disp_cb.isChecked()
+        self.canvas.page_removal_mode = self._page_rem_cb.isChecked()
+
+    def _on_hscroll(self, value: int) -> None:
+        self.canvas.set_scroll_x_cs(float(value))
+
+    def _snap_start_to_playhead(self) -> None:
+        if not self.project or not self.project.pages:
+            return
+        page = self.project.pages[self.canvas.selected_page]
+        cs = int(round(self.canvas.playhead_cs))
+        if self._page_disp_cb.isChecked():
+            for ln in page.lines:
+                ln.display_start = max(0, min(cs, ln.first_syl_start))
+            self.project_mutated.emit(f"Snap Page {self.canvas.selected_page + 1} Display Start")
+        else:
+            ln = page.lines[self.canvas.selected_line]
+            ln.display_start = max(0, min(cs, ln.first_syl_start))
+            self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display Start")
+        self.canvas.update()
+
+    def _snap_end_to_playhead(self) -> None:
+        if not self.project or not self.project.pages:
+            return
+        page = self.project.pages[self.canvas.selected_page]
+        cs = int(round(self.canvas.playhead_cs))
+        if self._page_rem_cb.isChecked():
+            for ln in page.lines:
+                ln.display_end = max(cs, ln.last_syl_end)
+            self.project_mutated.emit(f"Snap Page {self.canvas.selected_page + 1} Display End")
+        else:
+            ln = page.lines[self.canvas.selected_line]
+            ln.display_end = max(cs, ln.last_syl_end)
+            self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display End")
+        self.canvas.update()
+
+    def _duplicate_selected_page(self) -> None:
+        if not self.project or not self.project.pages:
+            return
+        p_num = self.canvas.selected_page + 1
+        self.project.duplicate_page(page_number=p_num)
+        self.canvas.set_project(self.project)
+        self.project_mutated.emit(f"Duplicate Page {p_num}")
+
+    def _reset_windows(self, all_pages: bool) -> None:
+        if not self.project or not self.project.pages:
+            return
+        if all_pages:
+            self.project.reset_windows()
+            self.project_mutated.emit("Reset All Windows to Default")
+        else:
+            p_idx = self.canvas.selected_page
+            self.project.reset_windows(page_indices=[p_idx])
+            self.project_mutated.emit(f"Reset Page {p_idx + 1} Windows to Default")
+        self.canvas.update()
+
+    def _optimize_windows(self, all_pages: bool) -> None:
+        if not self.project or not self.project.pages:
+            return
+        opt_lead = self._opt_lead_spin.value()
+        gap_thr = self._gap_spin.value()
+        if all_pages:
+            self.project.optimize_windows(
+                optimized_lead_in_cs=opt_lead,
+                gap_threshold_cs=gap_thr,
+            )
+            self.project_mutated.emit("Apply Optimized Windows (All)")
+        else:
+            p_idx = self.canvas.selected_page
+            self.project.optimize_windows(
+                page_indices=[p_idx],
+                optimized_lead_in_cs=opt_lead,
+                gap_threshold_cs=gap_thr,
+            )
+            self.project_mutated.emit(f"Apply Optimized Windows (Page {p_idx + 1})")
+        self.canvas.update()
