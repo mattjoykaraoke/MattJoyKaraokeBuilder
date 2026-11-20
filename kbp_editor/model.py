@@ -379,6 +379,28 @@ class Line:
             self.display_end = new_syls[-1].end + DEFAULT_CLEAR_HOLD_CS
         return True
 
+    def prepend_glyph(self, syl_idx: int, glyph_str: str, duration_cs: int) -> bool:
+        """
+        Insert a lead-in glyph syllable (e.g. '➣➣➣' = 135 cs, '••' = 68 cs) immediately
+        before `syl_idx`, matching Matt Joy Karaoke Creation Suite's exact timing rules.
+        """
+        if not (0 <= syl_idx < len(self.syllables)) or not glyph_str:
+            return False
+        word = self.syllables[syl_idx]
+        glyph_end = max(0, word.start - 1)
+        glyph_start = max(0, glyph_end - max(1, int(duration_cs)))
+        glyph_syl = Syllable(
+            text=glyph_str,
+            start=glyph_start,
+            end=glyph_end,
+            flag=word.flag,
+            pad=word.pad,
+        )
+        self.syllables.insert(syl_idx, glyph_syl)
+        if glyph_start < self.display_start:
+            self.display_start = glyph_start
+        return True
+
     def format_lines(self) -> List[str]:
         header = "/".join(
             [self.align, self.style, str(self.display_start), str(self.display_end), *self.extra_fields]

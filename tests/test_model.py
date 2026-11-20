@@ -286,3 +286,23 @@ def test_non_conforming_kbp_auto_repair_and_backup(tmp_path):
     bak2 = KbpProject.create_backup(broken_kbp)
     assert bak2.name == "broken.kbp.bak1"
     assert bak2.read_bytes() == orig_bytes
+
+
+def test_prepend_glyphs_matches_mjkcs():
+    proj = _sample_project()
+    line = proj.pages[0].lines[0]
+    # Syllable 1 is "Hel" starting at 1136
+    assert line.prepend_glyph(1, "➣➣➣", 135)
+    g1 = line.syllables[1]
+    assert g1.text == "➣➣➣"
+    assert g1.end == 1135
+    assert g1.start == 1000  # 1135 - 135
+
+    # Now prepend •• (68 cs) before syllable 0 (start 1000) -> 931..999, pulls display_start if needed
+    line.display_start = 980
+    assert line.prepend_glyph(0, "••", 68)
+    g2 = line.syllables[0]
+    assert g2.text == "••"
+    assert g2.end == 999
+    assert g2.start == 931
+    assert line.display_start == 931

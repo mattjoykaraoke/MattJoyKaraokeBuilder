@@ -125,6 +125,40 @@ class AddWordDialog(QDialog):
         return self._dur_spin.value()
 
 
+class EditSyllableDialog(QDialog):
+    """Dialog to edit a syllable's text while preserving or toggling its trailing word space."""
+
+    def __init__(self, syl: Syllable, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Syllable Text")
+        self.setMinimumWidth(340)
+
+        stripped = syl.text.rstrip(" ")
+        has_space = syl.text.endswith(" ")
+
+        layout = QVBoxLayout(self)
+        self._text_edit = QLineEdit(stripped)
+        self._text_edit.selectAll()
+        self._space_cb = QCheckBox("Trailing space (end of word)")
+        self._space_cb.setChecked(has_space)
+
+        form = QFormLayout()
+        form.addRow("Syllable Text:", self._text_edit)
+        form.addRow("", self._space_cb)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._text_edit.setFocus()
+
+    @property
+    def new_text(self) -> str:
+        base = self._text_edit.text().rstrip(" ")
+        return base + (" " if self._space_cb.isChecked() else "")
+
+
 class AddLineDialog(QDialog):
     """Dialog to insert a new synced line onto the current page."""
 
@@ -357,6 +391,7 @@ class _WipingTimelineCanvas(QWidget):
     line_clicked = Signal(int, int)          # page_idx, line_idx
     syllable_selected = Signal(int)
     delete_requested = Signal()
+    edit_syllable_requested = Signal()
     styles_changed = Signal()
     project_mutated = Signal(str)
     viewport_changed = Signal(float, float)  # start_cs, span_cs
@@ -723,7 +758,7 @@ class _WipingTimelineCanvas(QWidget):
 
         # Collect all lines whose syllables intersect the visible time window
         visible_lines: List[Tuple[int, int, Line]] = []
-        used_styles: Set[str] = {"A", "B"}
+        used_styles: Set[str] = {"A", "B", "C"}
         for p_idx, page in enumerate(self.project.pages):
             # Subtle vertical page marker + draggable Page badge (P1, P2, ...) at page start
             if page.lines:
@@ -755,6 +790,11 @@ class _WipingTimelineCanvas(QWidget):
                 if line.last_syl_end >= vis_start and line.first_syl_start <= vis_end:
                     visible_lines.append((p_idx, l_idx, line))
 
+        # Always keep one extra drop track below the highest used style (up to [F]) so lines can be dragged down further
+        highest = max(used_styles)
+        if "A" <= highest < "F":
+            used_styles.add(chr(ord(highest) + 1))
+
         style_order = sorted(used_styles)
 
         # Group visible lines by style track ([A], [B], [C], ...) and sub-pack overlaps within each track
@@ -777,9 +817,9 @@ class _WipingTimelineCanvas(QWidget):
             track_sublane_counts[st] = max(1, len(sub_ends))
 
         total_sublanes = sum(track_sublane_counts.values())
-        lane_h = min(100.0, max(62.0, (height - 8.0) / max(1, total_sublanes)))
-        label_h = 18.0
-        block_h = max(32.0, min(62.0, lane_h - label_h - 10.0))
+        lane_h = min(96.0, max(50.0, (height - 8.0) / max(1, total_sublanes)))
+        label_h = 16.0
+        block_h = max(28.0, min(58.0, lane_h - label_h - 8.0))
 
         # Paint dedicated track bands ([A], [B], [C], ...) with drag-drop hover highlight
         cur_y = float(top + 4)
@@ -1084,14 +1124,16 @@ class _WipingTimelineCanvas(QWidget):
                     delta = max(-min_start, ph_cs - max_end)
                     self._snapped_to_playhead = True
 
-            # Vertical track-switching: dragging full line(s) into [A], [B], [C]... band reassigns style live
+            # Vertical track-switching: dragging full line(s) into [A], [B], [C]...[F] band reassigns style live
             hover_style: Optional[str] = None
-            if self._drag_orig_lines:
+            if self._drag_orig_lines and self._rendered_style_bands:
                 py = pos.y()
                 for y_top, y_bot, st_letter in self._rendered_style_bands:
                     if y_top <= py <= y_bot:
                         hover_style = st_letter
                         break
+                if hover_style is None and py > self._rendered_style_bands[-1][1]:
+                    hover_style = self._rendered_style_bands[-1][2]
                 self._drag_hover_style = hover_style
                 if hover_style is not None:
                     for (p_i, l_i) in self._drag_orig_lines:
@@ -1209,9 +1251,15 @@ class _WipingTimelineCanvas(QWidget):
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position()
-            mode, _, _, _ = self._hit_test(pos.x(), pos.y())
+            mode, p_idx, l_idx, s_idx = self._hit_test(pos.x(), pos.y())
             if mode == "scrub":
                 self.clear_selection()
+                event.accept()
+                return
+            if mode in ("move", "left", "right") and p_idx >= 0 and s_idx >= 0:
+                self.select_single(p_idx, l_idx, s_idx)
+                self.line_clicked.emit(p_idx, l_idx)
+                self.edit_syllable_requested.emit()
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -1337,6 +1385,7 @@ class LyricsWipingView(QWidget):
         # Section 2: Words / Syllables
         sec_words, w_r1, w_r2 = _make_section("Words")
         _add_btn(w_r1, "Add…", "Insert word(s) or syllables into the selected synced line", self._add_word)
+        _add_btn(w_r1, "Edit…", "Edit the text of the selected syllable (or double-click a syllable)", self._edit_syl)
         _add_btn(w_r1, "Split…", "Split selected syllable (choose text & time)", self._split_syl)
         _add_btn(w_r1, "Join", "Join selected syllable with next syllable", self._join_syl)
         _add_btn(w_r1, "Delete", "Delete selected syllable(s) (Del)", self._delete_syl)
@@ -1374,6 +1423,23 @@ class LyricsWipingView(QWidget):
         _add_btn(p_r2, "Select", "Highlight all syllables on the current page to slide it", self._select_current_page)
         _add_btn(p_r2, "Duplicate", "Duplicate current page in-line on [B] / [C] track so you can drag it", self._duplicate_selected_page)
         ribbon_layout.addLayout(sec_pages)
+        ribbon_layout.addWidget(_make_divider())
+
+        # Section 5: Append Glyphs (matches MJKCS timings: ➣➣➣ = 135 cs, •• = 68 cs)
+        sec_glyphs, g_r1, g_r2 = _make_section("Append Glyphs")
+        _add_btn(
+            g_r1,
+            "➣➣➣",
+            "Insert ➣➣➣ lead-in glyph (135 cs) immediately before the selected syllable",
+            lambda: self._prepend_glyph("➣➣➣", 135),
+        )
+        _add_btn(
+            g_r2,
+            "••",
+            "Insert •• lead-in glyph (68 cs) immediately before the selected syllable",
+            lambda: self._prepend_glyph("••", 68),
+        )
+        ribbon_layout.addLayout(sec_glyphs)
         ribbon_layout.addStretch()
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -1405,6 +1471,7 @@ class LyricsWipingView(QWidget):
         self.canvas.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
         self.canvas.line_clicked.connect(self._on_canvas_line_clicked)
         self.canvas.delete_requested.connect(self._delete_syl)
+        self.canvas.edit_syllable_requested.connect(self._edit_syl)
         self.canvas.styles_changed.connect(self._on_canvas_styles_changed)
         self.canvas.project_mutated.connect(self.project_mutated.emit)
         self.canvas.viewport_changed.connect(self._on_canvas_viewport)
@@ -1754,6 +1821,24 @@ class LyricsWipingView(QWidget):
             self.canvas.update()
             self.project_mutated.emit(f"Snap Both Edges to Adjacent Lyrics (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
 
+    def _edit_syl(self) -> None:
+        line = self.canvas.current_line()
+        if not line:
+            return
+        idx = self.canvas.selected_syl
+        if not (0 <= idx < len(line.syllables)):
+            return
+        syl = line.syllables[idx]
+        dlg = EditSyllableDialog(syl, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            updated = dlg.new_text
+            if updated and updated != syl.text:
+                old = syl.text.strip()
+                syl.text = updated
+                self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+                self.canvas.update()
+                self.project_mutated.emit(f"Edit Syllable '{old}' → '{updated.strip()}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
+
     def _split_syl(self) -> None:
         line = self.canvas.current_line()
         if not line:
@@ -1784,6 +1869,19 @@ class LyricsWipingView(QWidget):
             self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
             self.canvas.update()
             self.project_mutated.emit(f"Join Syllables (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
+
+    def _prepend_glyph(self, glyph_str: str, duration_cs: int) -> None:
+        line = self.canvas.current_line()
+        if not line or not line.syllables:
+            return
+        idx = self.canvas.selected_syl
+        if not (0 <= idx < len(line.syllables)):
+            idx = 0
+        if line.prepend_glyph(idx, glyph_str, duration_cs):
+            self.canvas.select_single(self.canvas.page_idx, self.canvas.line_idx, idx)
+            self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+            self.canvas.update()
+            self.project_mutated.emit(f"Append Glyph '{glyph_str}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
 
     def _add_word(self) -> None:
         line = self.canvas.current_line()
