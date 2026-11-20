@@ -1331,6 +1331,7 @@ class LyricsWipingView(QWidget):
     project_mutated = Signal(str)
     play_line_requested = Signal(int, int)
     viewport_changed = Signal(float, float)
+    auto_reset_display_changed = Signal(bool)
 
     def __init__(self, audio: AudioEngine, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1530,12 +1531,17 @@ class LyricsWipingView(QWidget):
     def auto_reset_display_enabled(self) -> bool:
         return self._auto_reset_cb.isChecked()
 
+    def set_auto_reset_display(self, enabled: bool) -> None:
+        self._auto_reset_cb.blockSignals(True)
+        self._auto_reset_cb.setChecked(bool(enabled))
+        self._auto_reset_cb.blockSignals(False)
+        self.canvas.show_display_windows = not bool(enabled)
+        self.canvas.update()
+
     def _on_auto_reset_toggled(self, checked: bool) -> None:
         self.canvas.show_display_windows = not checked
-        if checked and self.project:
-            self.project.optimize_windows()
-            self.project_mutated.emit("Auto Reset Display (with ➣➣➣ Optimization)")
         self.canvas.update()
+        self.auto_reset_display_changed.emit(checked)
 
     def set_project(self, project: Optional[KbpProject], preserve_view: bool = False) -> None:
         old_page = self.canvas.page_idx

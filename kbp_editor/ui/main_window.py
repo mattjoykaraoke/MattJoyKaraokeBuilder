@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -92,6 +92,10 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self.setStatusBar(QStatusBar(self))
+        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
+        saved_auto_reset = self._settings.value("auto_reset_display", True, type=bool)
+        self.wiping_view.set_auto_reset_display(saved_auto_reset)
+        self.display_view.set_auto_reset_display(saved_auto_reset)
         self._build_menus()
         self._wire_signals()
         self._refresh_actions()
@@ -301,7 +305,7 @@ class MainWindow(QMainWindow):
 
         act_dup_page = QAction("&Duplicate Selected Page ([B]/[C])", self)
         act_dup_page.setShortcut(QKeySequence("Ctrl+D"))
-        act_dup_page.triggered.connect(self.display_view._duplicate_selected_page)
+        act_dup_page.triggered.connect(self.wiping_view._duplicate_selected_page)
         m_edit.addAction(act_dup_page)
 
         m_win = mb.addMenu("&Windows")
@@ -355,7 +359,18 @@ class MainWindow(QMainWindow):
         self.display_view.project_mutated.connect(self._on_project_mutated)
         self.wiping_view.project_mutated.connect(self._on_project_mutated)
 
+        self.display_view.auto_reset_display_changed.connect(self._on_auto_reset_display_changed)
+        self.wiping_view.auto_reset_display_changed.connect(self._on_auto_reset_display_changed)
+
         self.wiping_view.play_line_requested.connect(self.audio.play_range)
+
+    def _on_auto_reset_display_changed(self, enabled: bool) -> None:
+        self._settings.setValue("auto_reset_display", bool(enabled))
+        self.wiping_view.set_auto_reset_display(enabled)
+        self.display_view.set_auto_reset_display(enabled)
+        if enabled and self.project is not None:
+            self.project.optimize_windows()
+            self._on_project_mutated("Auto Reset Display (with ➣➣➣ Optimization)")
 
     def _on_waveform_loaded(self) -> None:
         self.wiping_view.canvas.invalidate_wave_cache()

@@ -23,10 +23,11 @@ from ..model import (
 )
 
 
-LABEL_COL_W = 220
+LABEL_COL_W = 240
 RULER_H = 28
-ROW_H = 28
-PAGE_GAP = 10
+ROW_H = 26
+PAGE_HDR_H = 24
+PAGE_GAP = 4
 HANDLE_HIT_PX = 8
 
 
@@ -56,6 +57,7 @@ class _DisplayTimelineCanvas(QWidget):
         self.page_removal_mode: bool = False
 
         self._rows: List[Tuple[int, int, int, Line]] = []
+        self._page_headers: List[Tuple[int, int]] = []  # (raw_y, page_idx)
         self._content_h: int = 0
 
         self._drag_mode: Optional[str] = None  # "scrub", "start", "end", "pan"
@@ -75,11 +77,14 @@ class _DisplayTimelineCanvas(QWidget):
 
     def _rebuild_rows(self) -> None:
         self._rows.clear()
+        self._page_headers.clear()
         if not self.project:
             self._content_h = 0
             return
-        y = RULER_H + 6
+        y = RULER_H + 2
         for p_idx, page in enumerate(self.project.pages):
+            self._page_headers.append((y, p_idx))
+            y += PAGE_HDR_H
             for l_idx, line in enumerate(page.lines):
                 self._rows.append((y, p_idx, l_idx, line))
                 y += ROW_H
@@ -182,8 +187,33 @@ class _DisplayTimelineCanvas(QWidget):
                 painter.drawText(x + 3, 2, 60, RULER_H - 6, Qt.AlignmentFlag.AlignVCenter, lbl)
 
     def _paint_rows(self, painter: QPainter, w: int, h: int) -> None:
-        font = QFont("Segoe UI", 8)
+        # 1. Paint Page section headers matching the Lyrics Wiping left bar
+        hdr_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        for raw_y, p_idx in self._page_headers:
+            y = raw_y - self.scroll_y_px
+            if y + PAGE_HDR_H < RULER_H or y > h:
+                continue
+            is_opt = bool(self.project and self.project.is_optimized_lead_in_page(p_idx))
+            hdr_bg = QColor(34, 58, 48) if is_opt else QColor(34, 40, 52)
+            hdr_fg = QColor(135, 225, 175) if is_opt else QColor(155, 185, 225)
+            # Subtle full-row divider bar + rich Page header in left column
+            painter.fillRect(0, y, LABEL_COL_W, PAGE_HDR_H, hdr_bg)
+            painter.fillRect(LABEL_COL_W + 1, y, w - LABEL_COL_W, PAGE_HDR_H, QColor(hdr_bg.red(), hdr_bg.green(), hdr_bg.blue(), 65))
+            painter.setFont(hdr_font)
+            painter.setPen(hdr_fg)
+            painter.drawText(8, y, LABEL_COL_W - 14, PAGE_HDR_H, Qt.AlignmentFlag.AlignVCenter, f"Page {p_idx + 1}")
+
+        # 2. Paint individual lyric line rows
+        font = QFont("Segoe UI", 9)
         painter.setFont(font)
+        fm = painter.fontMetrics()
+        style_fg = {
+            "B": QColor(210, 175, 245),
+            "C": QColor(125, 225, 210),
+            "D": QColor(244, 150, 190),
+            "E": QColor(175, 225, 130),
+            "F": QColor(240, 195, 115),
+        }
 
         for raw_y, p_idx, l_idx, line in self._rows:
             y = raw_y - self.scroll_y_px
@@ -194,19 +224,30 @@ class _DisplayTimelineCanvas(QWidget):
             is_sel_page = (p_idx == self.selected_page)
 
             if is_selected:
-                bg = QColor(44, 58, 78)
+                bg = QColor(43, 91, 132)
+                timeline_bg = QColor(40, 52, 70)
             elif is_sel_page:
-                bg = QColor(32, 37, 46)
+                bg = QColor(28, 32, 40)
+                timeline_bg = QColor(30, 35, 44)
             else:
-                bg = QColor(27, 30, 36) if p_idx % 2 == 0 else QColor(23, 25, 31)
-            painter.fillRect(0, y, w, ROW_H - 2, bg)
+                bg = QColor(25, 28, 34)
+                timeline_bg = QColor(25, 28, 34) if p_idx % 2 == 0 else QColor(22, 24, 30)
+            painter.fillRect(0, y, LABEL_COL_W, ROW_H - 1, bg)
+            painter.fillRect(LABEL_COL_W + 1, y, w - LABEL_COL_W, ROW_H - 1, timeline_bg)
 
             painter.save()
             painter.setClipRect(0, y, LABEL_COL_W - 2, ROW_H)
-            prefix = f"P{p_idx + 1} L{l_idx + 1} [{line.style}] "
-            txt = prefix + line.full_text.strip()
-            painter.setPen(QColor(240, 244, 250) if is_selected else QColor(185, 192, 205))
-            painter.drawText(8, y, LABEL_COL_W - 14, ROW_H - 2, Qt.AlignmentFlag.AlignVCenter, txt)
+            raw_text = line.full_text.strip() or "(empty)"
+            txt = f"[{line.style}] {raw_text}" if line.style != "A" else raw_text
+            elided = fm.elidedText(txt, Qt.TextElideMode.ElideRight, LABEL_COL_W - 22)
+            if is_selected:
+                pen_c = QColor(255, 255, 255)
+            elif line.style != "A":
+                pen_c = style_fg.get(line.style.upper(), QColor(210, 175, 245))
+            else:
+                pen_c = QColor(210, 216, 226)
+            painter.setPen(pen_c)
+            painter.drawText(16, y, LABEL_COL_W - 20, ROW_H - 1, Qt.AlignmentFlag.AlignVCenter, elided)
             painter.restore()
 
             painter.save()
@@ -249,6 +290,11 @@ class _DisplayTimelineCanvas(QWidget):
     def _hit_test(self, x: float, y: float) -> Tuple[Optional[str], int, int]:
         if y < RULER_H and x >= LABEL_COL_W:
             return ("scrub", self.selected_page, self.selected_line)
+        if x < LABEL_COL_W:
+            for raw_y, p_idx in self._page_headers:
+                ry = raw_y - self.scroll_y_px
+                if ry <= y <= ry + PAGE_HDR_H:
+                    return ("select", p_idx, 0)
         for raw_y, p_idx, l_idx, line in self._rows:
             ry = raw_y - self.scroll_y_px
             if ry <= y <= ry + ROW_H:
@@ -387,6 +433,7 @@ class DisplayRemoveView(QWidget):
     selection_changed = Signal(int, int)
     project_mutated = Signal(str)
     viewport_changed = Signal(float, float)
+    auto_reset_display_changed = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -411,6 +458,15 @@ class DisplayRemoveView(QWidget):
         self._follow_cb.setChecked(True)
         bar1.addWidget(self._follow_cb)
 
+        self._auto_reset_cb = QCheckBox("Auto Reset Display")
+        self._auto_reset_cb.setChecked(True)
+        self._auto_reset_cb.setToolTip(
+            "When ON: automatically resets display windows & applies ➣➣➣ optimizations on every edit.\n"
+            "When OFF: manual Display/Remove window control (and shows DISP/REM lines in Lyrics Wiping)."
+        )
+        self._auto_reset_cb.toggled.connect(self.auto_reset_display_changed.emit)
+        bar1.addWidget(self._auto_reset_cb)
+
         bar1.addSpacing(12)
         btn_snap_s = QPushButton("Snap Start → Playhead")
         btn_snap_s.clicked.connect(self._snap_start_to_playhead)
@@ -419,10 +475,6 @@ class DisplayRemoveView(QWidget):
         btn_snap_e = QPushButton("Snap End → Playhead")
         btn_snap_e.clicked.connect(self._snap_end_to_playhead)
         bar1.addWidget(btn_snap_e)
-
-        btn_dup = QPushButton("Duplicate Page")
-        btn_dup.clicked.connect(self._duplicate_selected_page)
-        bar1.addWidget(btn_dup)
         bar1.addStretch()
 
         bar2 = QHBoxLayout()
@@ -473,6 +525,11 @@ class DisplayRemoveView(QWidget):
         root.addLayout(bar2)
         root.addWidget(self.canvas, 1)
         root.addWidget(self._hscroll)
+
+    def set_auto_reset_display(self, enabled: bool) -> None:
+        self._auto_reset_cb.blockSignals(True)
+        self._auto_reset_cb.setChecked(bool(enabled))
+        self._auto_reset_cb.blockSignals(False)
 
     def set_project(self, project: Optional[KbpProject], preserve_view: bool = False) -> None:
         old_page = self.canvas.selected_page
