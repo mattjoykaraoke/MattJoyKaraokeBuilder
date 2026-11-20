@@ -36,6 +36,7 @@ RULER_H = 26
 HANDLE_PX = 7
 SNAP_PLAYHEAD_PX = 10.0
 DEFAULT_WIPING_PX_PER_CS = 2.4
+MAX_WIPING_PX_PER_CS = 24.0
 
 # Distinct per-style color palette (for [A], [B], [C], ... lanes & ChromaLyric style coding)
 _STYLE_COLORS: Dict[str, Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]] = {
@@ -396,6 +397,10 @@ class _WipingTimelineCanvas(QWidget):
     styles_changed = Signal()
     project_mutated = Signal(str)
     viewport_changed = Signal(float, float)  # start_cs, span_cs
+    word_adjust_toggle_requested = Signal()
+    word_adjust_exit_requested = Signal()
+    word_nudge_requested = Signal(str, int)  # edge ("left"|"right"), delta_cs
+    syllable_timing_changed = Signal()
 
     def __init__(self, audio: AudioEngine, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -411,7 +416,9 @@ class _WipingTimelineCanvas(QWidget):
         self.sticky_borders: bool = True
         self.snap_to_playhead: bool = True
         self.show_display_windows: bool = False
+        self.word_adjust_mode: bool = False
         self._snapped_to_playhead: bool = False
+        self._snapped_border_cs: Optional[int] = None
         self.px_per_cs: float = DEFAULT_WIPING_PX_PER_CS
         self.scroll_x_cs: float = 0.0
 
@@ -438,6 +445,10 @@ class _WipingTimelineCanvas(QWidget):
         self._drag_label: str = ""
         self._drag_changed: bool = False
         self._drag_sticky_neighbor: Optional[int] = None
+        self._drag_sticky_left: Optional[int] = None
+        self._drag_sticky_right: Optional[int] = None
+        self._drag_orig_prev_end: Optional[int] = None
+        self._drag_orig_next_start: Optional[int] = None
         self._pan_start_x: float = 0.0
         self._pan_start_scroll: float = 0.0
         self._right_press_pos: Optional[QPoint] = None
@@ -623,11 +634,43 @@ class _WipingTimelineCanvas(QWidget):
 
         self._paint_grid(painter, w, h)
         self._paint_waveform(painter, w, wave_top, wave_h)
+        if self.word_adjust_mode:
+            self._paint_word_adjust_guides(painter, w, h, wave_top, wave_h)
         self._paint_all_visible_syllables(painter, w, syl_top, syl_h)
         if self.show_display_windows:
             self._paint_active_display_window(painter, w, h)
         self._paint_ruler(painter, w)
         self._paint_playhead(painter, h)
+
+    def _paint_word_adjust_guides(self, painter: QPainter, w: int, h: int, wave_top: int, wave_h: int) -> None:
+        """Highlight the focused word's waveform region and draw crisp start/end border guides."""
+        line = self.current_line()
+        if not line or not (0 <= self.selected_syl < len(line.syllables)):
+            return
+        syl = line.syllables[self.selected_syl]
+        x0 = self.cs_to_x(syl.start)
+        x1 = self.cs_to_x(syl.end)
+
+        painter.save()
+        # Subtle highlighted band across the waveform for the active word's duration
+        band_left = max(0.0, x0)
+        band_right = min(float(w), x1)
+        if band_right > band_left:
+            painter.fillRect(
+                QRectF(band_left, float(wave_top), band_right - band_left, float(wave_h)),
+                QColor(245, 158, 11, 32),
+            )
+
+        # Left border guide (cyan, Q/W)
+        if -4 <= x0 <= w + 4:
+            painter.setPen(QPen(QColor(56, 189, 248, 220), 1.5, Qt.PenStyle.DashLine))
+            painter.drawLine(QLineF(x0, float(RULER_H), x0, float(h)))
+
+        # Right border guide (amber, Left/Right arrows)
+        if -4 <= x1 <= w + 4:
+            painter.setPen(QPen(QColor(251, 191, 36, 220), 1.5, Qt.PenStyle.DashLine))
+            painter.drawLine(QLineF(x1, float(RULER_H), x1, float(h)))
+        painter.restore()
 
     def _paint_active_display_window(self, painter: QPainter, w: int, h: int) -> None:
         """Draw thin delineation lines for the active page's display/remove window when Auto Reset Display is off."""
@@ -665,7 +708,18 @@ class _WipingTimelineCanvas(QWidget):
             _draw_marker(cur_line.display_end, QColor(251, 146, 60), f"L{self.line_idx + 1} REM", RULER_H + 22, width=1.2)
 
     def _paint_grid(self, painter: QPainter, w: int, h: int) -> None:
-        step_cs = 50 if self.px_per_cs >= 1.2 else (100 if self.px_per_cs >= 0.4 else 500)
+        if self.px_per_cs >= 8.0:
+            step_cs = 5
+        elif self.px_per_cs >= 4.0:
+            step_cs = 10
+        elif self.px_per_cs >= 2.0:
+            step_cs = 25
+        elif self.px_per_cs >= 1.2:
+            step_cs = 50
+        elif self.px_per_cs >= 0.4:
+            step_cs = 100
+        else:
+            step_cs = 500
         start_cs = int(self.scroll_x_cs // step_cs) * step_cs
         end_cs = self.x_to_cs(w) + step_cs
         painter.setPen(QPen(QColor(38, 42, 50), 1))
@@ -679,7 +733,16 @@ class _WipingTimelineCanvas(QWidget):
         painter.drawLine(0, RULER_H - 1, w, RULER_H - 1)
         painter.setFont(QFont("Segoe UI", 8))
 
-        step_cs = 50 if self.px_per_cs >= 1.5 else (100 if self.px_per_cs >= 0.5 else 500)
+        if self.px_per_cs >= 8.0:
+            step_cs = 10
+        elif self.px_per_cs >= 3.5:
+            step_cs = 25
+        elif self.px_per_cs >= 1.5:
+            step_cs = 50
+        elif self.px_per_cs >= 0.5:
+            step_cs = 100
+        else:
+            step_cs = 500
         start_cs = int(self.scroll_x_cs // step_cs) * step_cs
         end_cs = self.x_to_cs(w) + step_cs
         for t in range(start_cs, end_cs + 1, step_cs):
@@ -917,6 +980,14 @@ class _WipingTimelineCanvas(QWidget):
             cur_y = y_bot
 
     def _paint_playhead(self, painter: QPainter, h: int) -> None:
+        if self._snapped_border_cs is not None:
+            bx = self.cs_to_x(self._snapped_border_cs)
+            if -4 <= bx <= self.width() + 4:
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(QPen(QColor(56, 232, 255), 2.5))
+                painter.drawLine(QLineF(bx, float(RULER_H), bx, float(h)))
+                painter.restore()
         x = self.cs_to_x(self.playhead_cs)
         if -4 <= x <= self.width() + 4:
             painter.save()
@@ -1073,10 +1144,24 @@ class _WipingTimelineCanvas(QWidget):
         self._drag_syl_idx = s_idx
         self._drag_changed = False
         self._drag_sticky_neighbor = None
+        self._drag_sticky_left = None
+        self._drag_sticky_right = None
+        self._drag_orig_prev_end = None
+        self._drag_orig_next_start = None
 
         syl = line.syllables[s_idx]
         if mode == "move":
             self._drag_offset_cs = self.x_to_cs(pos.x()) - syl.start
+            if s_idx > 0:
+                prev_syl = line.syllables[s_idx - 1]
+                self._drag_orig_prev_end = prev_syl.end
+                if self.sticky_borders and abs(prev_syl.end - syl.start) <= 2:
+                    self._drag_sticky_left = s_idx - 1
+            if s_idx + 1 < len(line.syllables):
+                next_syl = line.syllables[s_idx + 1]
+                self._drag_orig_next_start = next_syl.start
+                if self.sticky_borders and abs(next_syl.start - syl.end) <= 2:
+                    self._drag_sticky_right = s_idx + 1
         elif mode == "left" and self.sticky_borders and s_idx > 0:
             prev_syl = line.syllables[s_idx - 1]
             if abs(prev_syl.end - syl.start) <= 2:
@@ -1117,6 +1202,7 @@ class _WipingTimelineCanvas(QWidget):
             return
 
         self._snapped_to_playhead = False
+        self._snapped_border_cs = None
         ph_cs = int(round(self.playhead_cs))
         snap_tol_cs = SNAP_PLAYHEAD_PX / max(1e-6, self.px_per_cs)
 
@@ -1127,16 +1213,67 @@ class _WipingTimelineCanvas(QWidget):
             raw_delta = cs - self._drag_start_cs
             min_start = min(st for st, _ in self._drag_orig_syls.values())
             max_end = max(en for _, en in self._drag_orig_syls.values())
-            delta = max(-min_start, raw_delta)
+
+            # When Sticky Borders is ON, prevent partial-line selections from crossing unselected neighbors
+            min_delta = -min_start
+            max_delta: Optional[int] = None
+            left_snap_border: Optional[Tuple[int, int]] = None   # (delta_to_snap, border_cs)
+            right_snap_border: Optional[Tuple[int, int]] = None  # (delta_to_snap, border_cs)
+            if self.sticky_borders:
+                for (p_i, l_i, s_i), (orig_s, orig_e) in self._drag_orig_syls.items():
+                    ln = self.get_line(p_i, l_i)
+                    if not ln:
+                        continue
+                    if s_i > 0 and (p_i, l_i, s_i - 1) not in self._drag_orig_syls:
+                        prev_end = ln.syllables[s_i - 1].end
+                        bound_d = prev_end - orig_s
+                        if bound_d <= 0 and bound_d > min_delta:
+                            min_delta = bound_d
+                            left_snap_border = (bound_d, prev_end)
+                    if s_i + 1 < len(ln.syllables) and (p_i, l_i, s_i + 1) not in self._drag_orig_syls:
+                        next_start = ln.syllables[s_i + 1].start
+                        bound_d = next_start - orig_e
+                        if bound_d >= 0 and (max_delta is None or bound_d < max_delta):
+                            max_delta = bound_d
+                            right_snap_border = (bound_d, next_start)
+
+            delta = max(min_delta, raw_delta)
+            if max_delta is not None:
+                delta = min(max_delta, delta)
+
+            best_dist = snap_tol_cs + 1.0
+            best_delta = delta
+            best_kind: Optional[str] = None
+            best_border: Optional[int] = None
+
             if self.snap_to_playhead:
                 d_left = abs((min_start + delta) - ph_cs)
+                cand_l = ph_cs - min_start
+                if d_left <= snap_tol_cs and d_left < best_dist and cand_l >= min_delta and (max_delta is None or cand_l <= max_delta):
+                    best_dist, best_delta, best_kind, best_border = d_left, cand_l, "playhead", None
                 d_right = abs((max_end + delta) - ph_cs)
-                if d_left <= snap_tol_cs and d_left <= d_right:
-                    delta = max(-min_start, ph_cs - min_start)
-                    self._snapped_to_playhead = True
-                elif d_right <= snap_tol_cs:
-                    delta = max(-min_start, ph_cs - max_end)
-                    self._snapped_to_playhead = True
+                cand_r = ph_cs - max_end
+                if d_right <= snap_tol_cs and d_right < best_dist and cand_r >= min_delta and (max_delta is None or cand_r <= max_delta):
+                    best_dist, best_delta, best_kind, best_border = d_right, cand_r, "playhead", None
+
+            if self.sticky_borders:
+                if left_snap_border is not None:
+                    cand_d, b_cs = left_snap_border
+                    dist = abs(delta - cand_d)
+                    if dist <= snap_tol_cs and dist < best_dist:
+                        best_dist, best_delta, best_kind, best_border = dist, cand_d, "border", b_cs
+                if right_snap_border is not None:
+                    cand_d, b_cs = right_snap_border
+                    dist = abs(delta - cand_d)
+                    if dist <= snap_tol_cs and dist < best_dist:
+                        best_dist, best_delta, best_kind, best_border = dist, cand_d, "border", b_cs
+
+            if best_kind == "playhead":
+                delta = best_delta
+                self._snapped_to_playhead = True
+            elif best_kind == "border":
+                delta = best_delta
+                self._snapped_border_cs = best_border
 
             # Vertical track-switching: dragging full line(s) into [A], [B], [C]...[F] band reassigns style live
             hover_style: Optional[str] = None
@@ -1187,9 +1324,18 @@ class _WipingTimelineCanvas(QWidget):
             elif self._drag_syl_idx > 0:
                 min_cs = line.syllables[self._drag_syl_idx - 1].end
             target_cs = cs
-            if self.snap_to_playhead and abs(target_cs - ph_cs) <= snap_tol_cs:
+            best_dist = snap_tol_cs + 1.0
+            if self.snap_to_playhead and abs(cs - ph_cs) <= snap_tol_cs:
+                best_dist = abs(cs - ph_cs)
                 target_cs = ph_cs
                 self._snapped_to_playhead = True
+            if self.sticky_borders and self._drag_sticky_neighbor is None and self._drag_syl_idx > 0:
+                prev_end = line.syllables[self._drag_syl_idx - 1].end
+                d_prev = abs(cs - prev_end)
+                if d_prev <= snap_tol_cs and d_prev < best_dist:
+                    target_cs = prev_end
+                    self._snapped_to_playhead = False
+                    self._snapped_border_cs = prev_end
             new_start = max(min_cs, min(target_cs, syl.end - 1))
             syl.start = new_start
             if self._drag_sticky_neighbor is not None:
@@ -1202,9 +1348,18 @@ class _WipingTimelineCanvas(QWidget):
             elif self._drag_syl_idx + 1 < len(line.syllables):
                 max_cs = line.syllables[self._drag_syl_idx + 1].start
             target_cs = cs
-            if self.snap_to_playhead and abs(target_cs - ph_cs) <= snap_tol_cs:
+            best_dist = snap_tol_cs + 1.0
+            if self.snap_to_playhead and abs(cs - ph_cs) <= snap_tol_cs:
+                best_dist = abs(cs - ph_cs)
                 target_cs = ph_cs
                 self._snapped_to_playhead = True
+            if self.sticky_borders and self._drag_sticky_neighbor is None and self._drag_syl_idx + 1 < len(line.syllables):
+                next_start = line.syllables[self._drag_syl_idx + 1].start
+                d_next = abs(cs - next_start)
+                if d_next <= snap_tol_cs and d_next < best_dist:
+                    target_cs = next_start
+                    self._snapped_to_playhead = False
+                    self._snapped_border_cs = next_start
             new_end = min(max_cs, max(target_cs, syl.start + 1))
             syl.end = new_end
             if self._drag_sticky_neighbor is not None:
@@ -1212,25 +1367,90 @@ class _WipingTimelineCanvas(QWidget):
             self._drag_changed = True
         elif self._drag_mode == "move":
             dur = syl.end - syl.start
-            new_start = max(0, cs - self._drag_offset_cs)
-            if self.snap_to_playhead:
-                d_left = abs(new_start - ph_cs)
-                d_right = abs((new_start + dur) - ph_cs)
-                if d_left <= snap_tol_cs and d_left <= d_right:
-                    new_start = max(0, ph_cs)
-                    self._snapped_to_playhead = True
-                elif d_right <= snap_tol_cs:
-                    new_start = max(0, ph_cs - dur)
-                    self._snapped_to_playhead = True
-            syl.start = new_start
-            syl.end = new_start + dur
-            self._drag_changed = True
+            if not self.sticky_borders:
+                # Sticky Borders OFF: completely free placement (no neighbor clamping or push/pull)
+                new_start = max(0, cs - self._drag_offset_cs)
+                if self.snap_to_playhead:
+                    d_left = abs(new_start - ph_cs)
+                    d_right = abs((new_start + dur) - ph_cs)
+                    if d_left <= snap_tol_cs and d_left <= d_right:
+                        new_start = max(0, ph_cs)
+                        self._snapped_to_playhead = True
+                    elif d_right <= snap_tol_cs:
+                        new_start = max(0, ph_cs - dur)
+                        self._snapped_to_playhead = True
+                syl.start = new_start
+                syl.end = new_start + dur
+                self._drag_changed = True
+            else:
+                # Sticky Borders ON:
+                # - Clamped so subject word never passes under neighbors (neighbors keep >= 1 cs)
+                # - Colliding into a neighbor shrinks it; pulling away from a sticky neighbor stretches it
+                prev_syl = line.syllables[self._drag_syl_idx - 1] if self._drag_syl_idx > 0 else None
+                next_syl = line.syllables[self._drag_syl_idx + 1] if self._drag_syl_idx + 1 < len(line.syllables) else None
+                orig_prev_end = self._drag_orig_prev_end if self._drag_orig_prev_end is not None else (prev_syl.end if prev_syl else 0)
+                orig_next_start = self._drag_orig_next_start if self._drag_orig_next_start is not None else (next_syl.start if next_syl else 10_000_000)
 
+                min_start = max(0, prev_syl.start + 1) if prev_syl is not None else 0
+                max_start = (next_syl.end - 1) - dur if next_syl is not None else 10_000_000
+                if min_start > max_start:
+                    min_start = min(syl.start, min_start)
+                    max_start = max(syl.start, max_start)
+
+                raw_start = max(min_start, min(max_start, cs - self._drag_offset_cs))
+                new_start = raw_start
+                best_dist = snap_tol_cs + 1.0
+                best_kind: Optional[str] = None
+                best_border: Optional[int] = None
+
+                if self.snap_to_playhead:
+                    d_left = abs(raw_start - ph_cs)
+                    if d_left <= snap_tol_cs and d_left < best_dist and min_start <= ph_cs <= max_start:
+                        best_dist, new_start, best_kind, best_border = d_left, ph_cs, "playhead", None
+                    d_right = abs((raw_start + dur) - ph_cs)
+                    cand_r = ph_cs - dur
+                    if d_right <= snap_tol_cs and d_right < best_dist and min_start <= cand_r <= max_start:
+                        best_dist, new_start, best_kind, best_border = d_right, cand_r, "playhead", None
+
+                # Magnetic snap to non-sticky neighbor borders before colliding into them
+                if prev_syl is not None and self._drag_sticky_left is None:
+                    d_prev = abs(raw_start - orig_prev_end)
+                    if d_prev <= snap_tol_cs and d_prev < best_dist and min_start <= orig_prev_end <= max_start:
+                        best_dist, new_start, best_kind, best_border = d_prev, orig_prev_end, "border", orig_prev_end
+                if next_syl is not None and self._drag_sticky_right is None:
+                    d_next = abs((raw_start + dur) - orig_next_start)
+                    cand_n = orig_next_start - dur
+                    if d_next <= snap_tol_cs and d_next < best_dist and min_start <= cand_n <= max_start:
+                        best_dist, new_start, best_kind, best_border = d_next, cand_n, "border", orig_next_start
+
+                if best_kind == "playhead":
+                    self._snapped_to_playhead = True
+                elif best_kind == "border":
+                    self._snapped_border_cs = best_border
+
+                new_end = new_start + dur
+                syl.start = new_start
+                syl.end = new_end
+                if prev_syl is not None:
+                    if self._drag_sticky_left is not None:
+                        prev_syl.end = new_start
+                    else:
+                        prev_syl.end = min(orig_prev_end, new_start)
+                if next_syl is not None:
+                    if self._drag_sticky_right is not None:
+                        next_syl.start = new_end
+                    else:
+                        next_syl.start = max(orig_next_start, new_end)
+                self._drag_changed = True
+
+        if self._drag_changed:
+            self.syllable_timing_changed.emit()
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        was_snapped = self._snapped_to_playhead
+        was_snapped = self._snapped_to_playhead or (self._snapped_border_cs is not None)
         self._snapped_to_playhead = False
+        self._snapped_border_cs = None
         if self._drag_mode == "pan":
             self.setCursor(Qt.CursorShape.ArrowCursor)
             if event.button() == Qt.MouseButton.RightButton and not self._right_panned:
@@ -1279,6 +1499,10 @@ class _WipingTimelineCanvas(QWidget):
         self._drag_changed = False
         self._drag_style_changed = False
         self._drag_sticky_neighbor = None
+        self._drag_sticky_left = None
+        self._drag_sticky_right = None
+        self._drag_orig_prev_end = None
+        self._drag_orig_next_start = None
         self._drag_collapse_target = None
         self._drag_orig_syls.clear()
         self._drag_orig_lines.clear()
@@ -1301,11 +1525,37 @@ class _WipingTimelineCanvas(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() == Qt.Key.Key_Escape:
-            self.clear_selection()
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.word_adjust_toggle_requested.emit()
             event.accept()
             return
-        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        if key == Qt.Key.Key_Escape:
+            if self.word_adjust_mode:
+                self.word_adjust_exit_requested.emit()
+            else:
+                self.clear_selection()
+            event.accept()
+            return
+        if self.word_adjust_mode:
+            step = 5 if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 1
+            if key == Qt.Key.Key_Q:
+                self.word_nudge_requested.emit("left", -step)
+                event.accept()
+                return
+            if key == Qt.Key.Key_W:
+                self.word_nudge_requested.emit("left", step)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Left:
+                self.word_nudge_requested.emit("right", -step)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Right:
+                self.word_nudge_requested.emit("right", step)
+                event.accept()
+                return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_requested.emit()
             event.accept()
             return
@@ -1316,7 +1566,7 @@ class _WipingTimelineCanvas(QWidget):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             factor = 1.25 if delta > 0 else 1.0 / 1.25
             mouse_cs = self.x_to_cs_float(event.position().x())
-            self.px_per_cs = max(0.2, min(12.0, self.px_per_cs * factor))
+            self.px_per_cs = max(0.2, min(MAX_WIPING_PX_PER_CS, self.px_per_cs * factor))
             self.set_scroll_x_cs(mouse_cs - event.position().x() / self.px_per_cs)
         else:
             step = -delta / max(0.1, self.px_per_cs) * 0.5
@@ -1330,6 +1580,8 @@ class LyricsWipingView(QWidget):
     selection_changed = Signal(int, int)
     project_mutated = Signal(str)
     play_line_requested = Signal(int, int)
+    play_word_requested = Signal(int, int)
+    word_adjust_mode_changed = Signal(bool)
     viewport_changed = Signal(float, float)
     auto_reset_display_changed = Signal(bool)
 
@@ -1338,6 +1590,9 @@ class LyricsWipingView(QWidget):
         self.audio = audio
         self.project: Optional[KbpProject] = None
         self._item_by_coord: dict[Tuple[int, int], QTreeWidgetItem] = {}
+        self._word_adjust_active: bool = False
+        self._saved_px_per_cs: float = DEFAULT_WIPING_PX_PER_CS
+        self._saved_scroll_x_cs: float = 0.0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -1429,6 +1684,12 @@ class LyricsWipingView(QWidget):
         _add_btn(w_r2, "Snap Start", "Snap selected syllable's start to previous lyric's end", self._snap_start)
         _add_btn(w_r2, "Snap End", "Snap selected syllable's end to next lyric's start", self._snap_end)
         _add_btn(w_r2, "Snap Both", "Snap both start & end to adjacent lyrics", self._snap_both)
+        self._word_adjust_btn = QPushButton("Adjust Word", ribbon)
+        self._word_adjust_btn.setCheckable(True)
+        self._word_adjust_btn.setToolTip("Enter/Exit Word Adjust Mode (Enter) — zoom in on word & nudge start/end borders")
+        self._word_adjust_btn.toggled.connect(self._on_word_adjust_btn_toggled)
+        w_r2.addWidget(self._word_adjust_btn)
+        _add_btn(w_r2, "▶ Play Word", "Play the selected word/syllable and stop right at its end", self.play_current_word)
         ribbon_layout.addLayout(sec_words)
         ribbon_layout.addWidget(_make_divider())
 
@@ -1504,19 +1765,29 @@ class LyricsWipingView(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(2)
 
+        self._word_adjust_bar = self._build_word_adjust_bar(right_box)
+        self._word_adjust_bar.setVisible(False)
+
         self.canvas = _WipingTimelineCanvas(audio, right_box)
         self.canvas.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
         self.canvas.line_clicked.connect(self._on_canvas_line_clicked)
+        self.canvas.syllable_selected.connect(self._on_canvas_syllable_selected)
         self.canvas.delete_requested.connect(self._delete_syl)
         self.canvas.edit_syllable_requested.connect(self._edit_syl)
         self.canvas.context_menu_requested.connect(self._on_canvas_context_menu)
         self.canvas.styles_changed.connect(self._on_canvas_styles_changed)
         self.canvas.project_mutated.connect(self.project_mutated.emit)
         self.canvas.viewport_changed.connect(self._on_canvas_viewport)
+        self.canvas.word_adjust_toggle_requested.connect(self.toggle_word_adjust_mode)
+        self.canvas.word_adjust_exit_requested.connect(self.exit_word_adjust_mode)
+        self.canvas.word_nudge_requested.connect(self._nudge_current_word)
+        self.canvas.syllable_timing_changed.connect(self._refresh_word_adjust_bar)
+        self.project_mutated.connect(lambda _lbl: self._refresh_word_adjust_bar())
 
         self._hscroll = QScrollBar(Qt.Orientation.Horizontal, right_box)
         self._hscroll.valueChanged.connect(self._on_hscroll)
 
+        right_layout.addWidget(self._word_adjust_bar)
         right_layout.addWidget(self.canvas, 1)
         right_layout.addWidget(self._hscroll)
 
@@ -1544,6 +1815,9 @@ class LyricsWipingView(QWidget):
         self.auto_reset_display_changed.emit(checked)
 
     def set_project(self, project: Optional[KbpProject], preserve_view: bool = False) -> None:
+        if not preserve_view and self._word_adjust_active:
+            self.exit_word_adjust_mode(restore_view=False)
+
         old_page = self.canvas.page_idx
         old_line = self.canvas.line_idx
         old_syl = self.canvas.selected_syl
@@ -1564,6 +1838,12 @@ class LyricsWipingView(QWidget):
                 self.canvas.set_scroll_x_cs(old_scroll)
                 self._hscroll.setValue(int(old_scroll))
             self._hscroll.blockSignals(False)
+        if self._word_adjust_active:
+            line = self.canvas.current_line()
+            if not line or not (0 <= self.canvas.selected_syl < len(line.syllables)):
+                self.exit_word_adjust_mode(restore_view=False)
+            else:
+                self._refresh_word_adjust_bar()
         self.canvas.update()
 
     def _rebuild_tree(self, preserve_view: bool = False, target_page: int = 0, target_line: int = 0) -> None:
@@ -1688,6 +1968,7 @@ class LyricsWipingView(QWidget):
             self._line_tree.scrollToItem(item)
             self._line_tree.blockSignals(False)
         self._sync_style_combo()
+        self._refresh_word_adjust_bar()
         self.selection_changed.emit(page_idx, line_idx)
 
     def set_selection(self, page_idx: int, line_idx: int, center: bool = True) -> None:
@@ -1699,10 +1980,11 @@ class LyricsWipingView(QWidget):
             self._line_tree.blockSignals(False)
         self.canvas.set_line(page_idx, line_idx, center=center)
         self._sync_style_combo()
+        self._refresh_word_adjust_bar()
 
     def set_playhead_cs(self, cs: float, follow_if_playing: bool = False) -> None:
         self.canvas.playhead_cs = cs
-        if follow_if_playing and self._follow_cb.isChecked():
+        if follow_if_playing and self._follow_cb.isChecked() and not self._word_adjust_active:
             span = self.canvas.view_span_cs()
             if cs > self.canvas.scroll_x_cs + span * 0.82 or cs < self.canvas.scroll_x_cs:
                 self.canvas.set_scroll_x_cs(cs - span * 0.2)
@@ -1714,7 +1996,7 @@ class LyricsWipingView(QWidget):
 
     def zoom(self, factor: float) -> None:
         center_cs = self.canvas.scroll_x_cs + self.canvas.view_span_cs() * 0.5
-        self.canvas.px_per_cs = max(0.2, min(12.0, self.canvas.px_per_cs * factor))
+        self.canvas.px_per_cs = max(0.2, min(MAX_WIPING_PX_PER_CS, self.canvas.px_per_cs * factor))
         self.canvas.center_on_cs(center_cs)
 
     def reset_zoom(self) -> None:
@@ -1743,6 +2025,7 @@ class LyricsWipingView(QWidget):
             return
         self.canvas.set_line(p_idx, l_idx, center=True)
         self._sync_style_combo()
+        self._refresh_word_adjust_bar()
         self.selection_changed.emit(p_idx, l_idx)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
@@ -1766,6 +2049,20 @@ class LyricsWipingView(QWidget):
         menu = QMenu(self)
 
         if kind == "word":
+            act_play_w = QAction("▶ Play Word", self)
+            act_play_w.triggered.connect(self.play_current_word)
+            menu.addAction(act_play_w)
+
+            adjust_lbl = (
+                "Exit Word Adjust Mode (Enter / Esc)"
+                if self._word_adjust_active
+                else "Word Adjust Mode (Enter)"
+            )
+            act_adjust = QAction(adjust_lbl, self)
+            act_adjust.triggered.connect(self.toggle_word_adjust_mode)
+            menu.addAction(act_adjust)
+
+            menu.addSeparator()
             for label, fn in [
                 ("Add Word / Syllable…", self._add_word),
                 ("Edit Syllable Text…", self._edit_syl),
@@ -1975,6 +2272,8 @@ class LyricsWipingView(QWidget):
                 self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
                 self.canvas.update()
                 self.project_mutated.emit(f"Edit Syllable '{old}' → '{updated.strip()}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
+        if self._word_adjust_active:
+            self.canvas.setFocus()
 
     def _split_syl(self) -> None:
         line = self.canvas.current_line()
@@ -2236,3 +2535,248 @@ class LyricsWipingView(QWidget):
         line = self.canvas.current_line()
         if line:
             self.play_line_requested.emit(max(0, line.first_syl_start - 15), line.last_syl_end)
+
+    def _current_syllable(self) -> Optional[Tuple[int, int, int, Line, Syllable]]:
+        line = self.canvas.current_line()
+        if not line or not line.syllables:
+            return None
+        s_idx = self.canvas.selected_syl
+        if not (0 <= s_idx < len(line.syllables)):
+            s_idx = 0
+        return (self.canvas.page_idx, self.canvas.line_idx, s_idx, line, line.syllables[s_idx])
+
+    def play_current_word(self) -> None:
+        cur = self._current_syllable()
+        if cur is None:
+            return
+        _, _, _, _, syl = cur
+        self.play_word_requested.emit(max(0, syl.start), max(syl.start + 1, syl.end))
+        if self._word_adjust_active:
+            self.canvas.setFocus()
+
+    @property
+    def is_word_adjust_mode(self) -> bool:
+        return self._word_adjust_active
+
+    def _build_word_adjust_bar(self, parent: QWidget) -> QFrame:
+        bar = QFrame(parent)
+        bar.setObjectName("wordAdjustBar")
+        bar.setStyleSheet(
+            "QFrame#wordAdjustBar { background-color: #252218; border: 1px solid #d97706; border-radius: 4px; }"
+            "QLabel { color: #e2e8f0; font-size: 11px; }"
+            "QPushButton { padding: 2px 6px; font-size: 11px; }"
+        )
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+
+        self._wa_title_lbl = QLabel("Word Adjust", bar)
+        self._wa_title_lbl.setStyleSheet("color: #fbbf24; font-weight: bold; font-size: 11px;")
+        layout.addWidget(self._wa_title_lbl)
+
+        btn_prev_w = QPushButton("◀ Prev", bar)
+        btn_prev_w.setToolTip("Focus previous word/syllable")
+        btn_prev_w.clicked.connect(lambda: self._step_word_adjust_target(-1))
+        layout.addWidget(btn_prev_w)
+
+        btn_next_w = QPushButton("Next ▶", bar)
+        btn_next_w.setToolTip("Focus next word/syllable")
+        btn_next_w.clicked.connect(lambda: self._step_word_adjust_target(1))
+        layout.addWidget(btn_next_w)
+
+        def _sep() -> QFrame:
+            f = QFrame(bar)
+            f.setFrameShape(QFrame.Shape.VLine)
+            f.setStyleSheet("color: #4b4532;")
+            return f
+
+        layout.addWidget(_sep())
+
+        # Left border (Start) mouse & Q/W controls
+        lbl_l = QLabel("Start (Q/W):", bar)
+        lbl_l.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        layout.addWidget(lbl_l)
+
+        for txt, delta in [("−5", -5), ("−1", -1), ("+1", 1), ("+5", 5)]:
+            b = QPushButton(txt, bar)
+            b.setFixedWidth(30)
+            b.setToolTip(f"Nudge left border by {delta:+d} cs (Q/W, Shift = ±5 cs)")
+            b.clicked.connect(lambda _chk=False, d=delta: self._nudge_current_word("left", d))
+            layout.addWidget(b)
+
+        self._wa_start_lbl = QLabel("0 cs", bar)
+        self._wa_start_lbl.setStyleSheet("font-family: Consolas; color: #7dd3fc; min-width: 52px;")
+        layout.addWidget(self._wa_start_lbl)
+
+        layout.addWidget(_sep())
+
+        btn_play_w = QPushButton("▶ Play Word", bar)
+        btn_play_w.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 2px 10px;")
+        btn_play_w.setToolTip("Play selected word (Space)")
+        btn_play_w.clicked.connect(self.play_current_word)
+        layout.addWidget(btn_play_w)
+
+        self._wa_dur_lbl = QLabel("0 cs", bar)
+        self._wa_dur_lbl.setStyleSheet("font-family: Consolas; color: #cbd5e1;")
+        layout.addWidget(self._wa_dur_lbl)
+
+        layout.addWidget(_sep())
+
+        # Right border (End) mouse & Left/Right Arrow controls
+        lbl_r = QLabel("End (←/→):", bar)
+        lbl_r.setStyleSheet("color: #fbbf24; font-weight: bold;")
+        layout.addWidget(lbl_r)
+
+        self._wa_end_lbl = QLabel("0 cs", bar)
+        self._wa_end_lbl.setStyleSheet("font-family: Consolas; color: #fde68a; min-width: 52px;")
+        layout.addWidget(self._wa_end_lbl)
+
+        for txt, delta in [("−5", -5), ("−1", -1), ("+1", 1), ("+5", 5)]:
+            b = QPushButton(txt, bar)
+            b.setFixedWidth(30)
+            b.setToolTip(f"Nudge right border by {delta:+d} cs (←/→, Shift = ±5 cs)")
+            b.clicked.connect(lambda _chk=False, d=delta: self._nudge_current_word("right", d))
+            layout.addWidget(b)
+
+        layout.addStretch()
+
+        hint = QLabel("Shift = ±5 cs", bar)
+        hint.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        layout.addWidget(hint)
+
+        btn_done = QPushButton("✓ Done (Enter / Esc)", bar)
+        btn_done.setStyleSheet("background-color: #b45309; color: white; font-weight: bold; padding: 2px 10px;")
+        btn_done.setToolTip("Exit Word Adjust Mode and restore previous zoom")
+        btn_done.clicked.connect(self.exit_word_adjust_mode)
+        layout.addWidget(btn_done)
+
+        for btn in bar.findChildren(QPushButton):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        return bar
+
+    def _on_word_adjust_btn_toggled(self, checked: bool) -> None:
+        if checked:
+            self.enter_word_adjust_mode()
+        else:
+            self.exit_word_adjust_mode()
+
+    def _on_canvas_syllable_selected(self, _s_idx: int) -> None:
+        if self._word_adjust_active:
+            self._refresh_word_adjust_bar()
+
+    def _focus_word_in_viewport(self, syl: Syllable) -> None:
+        dur = max(10, syl.end - syl.start)
+        canvas_w = max(320, self.canvas.width())
+        target_px = (canvas_w * 0.36) / dur
+        self.canvas.px_per_cs = max(4.5, min(MAX_WIPING_PX_PER_CS, target_px))
+        self.canvas.center_on_cs((syl.start + syl.end) * 0.5)
+
+    def _refresh_word_adjust_bar(self) -> None:
+        if not self._word_adjust_active:
+            return
+        cur = self._current_syllable()
+        if cur is None:
+            return
+        p_idx, l_idx, s_idx, _, syl = cur
+        txt = syl.text.strip() or "␣"
+        self._wa_title_lbl.setText(f"Word Adjust: \"{txt}\" (P{p_idx + 1} L{l_idx + 1} #{s_idx + 1})")
+        self._wa_start_lbl.setText(f"{syl.start} cs")
+        self._wa_end_lbl.setText(f"{syl.end} cs")
+        self._wa_dur_lbl.setText(f"({syl.duration} cs)")
+
+    def enter_word_adjust_mode(self) -> None:
+        cur = self._current_syllable()
+        if cur is None:
+            self._word_adjust_btn.blockSignals(True)
+            self._word_adjust_btn.setChecked(False)
+            self._word_adjust_btn.blockSignals(False)
+            return
+        p_idx, l_idx, s_idx, _, syl = cur
+        if not self._word_adjust_active:
+            self._saved_px_per_cs = self.canvas.px_per_cs
+            self._saved_scroll_x_cs = self.canvas.scroll_x_cs
+        self._word_adjust_active = True
+        self.canvas.word_adjust_mode = True
+        self.canvas.select_single(p_idx, l_idx, s_idx)
+        self._focus_word_in_viewport(syl)
+        self._word_adjust_bar.setVisible(True)
+        self._word_adjust_btn.blockSignals(True)
+        self._word_adjust_btn.setChecked(True)
+        self._word_adjust_btn.setStyleSheet("background-color: #d97706; color: white; font-weight: bold;")
+        self._word_adjust_btn.blockSignals(False)
+        self._refresh_word_adjust_bar()
+        self.canvas.setFocus()
+        self.canvas.update()
+        self.word_adjust_mode_changed.emit(True)
+
+    def exit_word_adjust_mode(self, restore_view: bool = True) -> None:
+        if not self._word_adjust_active:
+            self._word_adjust_btn.blockSignals(True)
+            self._word_adjust_btn.setChecked(False)
+            self._word_adjust_btn.setStyleSheet("")
+            self._word_adjust_btn.blockSignals(False)
+            return
+        self._word_adjust_active = False
+        self.canvas.word_adjust_mode = False
+        self._word_adjust_bar.setVisible(False)
+        self._word_adjust_btn.blockSignals(True)
+        self._word_adjust_btn.setChecked(False)
+        self._word_adjust_btn.setStyleSheet("")
+        self._word_adjust_btn.blockSignals(False)
+        if restore_view:
+            self.canvas.px_per_cs = self._saved_px_per_cs
+            self.canvas.set_scroll_x_cs(self._saved_scroll_x_cs)
+        self.canvas.update()
+        self.word_adjust_mode_changed.emit(False)
+
+    def toggle_word_adjust_mode(self) -> None:
+        if self._word_adjust_active:
+            self.exit_word_adjust_mode()
+        else:
+            self.enter_word_adjust_mode()
+
+    def _step_word_adjust_target(self, direction: int) -> None:
+        if not self.project:
+            return
+        flat = self.canvas._flat_syllable_coords()
+        if not flat:
+            return
+        cur = (self.canvas.page_idx, self.canvas.line_idx, self.canvas.selected_syl)
+        idx = flat.index(cur) if cur in flat else 0
+        nxt_idx = max(0, min(len(flat) - 1, idx + direction))
+        p_idx, l_idx, s_idx = flat[nxt_idx]
+        self.set_selection(p_idx, l_idx, center=False)
+        self.canvas.select_single(p_idx, l_idx, s_idx)
+        self.selection_changed.emit(p_idx, l_idx)
+        line = self.canvas.get_line(p_idx, l_idx)
+        if line and 0 <= s_idx < len(line.syllables):
+            self._focus_word_in_viewport(line.syllables[s_idx])
+        self._refresh_word_adjust_bar()
+        self.canvas.setFocus()
+
+    def _nudge_current_word(self, edge: str, delta_cs: int) -> None:
+        cur = self._current_syllable()
+        if cur is None:
+            return
+        p_idx, l_idx, s_idx, line, syl = cur
+        if line.nudge_syllable_border(s_idx, edge, delta_cs, sticky=self.canvas.sticky_borders):
+            self.canvas.update()
+            self._refresh_word_adjust_bar()
+            edge_lbl = "Start" if edge == "left" else "End"
+            txt = syl.text.strip() or "␣"
+            self.project_mutated.emit(
+                f"Nudge '{txt}' {edge_lbl} ({delta_cs:+d} cs) (P{p_idx + 1} L{l_idx + 1})"
+            )
+            self.canvas.setFocus()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.toggle_word_adjust_mode()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._word_adjust_active:
+            self.exit_word_adjust_mode()
+            event.accept()
+            return
+        super().keyPressEvent(event)

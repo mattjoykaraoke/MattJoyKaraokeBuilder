@@ -180,6 +180,8 @@ class MainWindow(QMainWindow):
     def _sync_minimap_from_active_tab(self) -> None:
         cs = self.audio.smooth_position_cs
         if self._tabs.currentWidget() is self.display_view:
+            if self.wiping_view.is_word_adjust_mode:
+                self.wiping_view.exit_word_adjust_mode()
             self.display_view.set_playhead_cs(cs, follow_if_playing=False)
             self.minimap.set_viewport(self.display_view.canvas.scroll_x_cs, self.display_view.canvas.view_span_cs())
         else:
@@ -201,6 +203,11 @@ class MainWindow(QMainWindow):
         self._play_line_btn = QPushButton("Play Line")
         self._play_line_btn.clicked.connect(self._play_selected_line)
         layout.addWidget(self._play_line_btn)
+
+        self._play_word_btn = QPushButton("Play Word")
+        self._play_word_btn.setToolTip("Play the selected word/syllable and stop right at its end")
+        self._play_word_btn.clicked.connect(self._play_selected_word)
+        layout.addWidget(self._play_word_btn)
 
         layout.addWidget(QLabel("Speed:"))
         self._speed_combo = QComboBox()
@@ -308,6 +315,12 @@ class MainWindow(QMainWindow):
         act_dup_page.triggered.connect(self.wiping_view._duplicate_selected_page)
         m_edit.addAction(act_dup_page)
 
+        m_edit.addSeparator()
+        self._act_word_adjust = QAction("&Word Adjust Mode (Enter)", self)
+        self._act_word_adjust.setCheckable(True)
+        self._act_word_adjust.toggled.connect(self._toggle_word_adjust_from_menu)
+        m_edit.addAction(self._act_word_adjust)
+
         m_win = mb.addMenu("&Windows")
         act_reset_all = QAction("&Reset All Windows to Default", self)
         act_reset_all.triggered.connect(lambda: self.display_view._reset_windows(all_pages=True))
@@ -334,12 +347,12 @@ class MainWindow(QMainWindow):
 
         act_play = QAction("Play / Pause", self)
         act_play.setShortcut(QKeySequence(Qt.Key.Key_Space))
-        act_play.triggered.connect(self.audio.toggle_play)
+        act_play.triggered.connect(self._on_space_pressed)
         self.addAction(act_play)
 
-        act_clear_sel = QAction("Clear Selection", self)
+        act_clear_sel = QAction("Clear Selection / Exit Word Adjust", self)
         act_clear_sel.setShortcut(QKeySequence(Qt.Key.Key_Escape))
-        act_clear_sel.triggered.connect(self.wiping_view.canvas.clear_selection)
+        act_clear_sel.triggered.connect(self._on_escape_pressed)
         self.addAction(act_clear_sel)
 
     def _wire_signals(self) -> None:
@@ -363,6 +376,8 @@ class MainWindow(QMainWindow):
         self.wiping_view.auto_reset_display_changed.connect(self._on_auto_reset_display_changed)
 
         self.wiping_view.play_line_requested.connect(self.audio.play_range)
+        self.wiping_view.play_word_requested.connect(self.audio.play_range)
+        self.wiping_view.word_adjust_mode_changed.connect(self._on_word_adjust_mode_changed)
 
     def _on_auto_reset_display_changed(self, enabled: bool) -> None:
         self._settings.setValue("auto_reset_display", bool(enabled))
@@ -432,6 +447,37 @@ class MainWindow(QMainWindow):
         if 0 <= p_idx < len(self.project.pages) and 0 <= l_idx < len(self.project.pages[p_idx].lines):
             ln = self.project.pages[p_idx].lines[l_idx]
             self.audio.play_range(max(0, ln.first_syl_start - 15), ln.last_syl_end)
+
+    def _play_selected_word(self) -> None:
+        self.wiping_view.play_current_word()
+
+    def _toggle_word_adjust_from_menu(self, checked: bool) -> None:
+        if checked:
+            if self._tabs.currentWidget() is not self.wiping_view:
+                self._tabs.setCurrentWidget(self.wiping_view)
+            self.wiping_view.enter_word_adjust_mode()
+        else:
+            self.wiping_view.exit_word_adjust_mode()
+
+    def _on_word_adjust_mode_changed(self, active: bool) -> None:
+        self._act_word_adjust.blockSignals(True)
+        self._act_word_adjust.setChecked(active)
+        self._act_word_adjust.blockSignals(False)
+
+    def _on_space_pressed(self) -> None:
+        if self._tabs.currentWidget() is self.wiping_view and self.wiping_view.is_word_adjust_mode:
+            if self.audio.is_playing:
+                self.audio.pause()
+            else:
+                self.wiping_view.play_current_word()
+        else:
+            self.audio.toggle_play()
+
+    def _on_escape_pressed(self) -> None:
+        if self.wiping_view.is_word_adjust_mode:
+            self.wiping_view.exit_word_adjust_mode()
+        else:
+            self.wiping_view.canvas.clear_selection()
 
     def _open_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open KBP Project", "", "Karaoke Builder Projects (*.kbp);;All Files (*.*)")

@@ -458,6 +458,76 @@ class Line:
             self.display_start = glyph_start
         return True
 
+    def nudge_syllable_border(
+        self,
+        syl_idx: int,
+        edge: str,
+        delta_cs: int,
+        sticky: bool = True,
+        sticky_tolerance_cs: int = 2,
+    ) -> bool:
+        """
+        Nudge a syllable's 'left' (start) or 'right' (end) border by `delta_cs`.
+        When `sticky` is True and the adjacent syllable is touching (gap <= sticky_tolerance_cs),
+        the shared border moves together while preserving at least 1 cs duration for both syllables.
+        Returns True if any timestamp changed.
+        """
+        if not (0 <= syl_idx < len(self.syllables)) or delta_cs == 0:
+            return False
+        syl = self.syllables[syl_idx]
+
+        if edge == "left":
+            sticky_neighbor: Optional[Syllable] = None
+            if sticky and syl_idx > 0:
+                prev_syl = self.syllables[syl_idx - 1]
+                if abs(prev_syl.end - syl.start) <= sticky_tolerance_cs:
+                    sticky_neighbor = prev_syl
+
+            if sticky_neighbor is not None:
+                min_cs = sticky_neighbor.start + 1
+            elif syl_idx > 0:
+                min_cs = self.syllables[syl_idx - 1].end
+            else:
+                min_cs = 0
+
+            max_cs = syl.end - 1
+            if max_cs < min_cs:
+                return False
+            new_start = max(min_cs, min(syl.start + delta_cs, max_cs))
+            if new_start == syl.start:
+                return False
+            syl.start = new_start
+            if sticky_neighbor is not None:
+                sticky_neighbor.end = new_start
+            return True
+
+        if edge == "right":
+            sticky_neighbor = None
+            if sticky and syl_idx + 1 < len(self.syllables):
+                next_syl = self.syllables[syl_idx + 1]
+                if abs(next_syl.start - syl.end) <= sticky_tolerance_cs:
+                    sticky_neighbor = next_syl
+
+            if sticky_neighbor is not None:
+                max_cs = sticky_neighbor.end - 1
+            elif syl_idx + 1 < len(self.syllables):
+                max_cs = self.syllables[syl_idx + 1].start
+            else:
+                max_cs = 10_000_000
+
+            min_cs = syl.start + 1
+            if max_cs < min_cs:
+                return False
+            new_end = min(max_cs, max(syl.end + delta_cs, min_cs))
+            if new_end == syl.end:
+                return False
+            syl.end = new_end
+            if sticky_neighbor is not None:
+                sticky_neighbor.start = new_end
+            return True
+
+        return False
+
     def format_lines(self) -> List[str]:
         header = "/".join(
             [self.align, self.style, str(self.display_start), str(self.display_end), *self.extra_fields]

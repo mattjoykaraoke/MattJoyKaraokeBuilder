@@ -345,3 +345,46 @@ def test_insert_syllable_between_adjacent_and_short_neighbors():
             assert s.start >= ln2.syllables[i - 1].end
     # Downstream 'c' was completely untouched because the ripple was absorbed by the gap!
     assert ln2.syllables[3].start == 1040 and ln2.syllables[3].end == 1080
+
+
+def test_nudge_syllable_border_sticky_and_non_sticky():
+    # Syllables: "Hel" (100..150), "lo " (151..200) [touching within 2 cs], "world" (230..280) [gap 30 cs]
+    ln = Line(
+        "C", "A", 50, 330,
+        syllables=[
+            Syllable("Hel", 100, 150),
+            Syllable("lo ", 151, 200),
+            Syllable("world", 230, 280),
+        ],
+    )
+
+    # 1. Sticky ON: nudging "lo " left border left by -5 cs pulls touching "Hel" end along with it
+    assert ln.nudge_syllable_border(1, "left", -5, sticky=True)
+    assert ln.syllables[1].start == 146
+    assert ln.syllables[0].end == 146
+
+    # 2. Sticky ON: nudging "lo " left border right by +3 cs pushes "Hel" end right along with it
+    assert ln.nudge_syllable_border(1, "left", +3, sticky=True)
+    assert ln.syllables[1].start == 149
+    assert ln.syllables[0].end == 149
+
+    # 3. Sticky ON, but "lo " and "world" have a 30 cs gap (> 2 cs) -> NOT sticky, moves independently
+    assert ln.nudge_syllable_border(1, "right", +10, sticky=True)
+    assert ln.syllables[1].end == 210
+    assert ln.syllables[2].start == 230
+
+    # 4. Sticky OFF: nudging "lo " left border right leaves "Hel" end untouched
+    assert ln.nudge_syllable_border(1, "left", +5, sticky=False)
+    assert ln.syllables[1].start == 154
+    assert ln.syllables[0].end == 149
+
+    # 5. Clamping: cannot cross neighbor or collapse duration below 1 cs
+    assert ln.nudge_syllable_border(1, "left", -100, sticky=False)
+    assert ln.syllables[1].start == 149  # clamped to prev.end
+    assert not ln.nudge_syllable_border(1, "left", -1, sticky=False)  # already at limit
+
+    # 6. Sticky clamping: cannot collapse neighbor below 1 cs duration
+    assert ln.nudge_syllable_border(1, "left", -100, sticky=True)
+    assert ln.syllables[1].start == 101
+    assert ln.syllables[0].end == 101  # prev keeps >= 1 cs duration (100..101)
+    assert not ln.nudge_syllable_border(1, "left", -1, sticky=True)
