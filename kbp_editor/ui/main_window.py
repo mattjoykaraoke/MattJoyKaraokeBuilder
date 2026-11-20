@@ -6,6 +6,7 @@ from typing import List, Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -213,6 +214,12 @@ class MainWindow(QMainWindow):
         self._load_vocal_btn.clicked.connect(self._open_vocal_stem_dialog)
         layout.addWidget(self._load_vocal_btn)
 
+        self._scrub_audio_cb = QCheckBox("Scrub Audio")
+        self._scrub_audio_cb.setChecked(False)
+        self._scrub_audio_cb.setToolTip("Hear short audio snippets while dragging the playhead")
+        self._scrub_audio_cb.toggled.connect(self.audio.set_scrub_audio_enabled)
+        layout.addWidget(self._scrub_audio_cb)
+
         layout.addSpacing(12)
         btn_zin = QPushButton("Zoom +")
         btn_zin.clicked.connect(lambda: self._zoom_active(1.25))
@@ -364,7 +371,7 @@ class MainWindow(QMainWindow):
             self.minimap.set_viewport(start_cs, span_cs)
 
     def _scrub_to(self, cs: float) -> None:
-        self.audio.set_position_cs(cs)
+        self.audio.set_position_cs(cs, scrub_audio=True)
         self._on_playhead_moved(cs)
 
     def _on_playhead_moved(self, cs: float) -> None:

@@ -6,22 +6,32 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtCore import QIODevice, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtMultimedia import QAudioFormat, QAudioOutput, QAudioSink, QMediaDevices, QMediaPlayer
 
 
 class WaveformData:
-    """Precomputed peak envelope for fast zoomable waveform rendering."""
+    """Precomputed peak envelope + compact mono int16 PCM buffer for low-latency audio scrubbing."""
 
-    def __init__(self, peaks: np.ndarray, duration_cs: int, buckets_per_sec: int = 200) -> None:
+    def __init__(
+        self,
+        peaks: np.ndarray,
+        duration_cs: int,
+        buckets_per_sec: int = 200,
+        scrub_pcm: Optional[np.ndarray] = None,
+        scrub_sr: int = 22050,
+    ) -> None:
         self.peaks = peaks  # float32 array in [0.0, 1.0]
         self.duration_cs = duration_cs
         self.buckets_per_sec = buckets_per_sec
+        self.scrub_pcm = scrub_pcm  # optional 1D int16 mono PCM for instant scrubbing
+        self.scrub_sr = scrub_sr
 
     @classmethod
     def from_file(cls, path: str | Path, buckets_per_sec: int = 200) -> "WaveformData":
         data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-        mono = np.abs(data).mean(axis=1)
+        mono_signed = data.mean(axis=1)
+        mono = np.abs(mono_signed)
         total_samples = len(mono)
         duration_sec = total_samples / max(1, sr)
         duration_cs = int(round(duration_sec * 100))
@@ -33,7 +43,23 @@ class WaveformData:
         max_val = float(peaks.max()) if len(peaks) else 1.0
         if max_val > 1e-6:
             peaks = peaks / max_val
-        return cls(peaks=peaks.astype(np.float32), duration_cs=duration_cs, buckets_per_sec=buckets_per_sec)
+
+        # Compact mono int16 PCM (~22 kHz) for <5 ms latency audio scrubbing
+        if sr >= 40000:
+            pcm_f = mono_signed[::2]
+            scrub_sr = sr // 2
+        else:
+            pcm_f = mono_signed
+            scrub_sr = sr
+        scrub_pcm = np.clip(pcm_f * 32767.0, -32768.0, 32767.0).astype(np.int16)
+
+        return cls(
+            peaks=peaks.astype(np.float32),
+            duration_cs=duration_cs,
+            buckets_per_sec=buckets_per_sec,
+            scrub_pcm=scrub_pcm,
+            scrub_sr=int(scrub_sr),
+        )
 
 
 class AudioEngine(QObject):
@@ -73,6 +99,22 @@ class AudioEngine(QObject):
         self._play_start_wall: float = 0.0
         self._play_start_pos_ms: float = 0.0
 
+        # Seek-guard & debounced backend seek so rapid backward scrubbing never causes stale jumps
+        self._seek_target_ms: float = 0.0
+        self._seek_guard_until: float = 0.0
+        self._pending_seek_ms: Optional[int] = None
+        self._seek_debounce_timer = QTimer(self)
+        self._seek_debounce_timer.setSingleShot(True)
+        self._seek_debounce_timer.setInterval(35)
+        self._seek_debounce_timer.timeout.connect(self._flush_pending_seek)
+
+        # Low-latency scrub audio output
+        self.scrub_audio_enabled: bool = False
+        self._scrub_sink: Optional[QAudioSink] = None
+        self._scrub_io: Optional[QIODevice] = None
+        self._scrub_sink_sr: int = 0
+        self._last_scrub_grain_wall: float = 0.0
+
         self._stop_at_cs: Optional[float] = None
         self._poll_timer = QTimer(self)
         self._poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -91,16 +133,30 @@ class AudioEngine(QObject):
         self._last_tick_wall = now
         self._smooth_cs = pos / 10.0
 
+    def _flush_pending_seek(self) -> None:
+        if self._pending_seek_ms is not None:
+            target = self._pending_seek_ms
+            self._pending_seek_ms = None
+            self._seek_target_ms = float(target)
+            self._seek_guard_until = time.perf_counter() + 0.22
+            self._player.setPosition(target)
+
     def _on_backend_position(self, pos_ms: int) -> None:
         now = time.perf_counter()
+        # Ignore stale pre-seek callbacks emitted asynchronously by Windows media backend
+        if now < self._seek_guard_until and abs(pos_ms - self._seek_target_ms) > 120.0:
+            return
         if not self.is_playing:
-            self._reanchor(float(pos_ms))
+            # While paused, user's scrub position is authoritative; don't let stale backend ticks jump it
+            self._backend_pos_ms = float(pos_ms)
+            self._backend_wall = now
             return
         self._backend_pos_ms = float(pos_ms)
         self._backend_wall = now
         if self._awaiting_audio_start:
-            # Wait until audio hardware actually begins advancing before ticking the playhead
-            if abs(pos_ms - self._play_start_pos_ms) >= 1.0:
+            # Only unlock once backend actually advances forward near our start target
+            delta = pos_ms - self._play_start_pos_ms
+            if 1.0 <= delta <= 250.0:
                 self._awaiting_audio_start = False
                 self._clock_ms = float(pos_ms)
                 self._last_tick_wall = now
@@ -173,15 +229,98 @@ class AudioEngine(QObject):
     def position_cs(self) -> int:
         return int(round(self.smooth_position_cs))
 
-    def set_position_cs(self, cs: float) -> None:
+    def set_scrub_audio_enabled(self, enabled: bool) -> None:
+        self.scrub_audio_enabled = bool(enabled)
+        if not self.scrub_audio_enabled:
+            self._stop_scrub_sink()
+
+    def _stop_scrub_sink(self) -> None:
+        if self._scrub_sink is not None:
+            try:
+                self._scrub_sink.stop()
+            except Exception:
+                pass
+            self._scrub_io = None
+
+    def _ensure_scrub_sink(self, sr: int) -> Optional[QIODevice]:
+        if sr <= 0:
+            return None
+        if self._scrub_sink is not None and self._scrub_sink_sr == sr and self._scrub_io is not None:
+            return self._scrub_io
+        self._stop_scrub_sink()
+        try:
+            dev = QMediaDevices.defaultAudioOutput()
+            if dev.isNull():
+                return None
+            fmt = QAudioFormat()
+            fmt.setSampleRate(sr)
+            fmt.setChannelCount(1)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+            self._scrub_sink = QAudioSink(dev, fmt, self)
+            self._scrub_sink.setVolume(self._output.volume())
+            self._scrub_sink.setBufferSize(max(2048, int(sr * 2 * 0.12)))
+            self._scrub_io = self._scrub_sink.start()
+            self._scrub_sink_sr = sr
+            return self._scrub_io
+        except Exception:
+            self._scrub_sink = None
+            self._scrub_io = None
+            return None
+
+    def play_scrub_grain(self, cs: float) -> None:
+        """Play a smooth 65 ms windowed PCM audio grain at `cs` while dragging the playhead."""
+        if not self.scrub_audio_enabled or self.is_playing:
+            return
+        now = time.perf_counter()
+        if (now - self._last_scrub_grain_wall) < 0.045:
+            return
+        wf = self.active_waveform
+        if wf is None or wf.scrub_pcm is None or len(wf.scrub_pcm) == 0:
+            return
+        io = self._ensure_scrub_sink(wf.scrub_sr)
+        if io is None:
+            return
+
+        self._last_scrub_grain_wall = now
+        sr = wf.scrub_sr
+        grain_len = max(64, int(sr * 0.065))  # 65 ms grain
+        start_idx = max(0, min(len(wf.scrub_pcm) - grain_len, int((cs / 100.0) * sr)))
+        chunk = wf.scrub_pcm[start_idx : start_idx + grain_len].astype(np.float32)
+        if len(chunk) < 16:
+            return
+
+        # Apply smooth 8 ms cosine fade-in/out to prevent clicks/pops
+        fade = min(len(chunk) // 4, max(8, int(sr * 0.008)))
+        ramp = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, fade, dtype=np.float32)))
+        chunk[:fade] *= ramp
+        chunk[-fade:] *= ramp[::-1]
+        pcm_bytes = np.clip(chunk, -32768.0, 32767.0).astype(np.int16).tobytes()
+        try:
+            io.write(pcm_bytes)
+        except Exception:
+            pass
+
+    def set_position_cs(self, cs: float, *, scrub_audio: bool = False) -> None:
         cs = max(0.0, float(cs))
         pos_ms = cs * 10.0
-        self._player.setPosition(int(round(pos_ms)))
+        target_int = int(round(pos_ms))
         self._reanchor(pos_ms)
+        self._seek_target_ms = pos_ms
+        self._seek_guard_until = time.perf_counter() + 0.22
+
         if self.is_playing and not self._player.source().isEmpty():
             self._awaiting_audio_start = True
             self._play_start_wall = time.perf_counter()
             self._play_start_pos_ms = pos_ms
+
+        # Debounce rapid drag seeks to QMediaPlayer so async Windows seeks never pile up
+        self._pending_seek_ms = target_int
+        if not self._seek_debounce_timer.isActive():
+            self._seek_debounce_timer.start()
+
+        if scrub_audio:
+            self.play_scrub_grain(cs)
+
         self.position_changed_float.emit(cs)
         self.position_changed.emit(int(round(cs)))
 
@@ -193,11 +332,23 @@ class AudioEngine(QObject):
         self._player.setPlaybackRate(self._rate)
 
     def set_volume(self, vol: float) -> None:
-        self._output.setVolume(max(0.0, min(1.0, vol)))
+        v = max(0.0, min(1.0, vol))
+        self._output.setVolume(v)
+        if self._scrub_sink is not None:
+            self._scrub_sink.setVolume(v)
 
     def play(self) -> None:
+        self._stop_scrub_sink()
         self._stop_at_cs = None
         cur_ms = self._smooth_cs * 10.0
+        # Ensure any debounced scrub position is committed to QMediaPlayer before play starts
+        self._seek_debounce_timer.stop()
+        self._pending_seek_ms = None
+        target_int = int(round(cur_ms))
+        self._seek_target_ms = cur_ms
+        self._seek_guard_until = time.perf_counter() + 0.22
+        if not self._player.source().isEmpty():
+            self._player.setPosition(target_int)
         self._reanchor(cur_ms)
         self._awaiting_audio_start = not self._player.source().isEmpty()
         self._play_start_wall = time.perf_counter()
@@ -220,8 +371,13 @@ class AudioEngine(QObject):
             self.play()
 
     def play_range(self, start_cs: int, end_cs: int) -> None:
+        self._stop_scrub_sink()
+        self._seek_debounce_timer.stop()
+        self._pending_seek_ms = None
         self._stop_at_cs = float(max(start_cs + 1, end_cs))
         pos_ms = float(max(0, start_cs) * 10)
+        self._seek_target_ms = pos_ms
+        self._seek_guard_until = time.perf_counter() + 0.22
         self._player.setPosition(int(round(pos_ms)))
         self._reanchor(pos_ms)
         self._awaiting_audio_start = not self._player.source().isEmpty()
