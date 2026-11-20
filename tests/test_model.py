@@ -158,3 +158,78 @@ def test_real_true_love_kbp_roundtrip_and_optimize(tmp_path):
     assert opt_pages == [0, 1, 3, 5]
     # Page 7 (index 6) starts with ➣➣➣ right after Page 6 (no gap) so it must NOT be shrunk
     assert proj.pages[6].lines[0].display_start == proj.pages[6].first_syl_start - 300
+
+
+def test_insert_and_multi_delete_syllables():
+    proj = _sample_project()
+    line = proj.pages[0].lines[0]
+    assert len(line.syllables) == 3
+
+    # Insert two syllables ("new ", "word") at end of line
+    assert line.insert_syllables(len(line.syllables), ["new ", "word"], duration_cs=25)
+    assert len(line.syllables) == 5
+    assert line.syllables[2].text.endswith(" ")
+    assert line.syllables[3].text == "new "
+    assert line.syllables[3].start == 1300
+    assert line.syllables[4].text == "word"
+    assert line.syllables[4].end == 1350
+
+    # Delete multiple syllables at once
+    assert line.delete_syllables([3, 4])
+    assert len(line.syllables) == 3
+
+
+def test_duplicate_line_and_page_assigns_b_and_c_styles():
+    proj = _sample_project()
+    # Duplicating an [A] line produces a [B] line right after it
+    dup_l = proj.duplicate_line(0, 0)
+    assert dup_l is not None
+    assert dup_l.style == "B"
+    assert len(proj.pages[0].lines) == 3
+
+    # Duplicating that [B] line produces a [C] line
+    dup_l2 = proj.duplicate_line(0, 1)
+    assert dup_l2 is not None
+    assert dup_l2.style == "C"
+
+    # Duplicating Page 2 ([A]) with pick_duplicate_style produces [B]
+    style_b = proj.pick_duplicate_style(proj.pages[1].lines)
+    assert style_b == "B"
+    new_p = proj.duplicate_page(page_number=2, target_style=style_b)
+    assert all(ln.style == "B" for ln in new_p.lines)
+
+    # Duplicating the new [B] page picks [C]
+    style_c = proj.pick_duplicate_style(new_p.lines)
+    assert style_c == "C"
+
+    # In-place page duplication keeps exact same timestamps for dragging
+    src_start = proj.pages[0].first_syl_start
+    in_place_p = proj.duplicate_page(page_number=1, target_style="B", in_place=True)
+    assert in_place_p.first_syl_start == src_start
+
+
+def test_line_and_page_crud():
+    proj = _sample_project()
+    # Add & delete line
+    orig_lines = len(proj.pages[0].lines)
+    added = proj.add_line(0, 0, ["new ", "line"], duration_cs=25, style="A")
+    assert added is not None
+    assert len(proj.pages[0].lines) == orig_lines + 1
+    assert proj.delete_line(0, 1)
+    assert len(proj.pages[0].lines) == orig_lines
+
+    # Split & join page
+    orig_pages = len(proj.pages)
+    assert proj.split_page(0, 1)
+    assert len(proj.pages) == orig_pages + 1
+    assert len(proj.pages[0].lines) == 1
+    assert len(proj.pages[1].lines) == 1
+    assert proj.join_pages(0)
+    assert len(proj.pages) == orig_pages
+    assert len(proj.pages[0].lines) == 2
+
+    # Add & delete page
+    proj.add_page(0, [["fresh ", "page"]], duration_cs=30)
+    assert len(proj.pages) == orig_pages + 1
+    assert proj.delete_page(1)
+    assert len(proj.pages) == orig_pages

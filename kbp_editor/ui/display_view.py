@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QRectF, Signal
+from PySide6.QtCore import Qt, QLineF, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -28,6 +28,9 @@ RULER_H = 28
 ROW_H = 28
 PAGE_GAP = 10
 HANDLE_HIT_PX = 8
+
+
+DEFAULT_DISPLAY_PX_PER_CS = 0.25
 
 
 class _DisplayTimelineCanvas(QWidget):
@@ -237,8 +240,11 @@ class _DisplayTimelineCanvas(QWidget):
     def _paint_playhead(self, painter: QPainter, h: int) -> None:
         x = self.cs_to_x(self.playhead_cs)
         if x >= LABEL_COL_W:
-            painter.setPen(QPen(QColor(255, 70, 90), 2))
-            painter.drawLine(int(round(x)), 0, int(round(x)), h)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(255, 70, 90), 2.0))
+            painter.drawLine(QLineF(x, 0.0, x, float(h)))
+            painter.restore()
 
     def _hit_test(self, x: float, y: float) -> Tuple[Optional[str], int, int]:
         if y < RULER_H and x >= LABEL_COL_W:
@@ -516,6 +522,11 @@ class DisplayRemoveView(QWidget):
         self.canvas.px_per_cs = max(0.03, min(4.0, self.canvas.px_per_cs * factor))
         self.canvas.center_on_cs(center_cs)
 
+    def reset_zoom(self) -> None:
+        center_cs = self.canvas.scroll_x_cs + self.canvas.view_span_cs() * 0.5
+        self.canvas.px_per_cs = DEFAULT_DISPLAY_PX_PER_CS
+        self.canvas.center_on_cs(center_cs)
+
     def _on_canvas_viewport(self, start_cs: float, span_cs: float) -> None:
         self._hscroll.blockSignals(True)
         self._hscroll.setPageStep(max(100, int(span_cs)))
@@ -563,10 +574,12 @@ class DisplayRemoveView(QWidget):
     def _duplicate_selected_page(self) -> None:
         if not self.project or not self.project.pages:
             return
-        p_num = self.canvas.selected_page + 1
-        self.project.duplicate_page(page_number=p_num)
+        p_idx = self.canvas.selected_page
+        p_num = p_idx + 1
+        target_style = self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
+        self.project.duplicate_page(page_number=p_num, target_style=target_style, in_place=True)
         self.canvas.set_project(self.project)
-        self.project_mutated.emit(f"Duplicate Page {p_num}")
+        self.project_mutated.emit(f"Duplicate Page {p_num} → [{target_style}]")
 
     def _reset_windows(self, all_pages: bool) -> None:
         if not self.project or not self.project.pages:

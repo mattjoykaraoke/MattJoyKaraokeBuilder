@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 
@@ -62,14 +62,20 @@ class AudioEngine(QObject):
         self.vocal_waveform: Optional[WaveformData] = None
         self.duration_cs: int = 0
 
-        # Smooth interpolation state
+        # Smooth monotonic PLL interpolation state
         self._rate: float = 1.0
-        self._anchor_pos_ms: float = 0.0
-        self._anchor_wall: float = time.perf_counter()
+        self._clock_ms: float = 0.0
+        self._last_tick_wall: float = time.perf_counter()
+        self._backend_pos_ms: float = 0.0
+        self._backend_wall: float = time.perf_counter()
         self._smooth_cs: float = 0.0
+        self._awaiting_audio_start: bool = False
+        self._play_start_wall: float = 0.0
+        self._play_start_pos_ms: float = 0.0
 
         self._stop_at_cs: Optional[float] = None
         self._poll_timer = QTimer(self)
+        self._poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._poll_timer.setInterval(16)  # ~60 fps
         self._poll_timer.timeout.connect(self._on_poll)
 
@@ -77,20 +83,28 @@ class AudioEngine(QObject):
         self._player.positionChanged.connect(self._on_backend_position)
 
     def _reanchor(self, pos_ms: float) -> None:
-        self._anchor_pos_ms = max(0.0, pos_ms)
-        self._anchor_wall = time.perf_counter()
-        self._smooth_cs = self._anchor_pos_ms / 10.0
+        now = time.perf_counter()
+        pos = max(0.0, float(pos_ms))
+        self._clock_ms = pos
+        self._backend_pos_ms = pos
+        self._backend_wall = now
+        self._last_tick_wall = now
+        self._smooth_cs = pos / 10.0
 
     def _on_backend_position(self, pos_ms: int) -> None:
+        now = time.perf_counter()
         if not self.is_playing:
             self._reanchor(float(pos_ms))
             return
-        # Re-anchor only if backend jumped significantly (> 60 ms drift) so we stay smooth & synced
-        now = time.perf_counter()
-        predicted_ms = self._anchor_pos_ms + (now - self._anchor_wall) * 1000.0 * self._rate
-        if abs(pos_ms - predicted_ms) > 60.0:
-            self._anchor_pos_ms = float(pos_ms)
-            self._anchor_wall = now
+        self._backend_pos_ms = float(pos_ms)
+        self._backend_wall = now
+        if self._awaiting_audio_start:
+            # Wait until audio hardware actually begins advancing before ticking the playhead
+            if abs(pos_ms - self._play_start_pos_ms) >= 1.0:
+                self._awaiting_audio_start = False
+                self._clock_ms = float(pos_ms)
+                self._last_tick_wall = now
+                self._smooth_cs = self._clock_ms / 10.0
 
     def load_main(self, path: str | Path) -> bool:
         p = Path(path)
@@ -152,8 +166,7 @@ class AudioEngine(QObject):
     @property
     def smooth_position_cs(self) -> float:
         if self.is_playing:
-            elapsed_ms = (time.perf_counter() - self._anchor_wall) * 1000.0 * self._rate
-            return max(0.0, (self._anchor_pos_ms + elapsed_ms) / 10.0)
+            return max(0.0, self._clock_ms / 10.0)
         return self._smooth_cs
 
     @property
@@ -165,6 +178,10 @@ class AudioEngine(QObject):
         pos_ms = cs * 10.0
         self._player.setPosition(int(round(pos_ms)))
         self._reanchor(pos_ms)
+        if self.is_playing and not self._player.source().isEmpty():
+            self._awaiting_audio_start = True
+            self._play_start_wall = time.perf_counter()
+            self._play_start_pos_ms = pos_ms
         self.position_changed_float.emit(cs)
         self.position_changed.emit(int(round(cs)))
 
@@ -180,13 +197,18 @@ class AudioEngine(QObject):
 
     def play(self) -> None:
         self._stop_at_cs = None
-        self._reanchor(self._smooth_cs * 10.0)
+        cur_ms = self._smooth_cs * 10.0
+        self._reanchor(cur_ms)
+        self._awaiting_audio_start = not self._player.source().isEmpty()
+        self._play_start_wall = time.perf_counter()
+        self._play_start_pos_ms = cur_ms
         self._player.play()
         self._poll_timer.start()
 
     def pause(self) -> None:
         cur_ms = self.smooth_position_cs * 10.0
         self._stop_at_cs = None
+        self._awaiting_audio_start = False
         self._player.pause()
         self._poll_timer.stop()
         self._reanchor(cur_ms)
@@ -199,26 +221,56 @@ class AudioEngine(QObject):
 
     def play_range(self, start_cs: int, end_cs: int) -> None:
         self._stop_at_cs = float(max(start_cs + 1, end_cs))
-        pos_ms = max(0, start_cs) * 10
-        self._player.setPosition(pos_ms)
-        self._reanchor(float(pos_ms))
+        pos_ms = float(max(0, start_cs) * 10)
+        self._player.setPosition(int(round(pos_ms)))
+        self._reanchor(pos_ms)
+        self._awaiting_audio_start = not self._player.source().isEmpty()
+        self._play_start_wall = time.perf_counter()
+        self._play_start_pos_ms = pos_ms
         self._player.play()
         self._poll_timer.start()
 
     def _on_poll(self) -> None:
-        cs = self.smooth_position_cs
+        now = time.perf_counter()
+        dt = max(0.0, min(0.1, now - self._last_tick_wall))
+        self._last_tick_wall = now
+
+        if self._awaiting_audio_start:
+            # Hold position while Windows audio backend warms up (avoids start jump-back)
+            if (now - self._play_start_wall) < 0.35:
+                return
+            self._awaiting_audio_start = False
+            self._backend_wall = now
+
+        # Phase-locked smooth advance: strictly forward, never jumps backwards on backend jitter
+        est_backend_ms = self._backend_pos_ms + (now - self._backend_wall) * 1000.0 * self._rate
+        err_ms = est_backend_ms - self._clock_ms
+        if abs(err_ms) > 300.0:
+            self._clock_ms = max(0.0, est_backend_ms)
+        else:
+            slew = 1.0 + max(-0.08, min(0.08, err_ms / 400.0))
+            self._clock_ms = max(0.0, self._clock_ms + dt * 1000.0 * self._rate * slew)
+
+        cs = self._clock_ms / 10.0
+        if self._stop_at_cs is not None and cs >= self._stop_at_cs:
+            stop_cs = self._stop_at_cs
+            self._clock_ms = stop_cs * 10.0
+            self._smooth_cs = stop_cs
+            self.position_changed_float.emit(stop_cs)
+            self.position_changed.emit(int(round(stop_cs)))
+            self.pause()
+            return
         self._smooth_cs = cs
         self.position_changed_float.emit(cs)
         self.position_changed.emit(int(round(cs)))
-        if self._stop_at_cs is not None and cs >= self._stop_at_cs:
-            self.pause()
 
     def _on_playback_state(self, state: QMediaPlayer.PlaybackState) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         if playing:
-            self._anchor_wall = time.perf_counter()
+            self._last_tick_wall = time.perf_counter()
             if not self._poll_timer.isActive():
                 self._poll_timer.start()
         else:
+            self._awaiting_audio_start = False
             self._poll_timer.stop()
         self.state_changed.emit(playing)

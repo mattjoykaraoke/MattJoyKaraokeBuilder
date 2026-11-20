@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
 )
 from PySide6.QtWidgets import QPushButton, QWidget
 
@@ -48,12 +49,25 @@ class PreviewCanvas(QWidget):
         self._time_cs: float = 0.0
         self._use_palette_bg: bool = True
         self._show_hud: bool = True
+        # Cache rendered (unwiped_pm, wiped_pm, x_start_widget, syl_widths_widget) per line
+        self._line_cache: Dict[Tuple, Tuple[QPixmap, QPixmap, float, List[float]]] = {}
+        self._hud_font = QFont("Consolas")
+        self._hud_font.setPixelSize(28)
         self.setMinimumSize(320, 180)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
+    def invalidate_cache(self) -> None:
+        self._line_cache.clear()
+        self.update()
+
     def set_project(self, project: Optional[KbpProject]) -> None:
         self._project = project
+        self._line_cache.clear()
         self.update()
+
+    def resizeEvent(self, event) -> None:
+        self._line_cache.clear()
+        super().resizeEvent(event)
 
     def set_time_cs(self, cs: float) -> None:
         cs_f = max(0.0, float(cs))
@@ -78,11 +92,127 @@ class PreviewCanvas(QWidget):
                     primary_page = p_idx + 1
         return primary_page, active
 
+    def _get_line_render(
+        self,
+        line: Line,
+        row_idx: int,
+        total_rows: int,
+        w: float,
+        h: float,
+        scale: float,
+        offset_x: float,
+        offset_y: float,
+        dpr: float,
+    ) -> Tuple[QPixmap, QPixmap, float, List[float]]:
+        assert self._project is not None
+        header = self._project.header
+        style = header.get_style(line.style)
+        text_rgb = header.color(style.text_color_idx, (255, 255, 255))
+        outline_rgb = header.color(style.outline_color_idx, (0, 0, 0))
+        wipe_rgb = header.color(style.wipe_color_idx, (255, 140, 0))
+        wipe_outline_rgb = header.color(style.wipe_outline_color_idx, (120, 40, 0))
+
+        syl_texts = tuple(s.text for s in line.syllables)
+        key = (
+            syl_texts,
+            line.align,
+            row_idx,
+            total_rows,
+            header.margins,
+            style.font_name,
+            style.font_size,
+            style.is_bold,
+            style.is_italic,
+            style.uppercase,
+            tuple(style.outline_widths),
+            text_rgb,
+            outline_rgb,
+            wipe_rgb,
+            wipe_outline_rgb,
+            int(w),
+            int(h),
+            round(dpr, 2),
+        )
+        cached = self._line_cache.get(key)
+        if cached is not None:
+            return cached
+
+        if len(self._line_cache) >= 64:
+            self._line_cache.clear()
+
+        margin_l, margin_r, _margin_t, line_spacing = header.margins
+        safe_x_left = 110.0 + margin_l * 10.0
+        safe_x_right = LOGICAL_W - (110.0 + margin_r * 10.0)
+        usable_w = max(200.0, safe_x_right - safe_x_left)
+
+        px_size = max(28, int(round(style.font_size * 5.2)))
+        font = QFont(style.font_name or "Arial")
+        font.setPixelSize(px_size)
+        font.setBold(style.is_bold)
+        font.setItalic(style.is_italic)
+
+        fm = QFontMetricsF(font)
+        full_text = line.full_text.upper() if style.uppercase == "U" else line.full_text
+        total_text_w = fm.horizontalAdvance(full_text)
+
+        if total_text_w > usable_w and total_text_w > 0:
+            fit_scale = usable_w / total_text_w
+            font.setPixelSize(max(20, int(px_size * fit_scale)))
+            fm = QFontMetricsF(font)
+            total_text_w = fm.horizontalAdvance(full_text)
+
+        if line.align == "L":
+            x_start = safe_x_left
+        elif line.align == "R":
+            x_start = safe_x_right - total_text_w
+        else:
+            x_start = (LOGICAL_W - total_text_w) * 0.5
+
+        row_pitch = max(px_size * 1.45, 92.0 + line_spacing * 3.0)
+        block_h = total_rows * row_pitch
+        top_y = (LOGICAL_H - block_h) * 0.5
+        baseline_y = top_y + row_idx * row_pitch + fm.ascent() + (row_pitch - fm.height()) * 0.5
+
+        text_path = QPainterPath()
+        text_path.addText(x_start, baseline_y, font, full_text)
+        outline_w = max(2.0, sum(style.outline_widths) / 4.0 * 3.2)
+
+        phys_w = max(1, int(round(w * dpr)))
+        phys_h = max(1, int(round(h * dpr)))
+
+        def _render_pass(fill_c: QColor, out_c: QColor) -> QPixmap:
+            pm = QPixmap(phys_w, phys_h)
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.GlobalColor.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.translate(offset_x, offset_y)
+            p.scale(scale, scale)
+            p.setClipRect(QRectF(0, 0, LOGICAL_W, LOGICAL_H))
+            p.setPen(QPen(out_c, outline_w * 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(text_path)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill_c)
+            p.drawPath(text_path)
+            p.end()
+            return pm
+
+        unwiped_pm = _render_pass(_qcolor(text_rgb), _qcolor(outline_rgb))
+        wiped_pm = _render_pass(_qcolor(wipe_rgb), _qcolor(wipe_outline_rgb))
+
+        x_start_w = offset_x + x_start * scale
+        syl_widths_w: List[float] = []
+        for s_txt in syl_texts:
+            t_disp = s_txt.upper() if style.uppercase == "U" else s_txt
+            syl_widths_w.append(fm.horizontalAdvance(t_disp) * scale)
+
+        result = (unwiped_pm, wiped_pm, x_start_w, syl_widths_w)
+        self._line_cache[key] = result
+        return result
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-
         w = float(self.width())
         h = float(self.height())
         if w <= 0 or h <= 0:
@@ -95,113 +225,53 @@ class PreviewCanvas(QWidget):
         canvas_h = LOGICAL_H * scale
         offset_x = (w - canvas_w) * 0.5
         offset_y = (h - canvas_h) * 0.5
+        dpr = self.devicePixelRatioF()
 
-        painter.save()
-        painter.translate(offset_x, offset_y)
-        painter.scale(scale, scale)
-        painter.setClipRect(QRectF(0, 0, LOGICAL_W, LOGICAL_H))
-
+        bg_rect = QRectF(offset_x, offset_y, canvas_w, canvas_h)
         if self._project and self._use_palette_bg:
             bg_rgb = self._project.header.color(self._project.header.border_color_idx, (0, 0, 0))
-            painter.fillRect(QRectF(0, 0, LOGICAL_W, LOGICAL_H), _qcolor(bg_rgb))
+            painter.fillRect(bg_rect, _qcolor(bg_rgb))
         else:
-            painter.fillRect(QRectF(0, 0, LOGICAL_W, LOGICAL_H), QColor(14, 18, 28))
+            painter.fillRect(bg_rect, QColor(14, 18, 28))
 
         page_num, active_lines = self._active_lines_at(self._time_cs)
 
         if self._project and active_lines:
-            header = self._project.header
-            margin_l, margin_r, _margin_t, line_spacing = header.margins
-            safe_x_left = 110.0 + margin_l * 10.0
-            safe_x_right = LOGICAL_W - (110.0 + margin_r * 10.0)
-            usable_w = max(200.0, safe_x_right - safe_x_left)
-
             for row_idx, total_rows, line in active_lines:
-                style = header.get_style(line.style)
-                text_color = _qcolor(header.color(style.text_color_idx, (255, 255, 255)))
-                outline_color = _qcolor(header.color(style.outline_color_idx, (0, 0, 0)))
-                wipe_color = _qcolor(header.color(style.wipe_color_idx, (255, 140, 0)))
-                wipe_outline_color = _qcolor(header.color(style.wipe_outline_color_idx, (120, 40, 0)))
+                unwiped_pm, wiped_pm, x_start_w, syl_widths_w = self._get_line_render(
+                    line, row_idx, total_rows, w, h, scale, offset_x, offset_y, dpr
+                )
+                painter.drawPixmap(0, 0, unwiped_pm)
 
-                px_size = max(28, int(round(style.font_size * 5.2)))
-                font = QFont(style.font_name or "Arial")
-                font.setPixelSize(px_size)
-                font.setBold(style.is_bold)
-                font.setItalic(style.is_italic)
-
-                fm = QFontMetricsF(font)
-                full_text = line.full_text.upper() if style.uppercase == "U" else line.full_text
-                total_text_w = fm.horizontalAdvance(full_text)
-
-                if total_text_w > usable_w and total_text_w > 0:
-                    fit_scale = usable_w / total_text_w
-                    font.setPixelSize(max(20, int(px_size * fit_scale)))
-                    fm = QFontMetricsF(font)
-                    total_text_w = fm.horizontalAdvance(full_text)
-
-                if line.align == "L":
-                    x_start = safe_x_left
-                elif line.align == "R":
-                    x_start = safe_x_right - total_text_w
-                else:
-                    x_start = (LOGICAL_W - total_text_w) * 0.5
-
-                row_pitch = max(px_size * 1.45, 92.0 + line_spacing * 3.0)
-                block_h = total_rows * row_pitch
-                top_y = (LOGICAL_H - block_h) * 0.5
-                baseline_y = top_y + row_idx * row_pitch + fm.ascent() + (row_pitch - fm.height()) * 0.5
-
-                text_path = QPainterPath()
-                text_path.addText(x_start, baseline_y, font, full_text)
-
-                outline_w = max(2.0, sum(style.outline_widths) / 4.0 * 3.2)
-
-                # Unwiped pass
-                painter.save()
-                painter.setPen(QPen(outline_color, outline_w * 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawPath(text_path)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(text_color)
-                painter.drawPath(text_path)
-                painter.restore()
-
-                # Compute wipe pixel X
-                wipe_x = x_start
-                cur_x = x_start
-                for syl in line.syllables:
-                    syl_txt = syl.text.upper() if style.uppercase == "U" else syl.text
-                    syl_w = fm.horizontalAdvance(syl_txt)
+                # Compute wipe pixel X in widget space using cached syllable widths
+                wipe_x_w = x_start_w
+                cur_x_w = x_start_w
+                for syl, syl_w in zip(line.syllables, syl_widths_w):
                     if self._time_cs >= syl.end:
-                        wipe_x = cur_x + syl_w
+                        wipe_x_w = cur_x_w + syl_w
                     elif self._time_cs > syl.start and syl.end > syl.start:
                         frac = (self._time_cs - syl.start) / float(syl.end - syl.start)
-                        wipe_x = max(wipe_x, cur_x + syl_w * frac)
-                    cur_x += syl_w
+                        wipe_x_w = max(wipe_x_w, cur_x_w + syl_w * frac)
+                    cur_x_w += syl_w
 
-                # Wiped pass
-                if wipe_x > x_start:
+                if wipe_x_w > x_start_w:
                     painter.save()
-                    painter.setClipRect(QRectF(0, 0, wipe_x, LOGICAL_H), Qt.ClipOperation.IntersectClip)
-                    painter.setPen(QPen(wipe_outline_color, outline_w * 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                    painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawPath(text_path)
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    painter.setBrush(wipe_color)
-                    painter.drawPath(text_path)
+                    painter.setClipRect(QRectF(0.0, 0.0, wipe_x_w, h))
+                    painter.drawPixmap(0, 0, wiped_pm)
                     painter.restore()
 
         if self._show_hud:
-            hud_font = QFont("Consolas")
-            hud_font.setPixelSize(28)
-            painter.setFont(hud_font)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            painter.translate(offset_x, offset_y)
+            painter.scale(scale, scale)
+            painter.setFont(self._hud_font)
             page_str = f"P{page_num}" if page_num else "Idle"
             hud_text = f"{_format_time(int(round(self._time_cs)))}  |  {page_str}"
             painter.fillRect(QRectF(20, 18, 410, 46), QColor(0, 0, 0, 135))
             painter.setPen(QColor(225, 232, 245))
             painter.drawText(QRectF(34, 18, 390, 46), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, hud_text)
-
-        painter.restore()
+            painter.restore()
 
         # Crisp thin outer border + subtle bottom-right resize grip
         painter.setPen(QPen(QColor(255, 255, 255, 70), 1))
@@ -223,11 +293,11 @@ class FloatingPreviewWindow(QWidget):
     visibility_changed = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
+        # Frameless Tool window owned by MainWindow: stays above the main editor
+        # without using WindowStaysOnTopHint, so dialogs and other apps can rise above it.
         super().__init__(
             parent,
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint,
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool,
         )
         self.setWindowTitle("16:9 Live Preview")
         self.setAcceptDrops(True)

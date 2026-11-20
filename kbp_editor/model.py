@@ -298,6 +298,87 @@ class Line:
         del self.syllables[syl_idx]
         return True
 
+    def delete_syllables(self, indices: Sequence[int]) -> bool:
+        """Delete multiple syllables by index (keeps at least 1 syllable in the line)."""
+        valid = sorted({i for i in indices if 0 <= i < len(self.syllables)}, reverse=True)
+        if not valid:
+            return False
+        # Keep at least 1 syllable
+        if len(valid) >= len(self.syllables):
+            valid = valid[:-1]
+        if not valid:
+            return False
+        for i in valid:
+            del self.syllables[i]
+        return True
+
+    def insert_syllables(
+        self,
+        insert_idx: int,
+        texts: Sequence[str],
+        start_cs: Optional[int] = None,
+        duration_cs: int = 30,
+    ) -> bool:
+        """
+        Insert one or more syllables into a synced line at `insert_idx`, computing
+        clean non-overlapping timestamps and preserving word spacing.
+        """
+        cleaned = [t for t in texts if t]
+        if not cleaned:
+            return False
+        insert_idx = max(0, min(len(self.syllables), insert_idx))
+        count = len(cleaned)
+        dur = max(5, int(duration_cs))
+
+        # Ensure trailing word space on the preceding syllable when adding a new word
+        if insert_idx > 0 and self.syllables:
+            prev_t = self.syllables[insert_idx - 1].text
+            if prev_t and not prev_t.endswith(" ") and not cleaned[0].startswith(" "):
+                self.syllables[insert_idx - 1].text = prev_t + " "
+
+        # If inserting before an existing syllable, ensure the last inserted chunk ends with space
+        if insert_idx < len(self.syllables) and not cleaned[-1].endswith(" "):
+            cleaned[-1] = cleaned[-1] + " "
+
+        # Determine start & per-syllable step
+        if start_cs is not None:
+            t0 = max(0, int(start_cs))
+            step = dur
+        elif not self.syllables:
+            t0 = max(0, self.display_start)
+            step = dur
+        elif insert_idx == 0:
+            nxt_start = self.syllables[0].start
+            t0 = max(0, nxt_start - dur * count)
+            avail = max(count, nxt_start - t0)
+            step = max(2, min(dur, avail // count)) if nxt_start > t0 else dur
+        elif insert_idx >= len(self.syllables):
+            t0 = self.syllables[-1].end
+            step = dur
+        else:
+            prev_end = self.syllables[insert_idx - 1].end
+            nxt_start = self.syllables[insert_idx].start
+            gap = nxt_start - prev_end
+            if gap >= count * 4:
+                t0 = prev_end
+                step = min(dur, gap // count)
+            else:
+                t0 = prev_end
+                step = dur
+
+        new_syls: List[Syllable] = []
+        cur = t0
+        for txt in cleaned:
+            new_syls.append(Syllable(text=txt, start=cur, end=cur + step))
+            cur += step
+
+        self.syllables[insert_idx:insert_idx] = new_syls
+        if new_syls[0].start < self.display_start:
+            self.display_start = new_syls[0].start
+        if new_syls[-1].end > self.display_end:
+            self.display_end = new_syls[-1].end + DEFAULT_CLEAR_HOLD_CS
+        return True
+
     def format_lines(self) -> List[str]:
         header = "/".join(
             [self.align, self.style, str(self.display_start), str(self.display_end), *self.extra_fields]
@@ -565,6 +646,34 @@ class KbpProject:
         cur_line.display_end = max(cur_line.display_end, next_line.display_end)
         return True
 
+    def pick_duplicate_style(self, lines: Sequence[Line]) -> str:
+        """Pick [B] for duplicated [A] tracks, or [C] if [B] is already in use."""
+        styles = {ln.style for ln in lines}
+        if "B" in styles:
+            return "C"
+        return "B"
+
+    def duplicate_line(
+        self,
+        page_idx: int,
+        line_idx: int,
+        target_style: Optional[str] = None,
+        shift_cs: int = 0,
+    ) -> Optional[Line]:
+        """Duplicate a single line on the same page, assigning style [B]/[C] by default."""
+        if not (0 <= page_idx < len(self.pages)):
+            return None
+        page = self.pages[page_idx]
+        if not (0 <= line_idx < len(page.lines)):
+            return None
+        src = page.lines[line_idx]
+        new_line = deepcopy(src)
+        new_line.style = target_style if target_style is not None else self.pick_duplicate_style([src])
+        if shift_cs:
+            new_line.shift(shift_cs)
+        page.lines.insert(line_idx + 1, new_line)
+        return new_line
+
     def duplicate_page(
         self,
         page_number: int,          # 1-based page number (e.g. 8)
@@ -572,35 +681,192 @@ class KbpProject:
         lead_in_cs: int = DEFAULT_LEAD_IN_CS,
         clear_hold_cs: int = DEFAULT_CLEAR_HOLD_CS,
         fix_lingering_clears: bool = True,
+        target_style: Optional[str] = None,
+        in_place: bool = False,
     ) -> Page:
-        """Duplicate a page (1-based) and insert it immediately after the source page."""
+        """
+        Duplicate a page (1-based) and insert it immediately after the source page.
+        When `in_place=True`, keeps the exact same timestamps so the duplicated page
+        appears directly beneath the source page ready to be dragged into position.
+        """
         src_idx = page_number - 1
         if not (0 <= src_idx < len(self.pages)):
             raise IndexError(f"Page {page_number} out of range (1..{len(self.pages)}).")
         src = self.pages[src_idx]
 
-        if fix_lingering_clears:
+        if fix_lingering_clears and not in_place:
             for line in src.lines:
                 if line.display_end - line.last_syl_end > 200:
                     line.display_end = line.last_syl_end + clear_hold_cs
 
-        dt = (src.last_syl_end + gap_cs) - src.first_syl_start
         new_page = deepcopy(src)
-        new_page.shift(dt)
+        if not in_place:
+            dt = (src.last_syl_end + gap_cs) - src.first_syl_start
+            new_page.shift(dt)
 
-        ideal_start = max(0, new_page.first_syl_start - lead_in_cs)
-        prev_line_start = 0
-        for i, line in enumerate(new_page.lines):
-            prev_row_clear = (src.lines[i].display_end + 1) if i < len(src.lines) else 0
-            line.display_start = max(ideal_start, prev_row_clear, prev_line_start)
-            if line.display_start > line.first_syl_start:
-                line.display_start = line.first_syl_start
-            prev_line_start = line.display_start
-            if line.last_syl_end > line.display_end:
-                line.display_end = line.last_syl_end + clear_hold_cs
+        if target_style is not None:
+            for line in new_page.lines:
+                line.style = target_style
+
+        if not in_place:
+            ideal_start = max(0, new_page.first_syl_start - lead_in_cs)
+            prev_line_start = 0
+            for i, line in enumerate(new_page.lines):
+                prev_row_clear = (src.lines[i].display_end + 1) if i < len(src.lines) else 0
+                line.display_start = max(ideal_start, prev_row_clear, prev_line_start)
+                if line.display_start > line.first_syl_start:
+                    line.display_start = line.first_syl_start
+                prev_line_start = line.display_start
+                if line.last_syl_end > line.display_end:
+                    line.display_end = line.last_syl_end + clear_hold_cs
 
         self.pages.insert(src_idx + 1, new_page)
         return new_page
+
+    def add_line(
+        self,
+        page_idx: int,
+        after_line_idx: int,
+        syl_texts: Sequence[str],
+        start_cs: Optional[int] = None,
+        duration_cs: int = 30,
+        style: str = "A",
+        align: str = "C",
+    ) -> Optional[Line]:
+        """Insert a new synced line on `page_idx` right after `after_line_idx`."""
+        if not (0 <= page_idx < len(self.pages)):
+            return None
+        cleaned = [t for t in syl_texts if t]
+        if not cleaned:
+            cleaned = ["New"]
+        page = self.pages[page_idx]
+        insert_at = max(0, min(len(page.lines), after_line_idx + 1))
+
+        if start_cs is None:
+            if 0 <= after_line_idx < len(page.lines) and page.lines[after_line_idx].syllables:
+                t0 = page.lines[after_line_idx].last_syl_end + 10
+            elif page.lines:
+                t0 = page.last_syl_end + 10
+            else:
+                t0 = 100
+        else:
+            t0 = max(0, int(start_cs))
+
+        dur = max(5, int(duration_cs))
+        syls: List[Syllable] = []
+        cur = t0
+        for txt in cleaned:
+            syls.append(Syllable(text=txt, start=cur, end=cur + dur))
+            cur += dur
+
+        new_line = Line(
+            align=align,
+            style=style,
+            display_start=max(0, t0 - DEFAULT_LEAD_IN_CS),
+            display_end=cur + DEFAULT_CLEAR_HOLD_CS,
+            syllables=syls,
+        )
+        page.lines.insert(insert_at, new_line)
+        return new_line
+
+    def delete_line(self, page_idx: int, line_idx: int) -> bool:
+        """Delete a line (removes empty page if >1 page exists; keeps at least 1 line in project)."""
+        if not (0 <= page_idx < len(self.pages)):
+            return False
+        page = self.pages[page_idx]
+        if not (0 <= line_idx < len(page.lines)):
+            return False
+        total_lines = sum(len(p.lines) for p in self.pages)
+        if total_lines <= 1:
+            return False
+        del page.lines[line_idx]
+        if not page.lines and len(self.pages) > 1:
+            del self.pages[page_idx]
+        return True
+
+    def add_page(
+        self,
+        after_page_idx: int,
+        lines_syls: Sequence[Sequence[str]],
+        start_cs: Optional[int] = None,
+        duration_cs: int = 30,
+        style: str = "A",
+        align: str = "C",
+    ) -> Page:
+        """Insert a new page after `after_page_idx` with one or more lines of syllables."""
+        insert_at = max(0, min(len(self.pages), after_page_idx + 1))
+        if start_cs is None:
+            if 0 <= after_page_idx < len(self.pages) and self.pages[after_page_idx].lines:
+                t0 = self.pages[after_page_idx].last_syl_end + 50
+            else:
+                t0 = 100
+        else:
+            t0 = max(0, int(start_cs))
+
+        dur = max(5, int(duration_cs))
+        built_lines: List[Line] = []
+        cur = t0
+        for raw_syls in lines_syls:
+            cleaned = [t for t in raw_syls if t]
+            if not cleaned:
+                continue
+            syls: List[Syllable] = []
+            for txt in cleaned:
+                syls.append(Syllable(text=txt, start=cur, end=cur + dur))
+                cur += dur
+            built_lines.append(
+                Line(
+                    align=align,
+                    style=style,
+                    display_start=max(0, t0 - DEFAULT_LEAD_IN_CS),
+                    display_end=cur + DEFAULT_CLEAR_HOLD_CS,
+                    syllables=syls,
+                )
+            )
+            cur += 20
+
+        if not built_lines:
+            built_lines.append(
+                Line(
+                    align=align,
+                    style=style,
+                    display_start=max(0, t0 - DEFAULT_LEAD_IN_CS),
+                    display_end=t0 + dur + DEFAULT_CLEAR_HOLD_CS,
+                    syllables=[Syllable(text="New", start=t0, end=t0 + dur)],
+                )
+            )
+
+        new_page = Page(lines=built_lines)
+        self.pages.insert(insert_at, new_page)
+        return new_page
+
+    def split_page(self, page_idx: int, line_idx: int) -> bool:
+        """Split `page_idx` into two pages at `line_idx` (lines[:cut] stay; lines[cut:] move to new page)."""
+        if not (0 <= page_idx < len(self.pages)):
+            return False
+        page = self.pages[page_idx]
+        if len(page.lines) < 2:
+            return False
+        cut = line_idx if 1 <= line_idx < len(page.lines) else max(1, len(page.lines) // 2)
+        new_page = Page(lines=page.lines[cut:])
+        page.lines = page.lines[:cut]
+        self.pages.insert(page_idx + 1, new_page)
+        return True
+
+    def join_pages(self, page_idx: int) -> bool:
+        """Merge `page_idx` with `page_idx + 1` into a single page."""
+        if not (0 <= page_idx < len(self.pages) - 1):
+            return False
+        nxt = self.pages.pop(page_idx + 1)
+        self.pages[page_idx].lines.extend(nxt.lines)
+        return True
+
+    def delete_page(self, page_idx: int) -> bool:
+        """Delete `page_idx` (keeps at least 1 page in the project)."""
+        if len(self.pages) <= 1 or not (0 <= page_idx < len(self.pages)):
+            return False
+        del self.pages[page_idx]
+        return True
 
     def _row_clear_constraint(self, prev_page: Page, cur_page: Page, cur_row_idx: int) -> int:
         """

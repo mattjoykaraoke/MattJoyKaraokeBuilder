@@ -173,9 +173,12 @@ class MainWindow(QMainWindow):
                     break
 
     def _sync_minimap_from_active_tab(self) -> None:
+        cs = self.audio.smooth_position_cs
         if self._tabs.currentWidget() is self.display_view:
+            self.display_view.set_playhead_cs(cs, follow_if_playing=False)
             self.minimap.set_viewport(self.display_view.canvas.scroll_x_cs, self.display_view.canvas.view_span_cs())
         else:
+            self.wiping_view.set_playhead_cs(cs, follow_if_playing=False)
             self.minimap.set_viewport(self.wiping_view.canvas.scroll_x_cs, self.wiping_view.canvas.view_span_cs())
 
     def _build_transport_bar(self) -> QWidget:
@@ -217,6 +220,10 @@ class MainWindow(QMainWindow):
         btn_zout = QPushButton("Zoom −")
         btn_zout.clicked.connect(lambda: self._zoom_active(0.8))
         layout.addWidget(btn_zout)
+        btn_zreset = QPushButton("100%")
+        btn_zreset.setToolTip("Reset Zoom to 100% (Ctrl+0)")
+        btn_zreset.clicked.connect(self._reset_zoom_active)
+        layout.addWidget(btn_zreset)
 
         self._preview_btn = QPushButton("16:9 Preview")
         self._preview_btn.setCheckable(True)
@@ -279,7 +286,11 @@ class MainWindow(QMainWindow):
         act_shift_page.triggered.connect(self._shift_selected_page)
         m_edit.addAction(act_shift_page)
 
-        act_dup_page = QAction("&Duplicate Selected Page", self)
+        act_dup_line = QAction("Duplicate Selected &Line ([B]/[C])", self)
+        act_dup_line.triggered.connect(self.wiping_view._duplicate_selected_line)
+        m_edit.addAction(act_dup_line)
+
+        act_dup_page = QAction("&Duplicate Selected Page ([B]/[C])", self)
         act_dup_page.setShortcut(QKeySequence("Ctrl+D"))
         act_dup_page.triggered.connect(self.display_view._duplicate_selected_page)
         m_edit.addAction(act_dup_page)
@@ -300,6 +311,11 @@ class MainWindow(QMainWindow):
         self._act_preview.setShortcut(QKeySequence("F9"))
         self._act_preview.toggled.connect(self._set_preview_visible)
         m_view.addAction(self._act_preview)
+
+        act_reset_zoom = QAction("&Reset Zoom (100%)", self)
+        act_reset_zoom.setShortcut(QKeySequence("Ctrl+0"))
+        act_reset_zoom.triggered.connect(self._reset_zoom_active)
+        m_view.addAction(act_reset_zoom)
 
         self.preview_win.visibility_changed.connect(self._on_preview_visibility_changed)
 
@@ -328,8 +344,9 @@ class MainWindow(QMainWindow):
         self.wiping_view.play_line_requested.connect(self.audio.play_range)
 
     def _on_waveform_loaded(self) -> None:
+        self.wiping_view.canvas.invalidate_wave_cache()
         self.wiping_view.canvas.update()
-        self.minimap.update()
+        self.minimap.invalidate_cache()
 
     def _on_display_viewport(self, start_cs: float, span_cs: float) -> None:
         if self._tabs.currentWidget() is self.display_view:
@@ -346,9 +363,12 @@ class MainWindow(QMainWindow):
     def _on_playhead_moved(self, cs: float) -> None:
         playing = self.audio.is_playing
         self._time_lbl.setText(_fmt_time(cs))
-        self.display_view.set_playhead_cs(cs, follow_if_playing=playing)
-        self.wiping_view.set_playhead_cs(cs, follow_if_playing=playing)
-        self.preview_win.canvas.set_time_cs(cs)
+        if self._tabs.currentWidget() is self.display_view:
+            self.display_view.set_playhead_cs(cs, follow_if_playing=playing)
+        else:
+            self.wiping_view.set_playhead_cs(cs, follow_if_playing=playing)
+        if self.preview_win.isVisible():
+            self.preview_win.canvas.set_time_cs(cs)
         self.minimap.set_playhead_cs(cs)
 
     def _on_display_selection(self, page_idx: int, line_idx: int) -> None:
@@ -369,6 +389,12 @@ class MainWindow(QMainWindow):
         else:
             self.wiping_view.zoom(factor)
 
+    def _reset_zoom_active(self) -> None:
+        if self._tabs.currentWidget() is self.display_view:
+            self.display_view.reset_zoom()
+        else:
+            self.wiping_view.reset_zoom()
+
     def _play_selected_line(self) -> None:
         if not self.project or not self.project.pages:
             return
@@ -376,7 +402,7 @@ class MainWindow(QMainWindow):
         l_idx = self.wiping_view.canvas.line_idx
         if 0 <= p_idx < len(self.project.pages) and 0 <= l_idx < len(self.project.pages[p_idx].lines):
             ln = self.project.pages[p_idx].lines[l_idx]
-            self.audio.play_range(max(0, ln.first_syl_start - 30), ln.last_syl_end + 30)
+            self.audio.play_range(max(0, ln.first_syl_start - 15), ln.last_syl_end)
 
     def _open_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open KBP Project", "", "Karaoke Builder Projects (*.kbp);;All Files (*.*)")
@@ -420,14 +446,17 @@ class MainWindow(QMainWindow):
     def _on_project_mutated(self, label: str) -> None:
         if self.project is None:
             return
+        if self.wiping_view.auto_reset_display_enabled and not label.startswith("Reset ") and not label.startswith("Apply Optimized"):
+            self.project.optimize_windows()
         self.history.push(label, self.project)
         if len(self._page_buttons) != len(self.project.pages):
             self._rebuild_page_buttons()
-            self._highlight_page_button(self.display_view.canvas.selected_page)
+            self._highlight_page_button(min(self.display_view.canvas.selected_page, max(0, len(self.project.pages) - 1)))
+            self.wiping_view.set_project(self.project, preserve_view=True)
         self.display_view.set_project(self.project, preserve_view=True)
         self.wiping_view.canvas.update()
-        self.preview_win.canvas.update()
-        self.minimap.update()
+        self.preview_win.canvas.invalidate_cache()
+        self.minimap.invalidate_cache()
         self._refresh_actions()
         self.statusBar().showMessage(f"{label}  (Undo stack: {self.history.current_index})", 3000)
 
@@ -437,6 +466,7 @@ class MainWindow(QMainWindow):
                 g = self.geometry()
                 self.preview_win.move(g.right() - self.preview_win.width() - 36, g.bottom() - self.preview_win.height() - 68)
                 self._preview_positioned = True
+            self.preview_win.canvas.set_time_cs(self.audio.smooth_position_cs)
             self.preview_win.show()
         else:
             self.preview_win.hide()
