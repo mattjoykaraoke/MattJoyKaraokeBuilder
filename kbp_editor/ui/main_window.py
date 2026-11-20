@@ -497,11 +497,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open Failed", f"Could not load KBP file:\n{exc}")
             return
 
+        flushed_gaps = proj.flush_one_cs_gaps()
+
         self.project = proj
         self.history.reset(proj, label=f"Open {Path(path).name}")
 
         bak_path: Optional[Path] = None
-        if proj.load_issues:
+        if proj.load_issues or flushed_gaps > 0:
             try:
                 bak_path = KbpProject.create_backup(Path(path))
             except Exception:
@@ -519,7 +521,11 @@ class MainWindow(QMainWindow):
             self._scrub_to(float(proj.pages[0].display_start))
         self._sync_minimap_from_active_tab()
         self._refresh_actions()
-        self.statusBar().showMessage(f"Opened {Path(path).name} ({len(proj.pages)} pages)", 4000)
+        msg = f"Opened {Path(path).name} ({len(proj.pages)} pages)"
+        if flushed_gaps > 0:
+            bak_info = f", backup: {bak_path.name}" if bak_path is not None else ""
+            msg += f" — flushed {flushed_gaps} × 1 cs gap{'s' if flushed_gaps != 1 else ''}{bak_info}"
+        self.statusBar().showMessage(msg, 6000 if flushed_gaps > 0 else 4000)
 
         if proj.load_issues:
             self._show_repair_warning(Path(path), proj.load_issues, bak_path)

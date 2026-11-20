@@ -388,3 +388,38 @@ def test_nudge_syllable_border_sticky_and_non_sticky():
     assert ln.syllables[1].start == 101
     assert ln.syllables[0].end == 101  # prev keeps >= 1 cs duration (100..101)
     assert not ln.nudge_syllable_border(1, "left", -1, sticky=True)
+
+
+def test_flush_one_cs_gaps_zero_drift():
+    proj = _sample_project()
+    # Record every original start timestamp across the project
+    orig_starts = [
+        [s.start for s in ln.syllables]
+        for p in proj.pages
+        for ln in p.lines
+    ]
+    # Add a deliberate 20 cs gap in Page 0 Line 0 between syl 1 and syl 2? Keep original first:
+    # _sample_project has 1 cs gaps: 1135->1136, 1200->1201, 1495->1496, 1835->1836, 3135->3136 (5 total)
+    flushed = proj.flush_one_cs_gaps()
+    assert flushed == 5
+
+    # Every start timestamp must be 100% untouched (zero drift!)
+    new_starts = [
+        [s.start for s in ln.syllables]
+        for p in proj.pages
+        for ln in p.lines
+    ]
+    assert new_starts == orig_starts
+
+    # All 1 cs gaps are now 0 cs flush
+    l0 = proj.pages[0].lines[0]
+    assert l0.syllables[0].end == l0.syllables[1].start == 1136
+    assert l0.syllables[1].end == l0.syllables[2].start == 1201
+
+    # Idempotent: second call flushes 0
+    assert proj.flush_one_cs_gaps() == 0
+
+    # Larger gaps (>= 2 cs) are NOT touched
+    l0.syllables[1].end = 1190
+    assert proj.flush_one_cs_gaps() == 0
+    assert l0.syllables[1].end == 1190

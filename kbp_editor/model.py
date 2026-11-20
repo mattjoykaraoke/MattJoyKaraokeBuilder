@@ -789,6 +789,24 @@ class KbpProject:
         self.load_issues.extend(new_issues)
         return new_issues
 
+    def flush_one_cs_gaps(self, max_gap_cs: int = 1) -> int:
+        """
+        Close tiny KBS snap gaps (default: 1 cs) between consecutive syllables in each line
+        by extending `syl.end = next_syl.start`. Every syllable's `start` timestamp stays
+        unchanged so there is zero cumulative timing drift.
+        Returns the number of gaps flushed.
+        """
+        flushed = 0
+        for page in self.pages:
+            for line in page.lines:
+                syls = line.syllables
+                for i in range(len(syls) - 1):
+                    gap = syls[i + 1].start - syls[i].end
+                    if 0 < gap <= max_gap_cs:
+                        syls[i].end = syls[i + 1].start
+                        flushed += 1
+        return flushed
+
     @staticmethod
     def create_backup(path: str | Path) -> Path:
         """
