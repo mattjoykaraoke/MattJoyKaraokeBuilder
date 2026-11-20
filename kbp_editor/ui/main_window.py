@@ -268,12 +268,14 @@ class MainWindow(QMainWindow):
 
         m_edit = mb.addMenu("&Edit")
         self._act_undo = QAction("&Undo", self)
-        self._act_undo.setShortcut(QKeySequence.StandardKey.Undo)
+        self._act_undo.setShortcut(QKeySequence("Ctrl+Z"))
+        self._act_undo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self._act_undo.triggered.connect(self.undo)
         m_edit.addAction(self._act_undo)
 
         self._act_redo = QAction("&Redo", self)
-        self._act_redo.setShortcuts([QKeySequence.StandardKey.Redo, QKeySequence("Ctrl+Shift+Z")])
+        self._act_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        self._act_redo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self._act_redo.triggered.connect(self.redo)
         m_edit.addAction(self._act_redo)
 

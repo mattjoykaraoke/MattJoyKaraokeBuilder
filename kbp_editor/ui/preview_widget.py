@@ -106,11 +106,32 @@ class PreviewCanvas(QWidget):
     ) -> Tuple[QPixmap, QPixmap, float, List[float]]:
         assert self._project is not None
         header = self._project.header
-        style = header.get_style(line.style)
-        text_rgb = header.color(style.text_color_idx, (255, 255, 255))
-        outline_rgb = header.color(style.outline_color_idx, (0, 0, 0))
-        wipe_rgb = header.color(style.wipe_color_idx, (255, 140, 0))
-        wipe_outline_rgb = header.color(style.wipe_outline_color_idx, (120, 40, 0))
+        st_letter = (line.style or "A").upper()
+        style = header.get_style(st_letter)
+        if st_letter in header.styles:
+            # Always respect the KBP file's own defined style colors
+            text_rgb = header.color(style.text_color_idx, (255, 255, 255))
+            outline_rgb = header.color(style.outline_color_idx, (0, 0, 0))
+            wipe_rgb = header.color(style.wipe_color_idx, (255, 140, 0))
+            wipe_outline_rgb = header.color(style.wipe_outline_color_idx, (120, 40, 0))
+        else:
+            # Distinct fallback preview colors only for styles not defined in the KBP header
+            fallback_wipes = {
+                "B": ((255, 255, 255), (0, 0, 0), (195, 130, 255), (75, 35, 120)),
+                "C": ((255, 255, 255), (0, 0, 0), (70, 230, 210), (20, 95, 90)),
+                "D": ((255, 255, 255), (0, 0, 0), (255, 120, 175), (115, 30, 65)),
+                "E": ((255, 255, 255), (0, 0, 0), (150, 235, 95), (45, 95, 20)),
+                "F": ((255, 255, 255), (0, 0, 0), (255, 205, 80), (120, 75, 15)),
+            }
+            text_rgb, outline_rgb, wipe_rgb, wipe_outline_rgb = fallback_wipes.get(
+                st_letter,
+                (
+                    header.color(style.text_color_idx, (255, 255, 255)),
+                    header.color(style.outline_color_idx, (0, 0, 0)),
+                    header.color(style.wipe_color_idx, (255, 140, 0)),
+                    header.color(style.wipe_outline_color_idx, (120, 40, 0)),
+                ),
+            )
 
         syl_texts = tuple(s.text for s in line.syllables)
         key = (
