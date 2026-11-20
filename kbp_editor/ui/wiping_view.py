@@ -392,6 +392,7 @@ class _WipingTimelineCanvas(QWidget):
     syllable_selected = Signal(int)
     delete_requested = Signal()
     edit_syllable_requested = Signal()
+    context_menu_requested = Signal(str, int, int, int, QPoint)  # kind ("word"|"line"|"page"), p_idx, l_idx, s_idx, global_pos
     styles_changed = Signal()
     project_mutated = Signal(str)
     viewport_changed = Signal(float, float)  # start_cs, span_cs
@@ -439,6 +440,8 @@ class _WipingTimelineCanvas(QWidget):
         self._drag_sticky_neighbor: Optional[int] = None
         self._pan_start_x: float = 0.0
         self._pan_start_scroll: float = 0.0
+        self._right_press_pos: Optional[QPoint] = None
+        self._right_panned: bool = False
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -956,7 +959,13 @@ class _WipingTimelineCanvas(QWidget):
             self._drag_mode = "pan"
             self._pan_start_x = pos.x()
             self._pan_start_scroll = self.scroll_x_cs
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if event.button() == Qt.MouseButton.RightButton:
+                self._right_press_pos = pos.toPoint()
+                self._right_panned = False
+            else:
+                self._right_press_pos = None
+                self._right_panned = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
 
         if event.button() != Qt.MouseButton.LeftButton:
@@ -1092,6 +1101,11 @@ class _WipingTimelineCanvas(QWidget):
 
         if self._drag_mode == "pan":
             dx = pos.x() - self._pan_start_x
+            if not self._right_panned and self._right_press_pos is not None:
+                if abs(pos.x() - self._right_press_pos.x()) <= 4 and abs(pos.y() - self._right_press_pos.y()) <= 4:
+                    return
+                self._right_panned = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.set_scroll_x_cs(self._pan_start_scroll - dx / max(1e-6, self.px_per_cs))
             return
 
@@ -1219,6 +1233,28 @@ class _WipingTimelineCanvas(QWidget):
         self._snapped_to_playhead = False
         if self._drag_mode == "pan":
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            if event.button() == Qt.MouseButton.RightButton and not self._right_panned:
+                pos = event.position()
+                mode, p_idx, l_idx, s_idx = self._hit_test(pos.x(), pos.y())
+                gpos = event.globalPosition().toPoint()
+                if mode in ("move", "left", "right") and p_idx >= 0 and s_idx >= 0:
+                    coord = (p_idx, l_idx, s_idx)
+                    if coord not in self.selected_syls:
+                        self.select_single(p_idx, l_idx, s_idx)
+                    else:
+                        self.page_idx, self.line_idx, self.selected_syl = coord
+                    self.line_clicked.emit(p_idx, l_idx)
+                    self.context_menu_requested.emit("word", p_idx, l_idx, s_idx, gpos)
+                elif mode == "line_header" and p_idx >= 0:
+                    self.page_idx, self.line_idx = p_idx, l_idx
+                    self.line_clicked.emit(p_idx, l_idx)
+                    self.context_menu_requested.emit("line", p_idx, l_idx, 0, gpos)
+                elif mode == "page_badge" and p_idx >= 0:
+                    self.page_idx, self.line_idx = p_idx, 0
+                    self.line_clicked.emit(p_idx, 0)
+                    self.context_menu_requested.emit("page", p_idx, 0, 0, gpos)
+            self._right_press_pos = None
+            self._right_panned = False
         elif self._drag_mode == "group_move":
             if self._drag_changed or self._drag_style_changed:
                 lbl = self._drag_label or "Move Selection"
@@ -1472,6 +1508,7 @@ class LyricsWipingView(QWidget):
         self.canvas.line_clicked.connect(self._on_canvas_line_clicked)
         self.canvas.delete_requested.connect(self._delete_syl)
         self.canvas.edit_syllable_requested.connect(self._edit_syl)
+        self.canvas.context_menu_requested.connect(self._on_canvas_context_menu)
         self.canvas.styles_changed.connect(self._on_canvas_styles_changed)
         self.canvas.project_mutated.connect(self.project_mutated.emit)
         self.canvas.viewport_changed.connect(self._on_canvas_viewport)
@@ -1716,6 +1753,100 @@ class LyricsWipingView(QWidget):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data and data[1] >= 0:
             self._play_current_line()
+
+    def _on_canvas_context_menu(self, kind: str, p_idx: int, l_idx: int, s_idx: int, global_pos: QPoint) -> None:
+        if not self.project:
+            return
+        menu = QMenu(self)
+
+        if kind == "word":
+            for label, fn in [
+                ("Add Word / Syllable…", self._add_word),
+                ("Edit Syllable Text…", self._edit_syl),
+                ("Split Syllable…", self._split_syl),
+                ("Join with Next Syllable", self._join_syl),
+                ("Delete Syllable(s)", self._delete_syl),
+            ]:
+                act = QAction(label, self)
+                act.triggered.connect(fn)
+                menu.addAction(act)
+
+            menu.addSeparator()
+            for label, fn in [
+                ("Snap Start", self._snap_start),
+                ("Snap End", self._snap_end),
+                ("Snap Both", self._snap_both),
+            ]:
+                act = QAction(label, self)
+                act.triggered.connect(fn)
+                menu.addAction(act)
+
+            menu.addSeparator()
+            act_arr = QAction("Append ➣➣➣ (135 cs)", self)
+            act_arr.triggered.connect(lambda: self._prepend_glyph("➣➣➣", 135))
+            menu.addAction(act_arr)
+            act_dot = QAction("Append •• (68 cs)", self)
+            act_dot.triggered.connect(lambda: self._prepend_glyph("••", 68))
+            menu.addAction(act_dot)
+
+        elif kind == "line":
+            act_play = QAction("▶ Play Line", self)
+            act_play.triggered.connect(self._play_current_line)
+            menu.addAction(act_play)
+
+            act_sel = QAction("Select Whole Line", self)
+            act_sel.triggered.connect(lambda: self.canvas.select_whole_line(p_idx, l_idx, center=False))
+            menu.addAction(act_sel)
+
+            menu.addSeparator()
+            for label, fn in [
+                ("Add Line…", self._add_line),
+                ("Split Line at Selected Syllable", self._split_line),
+                ("Join with Next Line", self._join_line),
+                ("Duplicate Line → [B]/[C]", self._duplicate_selected_line),
+                ("Delete Line", self._delete_line),
+            ]:
+                act = QAction(label, self)
+                act.triggered.connect(fn)
+                menu.addAction(act)
+
+            style_menu = menu.addMenu("Set Line Style")
+            cur_ln = self.canvas.get_line(p_idx, l_idx)
+            cur_st = cur_ln.style.upper() if cur_ln else "A"
+            for i in range(self._style_combo.count()):
+                st_letter = str(self._style_combo.itemData(i))
+                st_label = self._style_combo.itemText(i)
+                act_st = QAction(st_label, self)
+                act_st.setCheckable(True)
+                act_st.setChecked(st_letter == cur_st)
+                act_st.triggered.connect(lambda _chk=False, lt=st_letter: self._set_selected_lines_style(lt))
+                style_menu.addAction(act_st)
+
+        elif kind == "page":
+            act_sel = QAction(f"Select Whole Page {p_idx + 1}", self)
+            act_sel.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=False))
+            menu.addAction(act_sel)
+
+            menu.addSeparator()
+            for label, fn in [
+                ("Add Page…", self._add_page),
+                ("Split Page", self._split_page),
+                ("Join with Next Page", self._join_page),
+                (f"Duplicate Page {p_idx + 1} → [B]/[C]", lambda: self._duplicate_page_idx(p_idx)),
+                ("Delete Page", self._delete_page),
+            ]:
+                act = QAction(label, self)
+                act.triggered.connect(fn)
+                menu.addAction(act)
+
+            menu.addSeparator()
+            act_reset = QAction(f"Reset Page {p_idx + 1} Display Windows", self)
+            act_reset.triggered.connect(lambda: self._reset_page_displays(p_idx))
+            menu.addAction(act_reset)
+        else:
+            return
+
+        menu.exec(global_pos)
 
     def _on_tree_context_menu(self, pos: QPoint) -> None:
         item = self._line_tree.itemAt(pos)

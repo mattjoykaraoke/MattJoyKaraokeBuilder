@@ -306,3 +306,42 @@ def test_prepend_glyphs_matches_mjkcs():
     assert g2.end == 999
     assert g2.start == 931
     assert line.display_start == 931
+
+
+def test_insert_syllable_between_adjacent_and_short_neighbors():
+    # Case 1: long prev (32 cs) + short next (16 cs) adjacent -> borrows proportionally, never squishes < 8 cs, no overlap
+    ln = Line(
+        "C", "A", 17600, 17900,
+        syllables=[
+            Syllable("light ", 17697, 17729),  # 32 cs
+            Syllable("is ", 17729, 17745),     # 16 cs
+            Syllable("the ", 17745, 17761),    # 16 cs
+        ],
+    )
+    assert ln.insert_syllables(1, ["bright"], duration_cs=30)
+    assert len(ln.syllables) == 4
+    # Strictly non-overlapping and every syllable >= 8 cs
+    for i, s in enumerate(ln.syllables):
+        assert s.duration >= 8, f"Syllable {s.text} squished to {s.duration} cs"
+        if i > 0:
+            assert s.start >= ln.syllables[i - 1].end, "Inserted syllable overlapped neighbor!"
+    # Longer neighbor ('light') absorbed more of the trim than short neighbor ('is')
+    assert (17729 - ln.syllables[0].end) > (ln.syllables[2].start - 17729)
+
+    # Case 2: two ultra-short 8 cs neighbors with a downstream gap -> ripples minimally and absorbs into gap
+    ln2 = Line(
+        "C", "A", 900, 1200,
+        syllables=[
+            Syllable("a ", 1000, 1008),    # 8 cs (at minimum)
+            Syllable("b ", 1008, 1016),    # 8 cs (at minimum)
+            Syllable("c", 1040, 1080),     # 24 cs gap before 'c'
+        ],
+    )
+    assert ln2.insert_syllables(1, ["x"], duration_cs=30)
+    assert len(ln2.syllables) == 4
+    for i, s in enumerate(ln2.syllables):
+        assert s.duration >= 8
+        if i > 0:
+            assert s.start >= ln2.syllables[i - 1].end
+    # Downstream 'c' was completely untouched because the ripple was absorbed by the gap!
+    assert ln2.syllables[3].start == 1040 and ln2.syllables[3].end == 1080

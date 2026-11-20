@@ -322,13 +322,21 @@ class Line:
         """
         Insert one or more syllables into a synced line at `insert_idx`, computing
         clean non-overlapping timestamps and preserving word spacing.
+
+        When inserting between two synced syllables without enough gap:
+        1. Uses any existing gap first (0 disruption).
+        2. Borrows spare time proportionally from the preceding and following syllables
+           while never squishing any syllable below MIN_SYL_CS (8 cs).
+        3. If both neighbors are already too short, ripples the minimal deficit rightward
+           and absorbs it into the first downstream gap.
         """
+        MIN_SYL_CS = 8
         cleaned = [t for t in texts if t]
         if not cleaned:
             return False
         insert_idx = max(0, min(len(self.syllables), insert_idx))
         count = len(cleaned)
-        dur = max(5, int(duration_cs))
+        dur = max(MIN_SYL_CS, int(duration_cs))
 
         # Ensure trailing word space on the preceding syllable when adding a new word
         if insert_idx > 0 and self.syllables:
@@ -351,26 +359,75 @@ class Line:
             nxt_start = self.syllables[0].start
             t0 = max(0, nxt_start - dur * count)
             avail = max(count, nxt_start - t0)
-            step = max(2, min(dur, avail // count)) if nxt_start > t0 else dur
+            step = max(MIN_SYL_CS, min(dur, avail // count)) if nxt_start > t0 else dur
         elif insert_idx >= len(self.syllables):
             t0 = self.syllables[-1].end
             step = dur
         else:
-            prev_end = self.syllables[insert_idx - 1].end
-            nxt_start = self.syllables[insert_idx].start
-            gap = nxt_start - prev_end
-            if gap >= count * 4:
-                t0 = prev_end
+            prev_syl = self.syllables[insert_idx - 1]
+            nxt_syl = self.syllables[insert_idx]
+            gap = max(0, nxt_syl.start - prev_syl.end)
+            min_needed = MIN_SYL_CS * count
+            # Target a modest, grabbable slot when squeezing between synced neighbors
+            target_total = min(dur * count, max(min_needed, 14 * count))
+
+            if gap >= min_needed:
+                # Stage 1: fits cleanly inside existing gap
+                t0 = prev_syl.end
                 step = min(dur, gap // count)
             else:
-                t0 = prev_end
-                step = dur
+                # Stage 2: borrow proportionally from prev & next above MIN_SYL_CS
+                prev_spare = max(0, prev_syl.duration - MIN_SYL_CS)
+                nxt_spare = max(0, nxt_syl.duration - MIN_SYL_CS)
+                total_spare = prev_spare + nxt_spare
+                deficit = target_total - gap
+
+                if total_spare > 0:
+                    borrow = min(deficit, total_spare)
+                    take_prev = int(round(borrow * (prev_spare / total_spare)))
+                    take_prev = min(prev_spare, take_prev)
+                    take_nxt = min(nxt_spare, borrow - take_prev)
+                    # If rounding left remainder and prev still has spare, take it
+                    rem_b = borrow - take_prev - take_nxt
+                    if rem_b > 0 and prev_spare > take_prev:
+                        extra = min(rem_b, prev_spare - take_prev)
+                        take_prev += extra
+                    prev_syl.end -= take_prev
+                    nxt_syl.start += take_nxt
+
+                avail = max(0, nxt_syl.start - prev_syl.end)
+                # Stage 3: if both neighbors were too short, ripple minimal deficit right
+                if avail < min_needed:
+                    shift_rem = min_needed - avail
+                    for j in range(insert_idx, len(self.syllables)):
+                        cur_s = self.syllables[j]
+                        next_gap = (
+                            max(0, self.syllables[j + 1].start - cur_s.end)
+                            if j + 1 < len(self.syllables)
+                            else 0
+                        )
+                        cur_s.start += shift_rem
+                        cur_s.end += shift_rem
+                        # Absorb ripple into the next gap so later syllables stay untouched
+                        shift_rem = max(0, shift_rem - next_gap)
+                        if shift_rem == 0:
+                            break
+                    avail = max(min_needed, nxt_syl.start - prev_syl.end)
+
+                t0 = prev_syl.end
+                step = max(MIN_SYL_CS, avail // count)
 
         new_syls: List[Syllable] = []
         cur = t0
-        for txt in cleaned:
-            new_syls.append(Syllable(text=txt, start=cur, end=cur + step))
-            cur += step
+        for i, txt in enumerate(cleaned):
+            # Ensure last inserted syllable fits cleanly up to next_syl.start when between neighbors
+            if start_cs is None and 0 < insert_idx < len(self.syllables) and i == count - 1:
+                nxt_s = self.syllables[insert_idx].start
+                end_cs = min(cur + step, nxt_s) if nxt_s > cur else cur + step
+            else:
+                end_cs = cur + step
+            new_syls.append(Syllable(text=txt, start=cur, end=end_cs))
+            cur = end_cs
 
         self.syllables[insert_idx:insert_idx] = new_syls
         if new_syls[0].start < self.display_start:
