@@ -34,6 +34,7 @@ from ..model import KbpProject, Line, Syllable
 
 RULER_H = 26
 HANDLE_PX = 7
+SNAP_PLAYHEAD_PX = 10.0
 DEFAULT_WIPING_PX_PER_CS = 2.4
 
 
@@ -355,7 +356,9 @@ class _WipingTimelineCanvas(QWidget):
         self.playhead_cs: float = 0.0
 
         self.sticky_borders: bool = True
-        self.show_display_windows: bool = True
+        self.snap_to_playhead: bool = True
+        self.show_display_windows: bool = False
+        self._snapped_to_playhead: bool = False
         self.px_per_cs: float = DEFAULT_WIPING_PX_PER_CS
         self.scroll_x_cs: float = 0.0
 
@@ -397,6 +400,13 @@ class _WipingTimelineCanvas(QWidget):
                 for s_i in range(len(line.syllables)):
                     out.append((p_i, l_i, s_i))
         return out
+
+    def clear_selection(self) -> None:
+        if self.selected_syls or self.selected_syl != -1:
+            self.selected_syls.clear()
+            self.selected_syl = -1
+            self._anchor_syl = None
+            self.update()
 
     def select_single(self, p_idx: int, l_idx: int, s_idx: int) -> None:
         self.page_idx = p_idx
@@ -825,7 +835,10 @@ class _WipingTimelineCanvas(QWidget):
         if -4 <= x <= self.width() + 4:
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(QPen(QColor(255, 70, 90), 2.0))
+            if self._snapped_to_playhead:
+                painter.setPen(QPen(QColor(255, 220, 60), 2.5))
+            else:
+                painter.setPen(QPen(QColor(255, 70, 90), 2.0))
             painter.drawLine(QLineF(x, 0.0, x, float(h)))
             painter.restore()
 
@@ -1006,13 +1019,27 @@ class _WipingTimelineCanvas(QWidget):
             self.update()
             return
 
+        self._snapped_to_playhead = False
+        ph_cs = int(round(self.playhead_cs))
+        snap_tol_cs = SNAP_PLAYHEAD_PX / max(1e-6, self.px_per_cs)
+
         if self._drag_mode == "group_move":
             if not self._drag_orig_syls:
                 return
             cs = self.x_to_cs(pos.x())
             raw_delta = cs - self._drag_start_cs
             min_start = min(st for st, _ in self._drag_orig_syls.values())
+            max_end = max(en for _, en in self._drag_orig_syls.values())
             delta = max(-min_start, raw_delta)
+            if self.snap_to_playhead:
+                d_left = abs((min_start + delta) - ph_cs)
+                d_right = abs((max_end + delta) - ph_cs)
+                if d_left <= snap_tol_cs and d_left <= d_right:
+                    delta = max(-min_start, ph_cs - min_start)
+                    self._snapped_to_playhead = True
+                elif d_right <= snap_tol_cs:
+                    delta = max(-min_start, ph_cs - max_end)
+                    self._snapped_to_playhead = True
             if delta != 0 or self._drag_changed:
                 for (p_i, l_i, s_i), (orig_s, orig_e) in self._drag_orig_syls.items():
                     line = self.get_line(p_i, l_i)
@@ -1040,7 +1067,11 @@ class _WipingTimelineCanvas(QWidget):
                 min_cs = line.syllables[self._drag_sticky_neighbor].start + 1
             elif self._drag_syl_idx > 0:
                 min_cs = line.syllables[self._drag_syl_idx - 1].end
-            new_start = max(min_cs, min(cs, syl.end - 1))
+            target_cs = cs
+            if self.snap_to_playhead and abs(target_cs - ph_cs) <= snap_tol_cs:
+                target_cs = ph_cs
+                self._snapped_to_playhead = True
+            new_start = max(min_cs, min(target_cs, syl.end - 1))
             syl.start = new_start
             if self._drag_sticky_neighbor is not None:
                 line.syllables[self._drag_sticky_neighbor].end = new_start
@@ -1051,7 +1082,11 @@ class _WipingTimelineCanvas(QWidget):
                 max_cs = line.syllables[self._drag_sticky_neighbor].end - 1
             elif self._drag_syl_idx + 1 < len(line.syllables):
                 max_cs = line.syllables[self._drag_syl_idx + 1].start
-            new_end = min(max_cs, max(cs, syl.start + 1))
+            target_cs = cs
+            if self.snap_to_playhead and abs(target_cs - ph_cs) <= snap_tol_cs:
+                target_cs = ph_cs
+                self._snapped_to_playhead = True
+            new_end = min(max_cs, max(target_cs, syl.start + 1))
             syl.end = new_end
             if self._drag_sticky_neighbor is not None:
                 line.syllables[self._drag_sticky_neighbor].start = new_end
@@ -1059,6 +1094,15 @@ class _WipingTimelineCanvas(QWidget):
         elif self._drag_mode == "move":
             dur = syl.end - syl.start
             new_start = max(0, cs - self._drag_offset_cs)
+            if self.snap_to_playhead:
+                d_left = abs(new_start - ph_cs)
+                d_right = abs((new_start + dur) - ph_cs)
+                if d_left <= snap_tol_cs and d_left <= d_right:
+                    new_start = max(0, ph_cs)
+                    self._snapped_to_playhead = True
+                elif d_right <= snap_tol_cs:
+                    new_start = max(0, ph_cs - dur)
+                    self._snapped_to_playhead = True
             syl.start = new_start
             syl.end = new_start + dur
             self._drag_changed = True
@@ -1066,6 +1110,8 @@ class _WipingTimelineCanvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        was_snapped = self._snapped_to_playhead
+        self._snapped_to_playhead = False
         if self._drag_mode == "pan":
             self.setCursor(Qt.CursorShape.ArrowCursor)
         elif self._drag_mode == "group_move":
@@ -1080,6 +1126,8 @@ class _WipingTimelineCanvas(QWidget):
             line = self.get_line(self._drag_page_idx, self._drag_line_idx)
             txt = line.syllables[self._drag_syl_idx].text.strip() if line and 0 <= self._drag_syl_idx < len(line.syllables) else ""
             self.project_mutated.emit(f"Align Syllable '{txt}' (P{self._drag_page_idx + 1} L{self._drag_line_idx + 1})")
+        if was_snapped:
+            self.update()
         self._drag_mode = None
         self._drag_changed = False
         self._drag_sticky_neighbor = None
@@ -1087,7 +1135,21 @@ class _WipingTimelineCanvas(QWidget):
         self._drag_orig_syls.clear()
         self._drag_orig_lines.clear()
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            mode, _, _, _ = self._hit_test(pos.x(), pos.y())
+            if mode == "scrub":
+                self.clear_selection()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.clear_selection()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_requested.emit()
             event.accept()
@@ -1182,8 +1244,14 @@ class LyricsWipingView(QWidget):
         self._follow_cb.setChecked(True)
         sync_r1.addWidget(self._follow_cb)
 
+        self._snap_ph_cb = QCheckBox("Snap to Playhead", ribbon)
+        self._snap_ph_cb.setChecked(True)
+        self._snap_ph_cb.setToolTip("Magnetically snap syllable/line/page edges to the playhead while dragging")
+        self._snap_ph_cb.toggled.connect(self._on_snap_playhead)
+        sync_r1.addWidget(self._snap_ph_cb)
+
         self._auto_reset_cb = QCheckBox("Auto Reset Display", ribbon)
-        self._auto_reset_cb.setChecked(False)
+        self._auto_reset_cb.setChecked(True)
         self._auto_reset_cb.setToolTip(
             "When ON: automatically resets display windows & applies ➣➣➣ optimizations on every edit.\n"
             "When OFF: shows the active page's DISP / REM window delineation lines on the timeline."
@@ -1500,6 +1568,9 @@ class LyricsWipingView(QWidget):
 
     def _on_sticky(self, checked: bool) -> None:
         self.canvas.sticky_borders = checked
+
+    def _on_snap_playhead(self, checked: bool) -> None:
+        self.canvas.snap_to_playhead = checked
 
     def _snap_start(self) -> None:
         if not self.project:

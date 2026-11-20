@@ -427,11 +427,24 @@ class Page:
 
 
 @dataclass
+class KbpIssue:
+    """Describes a non-conforming KBP entry that was detected and auto-repaired on load."""
+
+    location: str
+    kind: str
+    detail: str
+
+    def __str__(self) -> str:
+        return f"[{self.kind}] {self.location}: {self.detail}"
+
+
+@dataclass
 class KbpProject:
     header: KbpHeader
     pages: List[Page]
     source_path: Optional[Path] = None
     trailing_blank_lines: int = 0
+    load_issues: List[KbpIssue] = field(default_factory=list)
 
     @property
     def header_lines(self) -> List[str]:
@@ -447,7 +460,7 @@ class KbpProject:
         )
 
     @classmethod
-    def load(cls, path: str | Path) -> "KbpProject":
+    def load(cls, path: str | Path, auto_repair: bool = True) -> "KbpProject":
         p = Path(path)
         raw = p.read_bytes()
         try:
@@ -466,23 +479,37 @@ class KbpProject:
         header_lines = raw_lines[:first_sep]
         header = KbpHeader.parse(header_lines)
 
+        issues: List[KbpIssue] = []
         pages: List[Page] = []
         for idx, p_start in enumerate(page_indices):
             p_end = page_indices[idx + 1] - 1 if idx + 1 < len(page_indices) else len(raw_lines)
             page_lines: List[Line] = []
             cur_line: Optional[Line] = None
 
-            for raw_l in raw_lines[p_start + 1 : p_end]:
+            for file_line_no, raw_l in enumerate(raw_lines[p_start + 1 : p_end], start=p_start + 2):
                 stripped = raw_l.strip()
                 if not stripped or stripped.startswith("---"):
                     continue
                 parts = raw_l.split("/")
                 if len(parts) >= 7 and parts[0] in ("L", "C", "R"):
+                    try:
+                        d_start = int(parts[2])
+                        d_end = int(parts[3])
+                    except ValueError:
+                        d_start = 0
+                        d_end = 0
+                        issues.append(
+                            KbpIssue(
+                                location=f"Page {idx + 1}, File line {file_line_no}",
+                                kind="Malformed Display Window",
+                                detail=f"Non-integer display window '{parts[2]}/{parts[3]}' → reset to 0/0",
+                            )
+                        )
                     cur_line = Line(
                         align=parts[0],
                         style=parts[1],
-                        display_start=int(parts[2]),
-                        display_end=int(parts[3]),
+                        display_start=d_start,
+                        display_end=d_end,
                         extra_fields=parts[4:],
                     )
                     page_lines.append(cur_line)
@@ -492,11 +519,25 @@ class KbpProject:
                     rest = raw_l[slash_idx + 1 :]
                     pad = len(rest) - len(rest.lstrip(" "))
                     t_parts = rest.lstrip(" ").split("/")
+                    try:
+                        s_start = int(t_parts[0])
+                        s_end = int(t_parts[1])
+                    except (ValueError, IndexError):
+                        fallback_start = cur_line.syllables[-1].end if cur_line.syllables else max(0, cur_line.display_start)
+                        s_start = fallback_start
+                        s_end = fallback_start + 15
+                        issues.append(
+                            KbpIssue(
+                                location=f"Page {idx + 1}, Line {len(page_lines)}, File line {file_line_no} ('{syl_text.strip()}')",
+                                kind="Malformed Syllable Timestamp",
+                                detail=f"Could not parse '{rest.strip()}' → recovered as {s_start}–{s_end} cs",
+                            )
+                        )
                     cur_line.syllables.append(
                         Syllable(
                             text=syl_text,
-                            start=int(t_parts[0]),
-                            end=int(t_parts[1]),
+                            start=s_start,
+                            end=s_end,
                             flag=t_parts[2] if len(t_parts) > 2 else "0",
                             pad=pad,
                         )
@@ -510,7 +551,109 @@ class KbpProject:
             else:
                 break
 
-        return cls(header=header, pages=pages, source_path=p, trailing_blank_lines=trailing_blanks)
+        proj = cls(
+            header=header,
+            pages=pages,
+            source_path=p,
+            trailing_blank_lines=trailing_blanks,
+            load_issues=issues,
+        )
+        if auto_repair:
+            proj.validate_and_repair()
+        return proj
+
+    def validate_and_repair(self) -> List[KbpIssue]:
+        """
+        Detect and repair non-conforming timestamps (negative times, inverted start/end,
+        inverted display windows) in memory. Appends findings to `self.load_issues`.
+        """
+        new_issues: List[KbpIssue] = []
+        for p_idx, page in enumerate(self.pages):
+            for l_idx, line in enumerate(page.lines):
+                loc_line = f"Page {p_idx + 1}, Line {l_idx + 1}"
+
+                # 1. Check syllables for negative or inverted timestamps
+                for s_idx, syl in enumerate(line.syllables):
+                    loc_syl = f"{loc_line}, Syl {s_idx + 1} ('{syl.text.strip() or ' '}')"
+                    if syl.start < 0 or syl.end < 0:
+                        orig = f"{syl.start}–{syl.end} cs"
+                        syl.start = max(0, syl.start)
+                        syl.end = max(0, syl.end)
+                        if syl.end < syl.start:
+                            syl.end = syl.start + 15
+                        new_issues.append(
+                            KbpIssue(
+                                location=loc_syl,
+                                kind="Negative Timestamp",
+                                detail=f"Found {orig} → clamped to {syl.start}–{syl.end} cs",
+                            )
+                        )
+
+                    if syl.end < syl.start:
+                        orig = f"{syl.start}–{syl.end} cs"
+                        if syl.end == 0:
+                            nxt_start = line.syllables[s_idx + 1].start if s_idx + 1 < len(line.syllables) else 0
+                            if nxt_start > syl.start:
+                                syl.end = min(syl.start + 30, nxt_start)
+                            else:
+                                syl.end = syl.start + 15
+                            detail = f"End 0 < Start {syl.start} cs → set end to {syl.end} cs"
+                        else:
+                            syl.start, syl.end = syl.end, syl.start
+                            detail = f"End preceded start ({orig}) → swapped to {syl.start}–{syl.end} cs"
+                        new_issues.append(
+                            KbpIssue(
+                                location=loc_syl,
+                                kind="Inverted Syllable Time",
+                                detail=detail,
+                            )
+                        )
+
+                # 2. Check line display window for negative or inverted times
+                if line.display_start < 0 or line.display_end < 0:
+                    orig = f"{line.display_start}–{line.display_end} cs"
+                    line.display_start = max(0, line.display_start)
+                    line.display_end = max(0, line.display_end)
+                    new_issues.append(
+                        KbpIssue(
+                            location=loc_line,
+                            kind="Negative Display Window",
+                            detail=f"Found {orig} → clamped to {line.display_start}–{line.display_end} cs",
+                        )
+                    )
+
+                if line.display_end < line.display_start:
+                    orig = f"{line.display_start}–{line.display_end} cs"
+                    if line.syllables:
+                        line.display_start = max(0, min(line.display_start, line.first_syl_start))
+                        line.display_end = max(line.display_start, line.last_syl_end + DEFAULT_CLEAR_HOLD_CS)
+                    else:
+                        line.display_start, line.display_end = line.display_end, line.display_start
+                    new_issues.append(
+                        KbpIssue(
+                            location=loc_line,
+                            kind="Inverted Display Window",
+                            detail=f"Display end preceded start ({orig}) → corrected to {line.display_start}–{line.display_end} cs",
+                        )
+                    )
+
+        self.load_issues.extend(new_issues)
+        return new_issues
+
+    @staticmethod
+    def create_backup(path: str | Path) -> Path:
+        """
+        Save a non-destructive .bak copy of the original file next to it.
+        Never overwrites an existing backup (uses .bak, .bak1, .bak2, ...).
+        """
+        src = Path(path)
+        bak = src.with_name(src.name + ".bak")
+        counter = 1
+        while bak.exists():
+            bak = src.with_name(f"{src.name}.bak{counter}")
+            counter += 1
+        bak.write_bytes(src.read_bytes())
+        return bak
 
     def to_bytes(self) -> bytes:
         out: List[str] = list(self.header.raw_lines)

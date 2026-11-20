@@ -324,6 +324,11 @@ class MainWindow(QMainWindow):
         act_play.triggered.connect(self.audio.toggle_play)
         self.addAction(act_play)
 
+        act_clear_sel = QAction("Clear Selection", self)
+        act_clear_sel.setShortcut(QKeySequence(Qt.Key.Key_Escape))
+        act_clear_sel.triggered.connect(self.wiping_view.canvas.clear_selection)
+        self.addAction(act_clear_sel)
+
     def _wire_signals(self) -> None:
         self.audio.position_changed_float.connect(self._on_playhead_moved)
         self.audio.state_changed.connect(lambda playing: self._play_btn.setText("⏸ Pause" if playing else "▶ Play"))
@@ -424,6 +429,15 @@ class MainWindow(QMainWindow):
 
         self.project = proj
         self.history.reset(proj, label=f"Open {Path(path).name}")
+
+        bak_path: Optional[Path] = None
+        if proj.load_issues:
+            try:
+                bak_path = KbpProject.create_backup(Path(path))
+            except Exception:
+                bak_path = None
+            self.history.mark_dirty()
+
         self._bind_project_to_views(preserve_view=False)
         self._rebuild_page_buttons()
 
@@ -436,6 +450,37 @@ class MainWindow(QMainWindow):
         self._sync_minimap_from_active_tab()
         self._refresh_actions()
         self.statusBar().showMessage(f"Opened {Path(path).name} ({len(proj.pages)} pages)", 4000)
+
+        if proj.load_issues:
+            self._show_repair_warning(Path(path), proj.load_issues, bak_path)
+
+    def _show_repair_warning(self, orig_path: Path, issues: list, bak_path: Optional[Path]) -> None:
+        count = len(issues)
+        preview_lines = "\n".join(f"• {iss}" for iss in issues[:6])
+        if count > 6:
+            preview_lines += f"\n… and {count - 6} more (click 'Show Details…' for the full list)."
+
+        bak_note = (
+            f"A backup of the untouched original file was saved to:\n{bak_path.name}"
+            if bak_path is not None
+            else "The original file on disk has NOT been modified."
+        )
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Non-Standard KBP File Auto-Repaired")
+        msg.setText(
+            f"Detected and automatically repaired {count} non-standard timing/format "
+            f"issue{'s' if count != 1 else ''} in '{orig_path.name}'."
+        )
+        msg.setInformativeText(
+            f"{preview_lines}\n\n"
+            f"Please review and verify the sync at the affected location(s) before saving.\n"
+            f"{bak_note}"
+        )
+        msg.setDetailedText("\n".join(str(iss) for iss in issues))
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
 
     def _bind_project_to_views(self, preserve_view: bool = False) -> None:
         self.display_view.set_project(self.project, preserve_view=preserve_view)

@@ -233,3 +233,56 @@ def test_line_and_page_crud():
     assert len(proj.pages) == orig_pages + 1
     assert proj.delete_page(1)
     assert len(proj.pages) == orig_pages
+
+
+def test_non_conforming_kbp_auto_repair_and_backup(tmp_path):
+    broken_kbp = tmp_path / "broken.kbp"
+    raw_content = "\r\n".join([
+        "-----------------------------",
+        "KARAOKE BUILDER STUDIO",
+        "HEADERV2",
+        "'Palette Colours (0-15)",
+        "  055,FFF,000,E70,940",
+        "  Style00,Default,1,2,3,4",
+        "    Arial,12,B,0",
+        "    2,2,2,2,0,0,0,L",
+        "  StyleEnd",
+        "-----------------------------",
+        "PAGEV2",
+        "C/A/-50/1200/0/0/0",
+        "Neg/           -25/100/0",
+        "Swap/          500/420/0",
+        "ZeroEnd/       600/0/0",
+        "BadNum/        abc/def/0",
+        "",
+        "C/A/1500/900/0/0/0",
+        "InvWin/        1000/1100/0",
+        "",
+        "-----------------------------",
+        "",
+    ])
+    broken_kbp.write_text(raw_content, encoding="utf-8")
+    orig_bytes = broken_kbp.read_bytes()
+
+    proj = KbpProject.load(broken_kbp)
+    # Original file on disk must be untouched!
+    assert broken_kbp.read_bytes() == orig_bytes
+    assert len(proj.load_issues) >= 5
+
+    l0 = proj.pages[0].lines[0]
+    assert l0.display_start == 0  # clamped from -50
+    assert l0.syllables[0].start == 0 and l0.syllables[0].end == 100  # clamped from -25
+    assert l0.syllables[1].start == 420 and l0.syllables[1].end == 500  # swapped
+    assert l0.syllables[2].start == 600 and l0.syllables[2].end > 600  # zero end fixed
+    assert l0.syllables[3].start >= 0 and l0.syllables[3].end > l0.syllables[3].start  # malformed recovered
+
+    l1 = proj.pages[0].lines[1]
+    assert l1.display_end >= l1.display_start  # inverted display window fixed
+
+    # Non-destructive backup creation (and collision safety)
+    bak1 = KbpProject.create_backup(broken_kbp)
+    assert bak1.name == "broken.kbp.bak"
+    assert bak1.read_bytes() == orig_bytes
+    bak2 = KbpProject.create_backup(broken_kbp)
+    assert bak2.name == "broken.kbp.bak1"
+    assert bak2.read_bytes() == orig_bytes

@@ -68,6 +68,9 @@ class HistoryManager:
     def mark_saved(self) -> None:
         self._saved_index = self._index
 
+    def mark_dirty(self) -> None:
+        self._saved_index = -1
+
     def undo(self) -> Optional[KbpProject]:
         if not self.can_undo:
             return None
