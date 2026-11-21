@@ -58,7 +58,7 @@ from .project_organizer import ProjectOrganizerDialog
 
 def _autosave_path() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    return Path(base) / "AdvancedKBPEditor" / "tap_sync_autosave.mjkp"
+    return Path(base) / "MattJoyKaraokeBuilder" / "tap_sync_autosave.mjkp"
 
 
 class _LocalLyricSplitterWorker(QThread):
@@ -124,7 +124,7 @@ class _LyricsInputDialog(QDialog):
         self.setWindowTitle("Obtain / Enter Lyrics for Tap Sync")
         self.resize(640, 560)
         self._draft = draft
-        self._settings = settings or QSettings("MattJoy", "AdvancedKBPEditor")
+        self._settings = settings or QSettings("MattJoy", "MattJoyKaraokeBuilder")
         self._lls_worker: Optional[_LocalLyricSplitterWorker] = None
 
         layout = QVBoxLayout(self)
@@ -803,7 +803,7 @@ class TapSyncView(QWidget):
         self._pending_punch_line: Optional[Tuple[int, int]] = None
         self._pending_seek_cs: Optional[float] = None
         self._draft_file_path: Optional[Path] = None
-        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
+        self._settings = QSettings("MattJoy", "MattJoyKaraokeBuilder")
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._build_ui()

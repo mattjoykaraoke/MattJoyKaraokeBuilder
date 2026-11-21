@@ -1,1 +1,1 @@
-"""UI widgets for Advanced KBP Editor."""
+"""UI widgets for Matt Joy Karaoke Builder."""

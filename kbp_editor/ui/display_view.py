@@ -456,7 +456,7 @@ class DisplayRemoveView(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.project: Optional[KbpProject] = None
-        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
+        self._settings = QSettings("MattJoy", "MattJoyKaraokeBuilder")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)

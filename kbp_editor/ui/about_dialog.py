@@ -114,7 +114,8 @@ class AboutDialog(QDialog):
         title_col.addWidget(ver_lbl)
 
         desc_lbl = QLabel(
-            "A modern karaoke lyric tap-syncing, syllable wiping, and display-window editor for Karaoke Builder Studio (.kbp) projects.",
+            "A modern karaoke lyric tap-syncing, syllable wiping, and display-window builder and editor of "
+            "Karaoke Builder Studio (.kbp) projects, and pipeline to finished video.",
             self,
         )
         desc_lbl.setWordWrap(True)

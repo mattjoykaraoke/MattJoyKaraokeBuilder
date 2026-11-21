@@ -1,8 +1,8 @@
 # Third-Party Licenses & Attribution
 
-Advanced KBP Editor is **Proprietary Software — All Rights Reserved** (see [`LICENSE`](LICENSE)).
+Matt Joy Karaoke Builder is **Proprietary Software — All Rights Reserved** (see [`LICENSE`](LICENSE)).
 
-All runtime dependencies used by Advanced KBP Editor are licensed under permissive open-source licenses (MIT / BSD) or **LGPL** (dynamically linked), which permits proprietary distribution with proper attribution and dynamic linking. **No GPL-only or third-party proprietary libraries are bundled or required.**
+All runtime dependencies used by Matt Joy Karaoke Builder are licensed under permissive open-source licenses (MIT / BSD) or **LGPL** (dynamically linked), which permits proprietary distribution with proper attribution and dynamic linking. **No GPL-only or third-party proprietary libraries are bundled or required.**
 
 ---
 
@@ -18,7 +18,7 @@ All runtime dependencies used by Advanced KBP Editor are licensed under permissi
 - **License:** GNU Lesser General Public License v2.1 or later (LGPL-2.1+)
 - **Website:** https://ffmpeg.org/
 - **Usage:** Official PySide6 `QtMultimedia` wheels bundle LGPL-configured FFmpeg shared libraries (`avcodec`, `avformat`, `avutil`) without `--enable-gpl` or `--enable-nonfree`.
-- **Important Packaging Note:** Advanced KBP Editor does **not** invoke or bundle a standalone `ffmpeg` CLI executable. If future features add external FFmpeg video/audio rendering, users will be prompted to point to their own local FFmpeg installation so that no GPL-licensed FFmpeg binary is ever packaged or redistributed with this application.
+- **Important Packaging Note:** Matt Joy Karaoke Builder does **not** invoke or bundle a standalone `ffmpeg` CLI executable. If future features add external FFmpeg video/audio rendering, users will be prompted to point to their own local FFmpeg installation so that no GPL-licensed FFmpeg binary is ever packaged or redistributed with this application.
 
 ### 3. python-soundfile & libsndfile
 - **python-soundfile License:** BSD-3-Clause — https://github.com/bastibe/python-soundfile
@@ -45,7 +45,7 @@ All runtime dependencies used by Advanced KBP Editor are licensed under permissi
 
 ## LGPL Compliance Notes for Binary Distribution
 
-When packaging Advanced KBP Editor into a standalone release (e.g., via PyInstaller or Nuitka):
+When packaging Matt Joy Karaoke Builder into a standalone release (e.g., via PyInstaller or Nuitka):
 1. Distribute using **dynamic linking / directory mode** (e.g., PyInstaller `--onedir`) so end users can replace the LGPL shared libraries (`Qt6*.dll`, `avcodec*.dll`, `avformat*.dll`, `avutil*.dll`, `libsndfile*.dll`) as required by LGPL-2.1 / LGPL-3.0.
 2. Include both `LICENSE` and `THIRD_PARTY_LICENSES.md` in the distributed release folder/installer.
 3. Do **not** bundle any GPL-compiled `ffmpeg.exe` binary; keep any external CLI tools user-supplied.

@@ -94,7 +94,7 @@ class ProjectOrganizerDialog(QDialog):
         # Keep ._table pointing to autosave table when callers inspect autosaves, or active table via helper
         self._table = self._autosave_table
 
-        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
+        self._settings = QSettings("MattJoy", "MattJoyKaraokeBuilder")
         row_opts = QHBoxLayout()
         self._inc_audio_cb = QCheckBox("Include main audio && vocal stem when exporting .zip bundle", self)
         self._inc_audio_cb.setChecked(self._settings.value("bundle_include_audio", True, type=bool))

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QProcess, QSettings, Qt
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import APP_NAME
 from ..audio import AudioEngine
 from ..history import HistoryManager
 from ..model import KbpProject
@@ -46,7 +47,15 @@ def _fmt_time(cs: float) -> str:
 class MainWindow(QMainWindow):
     def __init__(self, initial_file: Optional[str] = None) -> None:
         super().__init__()
-        self.setWindowTitle("Advanced KBP Editor")
+        self.setWindowTitle(APP_NAME)
+        _root = Path(__file__).resolve().parent.parent.parent
+        for _rel in ("assets/app_icon.ico", "assets/logo.png"):
+            _p = _root / _rel
+            if _p.is_file():
+                _ico = QIcon(str(_p))
+                if not _ico.isNull():
+                    self.setWindowIcon(_ico)
+                    break
         self.resize(1440, 880)
 
         self.project: Optional[KbpProject] = None
@@ -106,7 +115,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self.setStatusBar(QStatusBar(self))
-        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
+        self._settings = QSettings("MattJoy", "MattJoyKaraokeBuilder")
         saved_auto_reset = self._settings.value("auto_reset_display", True, type=bool)
         self.wiping_view.set_auto_reset_display(saved_auto_reset)
         self.display_view.set_auto_reset_display(saved_auto_reset)
@@ -698,7 +707,7 @@ class MainWindow(QMainWindow):
         )
 
     def _launch_new_window(self, file_path: Optional[str | Path] = None) -> bool:
-        """Spawn a separate instance of Advanced KBP Editor (optionally opening a file)."""
+        """Spawn a separate instance of Matt Joy Karaoke Builder (optionally opening a file)."""
         script = str(Path(sys.argv[0]).resolve())
         args = [script]
         if file_path is not None:
@@ -708,7 +717,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Could Not Open New Window",
-                "Failed to launch a new instance of Advanced KBP Editor.",
+                "Failed to launch a new instance of Matt Joy Karaoke Builder.",
             )
         return ok
 
@@ -1310,15 +1319,15 @@ class MainWindow(QMainWindow):
         self._act_redo.setEnabled(self.history.can_redo)
         self._act_redo.setText(f"&Redo: {self.history.redo_label}" if self.history.can_redo else "&Redo")
 
-        title = "Advanced KBP Editor"
+        title = "Matt Joy Karaoke Builder"
         dirty = "*" if (self.history.is_dirty or self.tap_sync_view.is_dirty) else ""
         if self.project and self.project.source_path:
-            title = f"{dirty}{self.project.source_path.name} — Advanced KBP Editor"
+            title = f"{dirty}{self.project.source_path.name} — Matt Joy Karaoke Builder"
         elif self.project:
             proj_name = self.project.header.title or "Untitled.kbp"
-            title = f"{dirty}{proj_name} — Advanced KBP Editor"
+            title = f"{dirty}{proj_name} — Matt Joy Karaoke Builder"
         elif self.tap_sync_view.is_dirty:
-            title = f"*{self.tap_sync_view.draft.display_name} — Advanced KBP Editor"
+            title = f"*{self.tap_sync_view.draft.display_name} — Matt Joy Karaoke Builder"
         self.setWindowTitle(title)
 
     @staticmethod

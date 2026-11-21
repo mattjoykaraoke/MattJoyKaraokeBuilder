@@ -1585,7 +1585,7 @@ class LyricsWipingView(QWidget):
         self._word_adjust_active: bool = False
         self._saved_px_per_cs: float = DEFAULT_WIPING_PX_PER_CS
         self._saved_scroll_x_cs: float = 0.0
-        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
+        self._settings = QSettings("MattJoy", "MattJoyKaraokeBuilder")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)

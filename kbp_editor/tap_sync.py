@@ -589,21 +589,21 @@ class TapSyncDraft:
 
 def default_drafts_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    d = Path(base) / "AdvancedKBPEditor" / "drafts"
+    d = Path(base) / "MattJoyKaraokeBuilder" / "drafts"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def default_autosaves_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    d = Path(base) / "AdvancedKBPEditor" / "autosaves"
+    d = Path(base) / "MattJoyKaraokeBuilder" / "autosaves"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def default_saved_projects_registry() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    d = Path(base) / "AdvancedKBPEditor"
+    d = Path(base) / "MattJoyKaraokeBuilder"
     d.mkdir(parents=True, exist_ok=True)
     return d / "saved_projects.json"
 

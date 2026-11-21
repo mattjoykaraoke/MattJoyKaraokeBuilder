@@ -1,4 +1,4 @@
-# Advanced KBP Editor
+# Matt Joy Karaoke Builder
 
 **A modern, dark-mode karaoke lyric tap-syncing, syllable wiping, and display-window editor for Karaoke Builder Studio (`.kbp`) projects.**
 
@@ -79,6 +79,6 @@ On Windows, you can also launch directly using [`run.bat`](run.bat) (or drop a `
 
 ## Licensing & Attribution
 
-- **Advanced KBP Editor** is **Proprietary — All Rights Reserved** (`Copyright © 2026 Matt Joy`). You may not copy, reuse, modify, redistribute, or sell the source code without prior written permission — see [`LICENSE`](LICENSE).
+- **Matt Joy Karaoke Builder** is **Proprietary — All Rights Reserved** (`Copyright © 2026 Matt Joy`). You may not copy, reuse, modify, redistribute, or sell the source code without prior written permission — see [`LICENSE`](LICENSE).
 - All runtime dependencies (`PySide6` / Qt 6, Qt Multimedia's LGPL FFmpeg libraries, `soundfile` / `libsndfile`, `NumPy`, `cffi`) are **MIT / BSD / LGPL** (dynamically linked), allowing proprietary distribution with attribution. No GPL-only libraries are bundled or required.
 - Full third-party notices and LGPL binary packaging compliance notes are in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) (also viewable in-app via **About → View Licenses & Attribution…**).
