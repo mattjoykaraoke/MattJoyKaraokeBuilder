@@ -76,6 +76,33 @@ class SongMinimapWidget(QWidget):
         w = max(1, self.width())
         return max(0.0, min(self.total_cs, (x / w) * self.total_cs))
 
+    def _draw_wave_layer(self, painter: QPainter, wf, w: int, h: int, color: QColor) -> None:
+        if wf is None or len(wf.peaks) == 0 or w <= 0:
+            return
+        peaks = wf.peaks
+        n = len(peaks)
+        mid_y = h * 0.56
+        half_h = h * 0.36
+        total_cs = self.total_cs
+        scale_b = wf.buckets_per_sec / 100.0
+        px_arr = np.arange(0, w, 2, dtype=np.float64)
+        cs0 = (px_arr / max(1, w)) * total_cs
+        cs1 = ((px_arr + 2.0) / max(1, w)) * total_cs
+        i0 = np.clip((cs0 * scale_b).astype(np.int64), 0, n - 1)
+        i1 = np.clip((cs1 * scale_b).astype(np.int64) + 1, i0 + 1, n)
+        amps = np.maximum.reduceat(peaks, i0)
+        amps[-1] = float(peaks[int(i0[-1]):int(i1[-1])].max())
+        small = (i1 - i0) <= 1
+        if np.any(small):
+            amps[small] = peaks[i0[small]]
+        bars = amps * half_h
+        lines = [
+            QLineF(px, y0, px, y1)
+            for px, y0, y1 in zip(px_arr.tolist(), (mid_y - bars).tolist(), (mid_y + bars).tolist())
+        ]
+        painter.setPen(QPen(color, 1))
+        painter.drawLines(lines)
+
     def _rebuild_bg_cache(self, w: int, h: int) -> QPixmap:
         pm = QPixmap(w, h)
         pm.fill(QColor(18, 20, 26))
@@ -83,32 +110,9 @@ class SongMinimapWidget(QWidget):
         painter.setPen(QColor(50, 56, 68))
         painter.drawRect(0, 0, w - 1, h - 1)
 
-        # Faint full-song waveform (vectorized)
-        wf = self.audio.active_waveform
-        if wf is not None and len(wf.peaks) > 0 and w > 0:
-            peaks = wf.peaks
-            n = len(peaks)
-            mid_y = h * 0.62
-            half_h = h * 0.32
-            total_cs = self.total_cs
-            scale_b = wf.buckets_per_sec / 100.0
-            px_arr = np.arange(0, w, 2, dtype=np.float64)
-            cs0 = (px_arr / max(1, w)) * total_cs
-            cs1 = ((px_arr + 2.0) / max(1, w)) * total_cs
-            i0 = np.clip((cs0 * scale_b).astype(np.int64), 0, n - 1)
-            i1 = np.clip((cs1 * scale_b).astype(np.int64) + 1, i0 + 1, n)
-            amps = np.maximum.reduceat(peaks, i0)
-            amps[-1] = float(peaks[int(i0[-1]):int(i1[-1])].max())
-            small = (i1 - i0) <= 1
-            if np.any(small):
-                amps[small] = peaks[i0[small]]
-            bars = amps * half_h
-            lines = [
-                QLineF(px, y0, px, y1)
-                for px, y0, y1 in zip(px_arr.tolist(), (mid_y - bars).tolist(), (mid_y + bars).tolist())
-            ]
-            painter.setPen(QPen(QColor(72, 108, 155, 130), 1))
-            painter.drawLines(lines)
+        # Full-song main waveform (blue) + vocal stem overlay (bright teal) so vocal entrances stand out immediately
+        self._draw_wave_layer(painter, self.audio.main_waveform, w, h, QColor(72, 108, 155, 130))
+        self._draw_wave_layer(painter, self.audio.vocal_waveform, w, h, QColor(65, 225, 200, 200))
 
         # Page blocks (P1 .. PN)
         if self.project:
@@ -150,7 +154,14 @@ class SongMinimapWidget(QWidget):
         if w <= 0 or h <= 0:
             return
 
-        cache_key = (w, h, id(self.audio.active_waveform), self.selected_page, self._cache_rev)
+        cache_key = (
+            w,
+            h,
+            id(self.audio.main_waveform),
+            id(self.audio.vocal_waveform),
+            self.selected_page,
+            self._cache_rev,
+        )
         if self._bg_cache is None or self._bg_cache_key != cache_key:
             self._bg_cache = self._rebuild_bg_cache(w, h)
             self._bg_cache_key = cache_key

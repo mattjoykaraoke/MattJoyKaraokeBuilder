@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import uuid
+import zipfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -216,6 +221,27 @@ class TapSyncDraft:
     latency_enabled: bool = True
     latency_cs: int = 4
     pre_roll_cs: int = 150
+    draft_id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
+    updated_at: str = ""
+
+    @property
+    def display_name(self) -> str:
+        if self.artist and self.title:
+            return f"{self.artist} - {self.title}"
+        if self.title:
+            return self.title
+        if self.artist:
+            return self.artist
+        for p in self.pages:
+            for ln in p.lines:
+                txt = ln.full_text.strip()
+                if txt:
+                    return txt[:48]
+        return "Untitled Draft"
+
+    def default_archive_filename(self) -> str:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", self.display_name).strip("_")[:48] or "draft"
+        return f"{slug}_{self.draft_id}.kbsync.json"
 
     def flat_lines(self) -> List[Tuple[int, int, TapLine]]:
         out: List[Tuple[int, int, TapLine]] = []
@@ -304,7 +330,7 @@ class TapSyncDraft:
             draft = cls.from_lyrics_text("\n".join(body_lines))
             draft.title = header.title
             draft.artist = header.artist
-            draft.audio_path = header.audio_path
+            draft.audio_path = cls._resolve_audio_path(header.audio_path, p.parent)
             draft.raw_header_lines = list(header_lines)
             return draft
 
@@ -323,13 +349,34 @@ class TapSyncDraft:
             pages=pages,
             title=proj.header.title,
             artist=proj.header.artist,
-            audio_path=proj.header.audio_path,
+            audio_path=cls._resolve_audio_path(proj.header.audio_path, p.parent),
             raw_header_lines=list(proj.header.raw_lines),
         )
+
+    @staticmethod
+    def _resolve_audio_path(raw_audio: str, kbp_dir: Path) -> str:
+        """Resolve an audio path from a KBP header (supports absolute, relative, and moved-sibling paths)."""
+        cleaned = raw_audio.strip().strip('"')
+        if not cleaned:
+            return ""
+        cand = Path(cleaned)
+        if cand.exists() and cand.is_file():
+            return str(cand)
+        if not cand.is_absolute():
+            rel = (kbp_dir / cand).resolve()
+            if rel.exists() and rel.is_file():
+                return str(rel)
+        # Sibling fallback if the folder was moved/renamed alongside the .kbp
+        sibling = kbp_dir / cand.name
+        if sibling.exists() and sibling.is_file():
+            return str(sibling)
+        return cleaned
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "version": 1,
+            "draft_id": self.draft_id,
+            "updated_at": self.updated_at or datetime.now().isoformat(timespec="seconds"),
             "title": self.title,
             "artist": self.artist,
             "audio_path": self.audio_path,
@@ -356,9 +403,12 @@ class TapSyncDraft:
             latency_enabled=bool(data.get("latency_enabled", True)),
             latency_cs=int(data.get("latency_cs", 4)),
             pre_roll_cs=int(data.get("pre_roll_cs", 150)),
+            draft_id=str(data.get("draft_id") or uuid.uuid4().hex[:10]),
+            updated_at=str(data.get("updated_at", "")),
         )
 
     def save_json(self, path: str | Path) -> Path:
+        self.updated_at = datetime.now().isoformat(timespec="seconds")
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -368,6 +418,61 @@ class TapSyncDraft:
     def load_json(cls, path: str | Path) -> "TapSyncDraft":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls.from_dict(data)
+
+    def export_bundle_zip(self, zip_path: str | Path, include_audio: bool = True) -> Path:
+        """
+        Package this draft (plus optional main audio & vocal stem) into a portable .zip
+        bundle so a project can be transferred cleanly between people/machines.
+        """
+        target = Path(zip_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.to_dict()
+        payload["bundle_audio_rel"] = ""
+        payload["bundle_vocal_rel"] = ""
+
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            if include_audio and self.audio_path and Path(self.audio_path).is_file():
+                ap = Path(self.audio_path)
+                rel = f"audio/{ap.name}"
+                zf.write(ap, rel)
+                payload["bundle_audio_rel"] = rel
+            if include_audio and self.vocal_path and Path(self.vocal_path).is_file():
+                vp = Path(self.vocal_path)
+                rel_v = f"vocal/{vp.name}"
+                zf.write(vp, rel_v)
+                payload["bundle_vocal_rel"] = rel_v
+            zf.writestr("project.kbsync.json", json.dumps(payload, indent=2, ensure_ascii=False))
+        return target
+
+    @classmethod
+    def import_bundle_zip(cls, zip_path: str | Path, extract_dir: str | Path) -> Tuple["TapSyncDraft", Path]:
+        """
+        Extract a portable .zip project bundle into `extract_dir`, re-link any bundled
+        main/vocal audio paths to the extracted files, and return (draft, saved_json_path).
+        """
+        dest = Path(extract_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            # Safe extraction (guard against zip-slip)
+            for member in zf.infolist():
+                resolved = (dest / member.filename).resolve()
+                if not str(resolved).startswith(str(dest.resolve())):
+                    continue
+                zf.extract(member, dest)
+
+        json_path = dest / "project.kbsync.json"
+        if not json_path.exists():
+            raise ValueError("Bundle does not contain project.kbsync.json")
+        raw = json.loads(json_path.read_text(encoding="utf-8"))
+        draft = cls.from_dict(raw)
+        rel_a = str(raw.get("bundle_audio_rel", ""))
+        rel_v = str(raw.get("bundle_vocal_rel", ""))
+        if rel_a and (dest / rel_a).is_file():
+            draft.audio_path = str((dest / rel_a).resolve())
+        if rel_v and (dest / rel_v).is_file():
+            draft.vocal_path = str((dest / rel_v).resolve())
+        draft.save_json(json_path)
+        return draft, json_path
 
     @staticmethod
     def _extract_header_from_kbp(path: str | Path) -> Optional[List[str]]:
@@ -459,3 +564,27 @@ class TapSyncDraft:
         proj = KbpProject(header=header, pages=built_pages)
         proj.optimize_windows()
         return proj
+
+
+def default_drafts_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(base) / "AdvancedKBPEditor" / "drafts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def list_archived_drafts(drafts_dir: Optional[Path] = None) -> List[Tuple[Path, TapSyncDraft]]:
+    """Return all archived .kbsync.json drafts sorted newest-first."""
+    folder = drafts_dir or default_drafts_dir()
+    if not folder.exists():
+        return []
+    entries: List[Tuple[float, Path, TapSyncDraft]] = []
+    for p in folder.glob("*.kbsync.json"):
+        try:
+            d = TapSyncDraft.load_json(p)
+            mtime = p.stat().st_mtime
+            entries.append((mtime, p, d))
+        except Exception:
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return [(p, d) for _, p, d in entries]
