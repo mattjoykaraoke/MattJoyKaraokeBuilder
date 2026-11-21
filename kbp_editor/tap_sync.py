@@ -242,7 +242,7 @@ class TapSyncDraft:
 
     def default_archive_filename(self) -> str:
         slug = re.sub(r"[^A-Za-z0-9._-]+", "_", self.display_name).strip("_")[:48] or "draft"
-        return f"{slug}_{self.draft_id}.kbsync.json"
+        return f"{slug}_{self.draft_id}.mjkp"
 
     def flat_lines(self) -> List[Tuple[int, int, TapLine]]:
         out: List[Tuple[int, int, TapLine]] = []
@@ -461,14 +461,14 @@ class TapSyncDraft:
                 rel_v = f"vocal/{vp.name}"
                 zf.write(vp, rel_v)
                 payload["bundle_vocal_rel"] = rel_v
-            zf.writestr("project.kbsync.json", json.dumps(payload, indent=2, ensure_ascii=False))
+            zf.writestr("project.mjkp", json.dumps(payload, indent=2, ensure_ascii=False))
         return target
 
     @classmethod
     def import_bundle_zip(cls, zip_path: str | Path, extract_dir: str | Path) -> Tuple["TapSyncDraft", Path]:
         """
         Extract a portable .zip project bundle into `extract_dir`, re-link any bundled
-        main/vocal audio paths to the extracted files, and return (draft, saved_json_path).
+        main/vocal audio paths to the extracted files, and return (draft, saved_sync_path).
         """
         dest = Path(extract_dir)
         dest.mkdir(parents=True, exist_ok=True)
@@ -480,10 +480,10 @@ class TapSyncDraft:
                     continue
                 zf.extract(member, dest)
 
-        json_path = dest / "project.kbsync.json"
-        if not json_path.exists():
-            raise ValueError("Bundle does not contain project.kbsync.json")
-        raw = json.loads(json_path.read_text(encoding="utf-8"))
+        sync_path = dest / "project.mjkp"
+        if not sync_path.exists():
+            raise ValueError("Bundle does not contain project.mjkp")
+        raw = json.loads(sync_path.read_text(encoding="utf-8"))
         draft = cls.from_dict(raw)
         rel_a = str(raw.get("bundle_audio_rel", ""))
         rel_v = str(raw.get("bundle_vocal_rel", ""))
@@ -491,8 +491,8 @@ class TapSyncDraft:
             draft.audio_path = str((dest / rel_a).resolve())
         if rel_v and (dest / rel_v).is_file():
             draft.vocal_path = str((dest / rel_v).resolve())
-        draft.save_json(json_path)
-        return draft, json_path
+        draft.save_json(sync_path)
+        return draft, sync_path
 
     @staticmethod
     def _extract_header_from_kbp(path: str | Path) -> Optional[List[str]]:
@@ -609,7 +609,7 @@ def default_saved_projects_registry() -> Path:
 
 
 def register_saved_project(path: str | Path, registry_path: Optional[Path] = None) -> None:
-    """Record an explicitly saved .kbp or .kbsync.json project in the Saved Projects registry."""
+    """Record an explicitly saved .kbp or .mjkp project in the Saved Projects registry."""
     reg = registry_path or default_saved_projects_registry()
     try:
         norm = str(Path(path).resolve())
@@ -657,7 +657,7 @@ def unregister_saved_projects(paths: List[str | Path], registry_path: Optional[P
 
 
 def list_saved_projects(registry_path: Optional[Path] = None) -> List[Path]:
-    """Return existing explicitly saved project paths (.kbp and .kbsync.json), newest-first."""
+    """Return existing explicitly saved project paths (.kbp and .mjkp), newest-first."""
     reg = registry_path or default_saved_projects_registry()
     if not reg.exists():
         return []
@@ -680,12 +680,12 @@ def list_saved_projects(registry_path: Optional[Path] = None) -> List[Path]:
 
 
 def list_archived_drafts(drafts_dir: Optional[Path] = None) -> List[Tuple[Path, TapSyncDraft]]:
-    """Return all .kbsync.json drafts in a folder sorted newest-first."""
+    """Return all .mjkp drafts in a folder sorted newest-first."""
     folder = drafts_dir or default_autosaves_dir()
     if not folder.exists():
         return []
     entries: List[Tuple[float, Path, TapSyncDraft]] = []
-    for p in folder.glob("*.kbsync.json"):
+    for p in folder.glob("*.mjkp"):
         try:
             d = TapSyncDraft.load_json(p)
             mtime = p.stat().st_mtime
@@ -711,7 +711,7 @@ def list_autosave_drafts(
     for folder in folders:
         if not folder.exists():
             continue
-        for p in folder.glob("*.kbsync.json"):
+        for p in folder.glob("*.mjkp"):
             key = str(p.resolve()).lower()
             if key in seen:
                 continue

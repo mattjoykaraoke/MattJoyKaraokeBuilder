@@ -4,7 +4,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QProcess, QSettings, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -130,8 +131,13 @@ class MainWindow(QMainWindow):
 
         if initial_file:
             p_init = Path(initial_file)
-            if p_init.suffix.lower() == ".json":
+            suf = p_init.suffix.lower()
+            if suf == ".mjkp":
                 if self.tap_sync_view.load_draft_file(p_init):
+                    self._tabs.setCurrentWidget(self.tap_sync_view)
+                    self._refresh_actions()
+            elif suf == ".txt":
+                if self.tap_sync_view.load_lyrics_txt(p_init):
                     self._tabs.setCurrentWidget(self.tap_sync_view)
                     self._refresh_actions()
             else:
@@ -248,74 +254,113 @@ class MainWindow(QMainWindow):
             self.minimap.set_viewport(self.wiping_view.canvas.scroll_x_cs, self.wiping_view.canvas.view_span_cs())
 
     def _build_transport_bar(self) -> QWidget:
-        bar = QWidget(self)
-        bar.setStyleSheet("background-color: #1f232a; border-top: 1px solid #353b47;")
+        bar = QFrame(self)
+        bar.setObjectName("transportRibbon")
+        bar.setStyleSheet(
+            "QFrame#transportRibbon { background-color: #20242c; border-top: 1px solid #323846; }"
+            "QPushButton { padding: 2px 8px; font-size: 11px; }"
+            "QCheckBox, QLabel { font-size: 11px; color: #cbd5e1; }"
+        )
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(10)
 
-        self._play_btn = QPushButton("▶ Play")
+        def _div() -> QFrame:
+            f = QFrame(bar)
+            f.setFrameShape(QFrame.Shape.VLine)
+            f.setFrameShadow(QFrame.Shadow.Plain)
+            f.setStyleSheet("color: #3a4150;")
+            return f
+
+        def _make_section(title: str) -> Tuple[QVBoxLayout, QHBoxLayout]:
+            sec = QVBoxLayout()
+            sec.setContentsMargins(0, 0, 0, 0)
+            sec.setSpacing(3)
+            lbl = QLabel(title, bar)
+            lbl.setStyleSheet("color: #cbd5e1; font-size: 11px; font-weight: bold;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            sec.addWidget(lbl)
+            sec.addLayout(row)
+            return sec, row
+
+        # Section 1: Playback
+        sec_play, play_row = _make_section("Playback")
+        self._play_btn = QPushButton("▶ Play", bar)
         self._play_btn.setFixedWidth(90)
         self._play_btn.clicked.connect(self.audio.toggle_play)
-        layout.addWidget(self._play_btn)
+        play_row.addWidget(self._play_btn)
 
-        self._play_line_btn = QPushButton("Play Line")
+        self._play_line_btn = QPushButton("Play Line", bar)
         self._play_line_btn.clicked.connect(self._play_selected_line)
-        layout.addWidget(self._play_line_btn)
+        play_row.addWidget(self._play_line_btn)
 
-        self._play_word_btn = QPushButton("Play Word")
+        self._play_word_btn = QPushButton("Play Word", bar)
         self._play_word_btn.setToolTip("Play the selected word/syllable and stop right at its end")
         self._play_word_btn.clicked.connect(self._play_selected_word)
-        layout.addWidget(self._play_word_btn)
+        play_row.addWidget(self._play_word_btn)
 
-        layout.addWidget(QLabel("Speed:"))
-        self._speed_combo = QComboBox()
+        play_row.addWidget(QLabel("Speed:", bar))
+        self._speed_combo = QComboBox(bar)
         self._speed_combo.addItems(["50%", "75%", "100%"])
         self._speed_combo.setCurrentText("100%")
         self._speed_combo.currentTextChanged.connect(self._on_speed_changed)
-        layout.addWidget(self._speed_combo)
+        play_row.addWidget(self._speed_combo)
 
-        self._audio_src_combo = QComboBox()
+        layout.addLayout(sec_play)
+        layout.addWidget(_div())
+
+        # Section 2: Audio
+        sec_aud, aud_row = _make_section("Audio")
+        self._audio_src_combo = QComboBox(bar)
         self._audio_src_combo.addItems(["Main Audio", "Vocal Stem"])
         self._audio_src_combo.currentIndexChanged.connect(lambda idx: self.audio.set_use_vocal_audio(idx == 1))
-        layout.addWidget(self._audio_src_combo)
+        aud_row.addWidget(self._audio_src_combo)
 
-        self._load_main_btn = QPushButton("Load Main Audio…")
+        self._load_main_btn = QPushButton("Load Main Audio…", bar)
         self._load_main_btn.setToolTip("Load or replace the project's main audio track")
         self._load_main_btn.clicked.connect(self._open_main_audio_dialog)
-        layout.addWidget(self._load_main_btn)
+        aud_row.addWidget(self._load_main_btn)
 
-        self._load_vocal_btn = QPushButton("Load Vocal Stem…")
+        self._load_vocal_btn = QPushButton("Load Vocal Stem…", bar)
         self._load_vocal_btn.setToolTip("Load an isolated vocal stem for visual/audio alignment")
         self._load_vocal_btn.clicked.connect(self._open_vocal_stem_dialog)
-        layout.addWidget(self._load_vocal_btn)
+        aud_row.addWidget(self._load_vocal_btn)
 
-        self._scrub_audio_cb = QCheckBox("Scrub Audio")
+        self._scrub_audio_cb = QCheckBox("Scrub Audio", bar)
         self._scrub_audio_cb.setChecked(False)
         self._scrub_audio_cb.setToolTip("Hear short audio snippets while dragging the playhead")
         self._scrub_audio_cb.toggled.connect(self._on_scrub_audio_toggled)
-        layout.addWidget(self._scrub_audio_cb)
+        aud_row.addWidget(self._scrub_audio_cb)
 
-        layout.addSpacing(12)
-        btn_zin = QPushButton("Zoom +")
+        layout.addLayout(sec_aud)
+        layout.addWidget(_div())
+
+        # Section 3: Preview
+        sec_prev, prev_row = _make_section("Preview")
+        btn_zin = QPushButton("Zoom +", bar)
         btn_zin.clicked.connect(lambda: self._zoom_active(1.25))
-        layout.addWidget(btn_zin)
-        btn_zout = QPushButton("Zoom −")
+        prev_row.addWidget(btn_zin)
+        btn_zout = QPushButton("Zoom −", bar)
         btn_zout.clicked.connect(lambda: self._zoom_active(0.8))
-        layout.addWidget(btn_zout)
-        btn_zreset = QPushButton("100%")
+        prev_row.addWidget(btn_zout)
+        btn_zreset = QPushButton("100%", bar)
         btn_zreset.setToolTip("Reset Zoom to 100% (Ctrl+0)")
         btn_zreset.clicked.connect(self._reset_zoom_active)
-        layout.addWidget(btn_zreset)
+        prev_row.addWidget(btn_zreset)
 
-        self._preview_btn = QPushButton("16:9 Preview")
+        self._preview_btn = QPushButton("16:9 Preview", bar)
         self._preview_btn.setCheckable(True)
         self._preview_btn.setChecked(True)
         self._preview_btn.toggled.connect(self._set_preview_visible)
-        layout.addWidget(self._preview_btn)
+        prev_row.addWidget(self._preview_btn)
+
+        layout.addLayout(sec_prev)
 
         layout.addStretch()
-        self._time_lbl = QLabel("00:00.00 (0 cs)")
+        self._time_lbl = QLabel("00:00.00 (0 cs)", bar)
         self._time_lbl.setStyleSheet("font-family: Consolas; font-size: 13px; color: #e2e8f0;")
         layout.addWidget(self._time_lbl)
         return bar
@@ -751,9 +796,15 @@ class MainWindow(QMainWindow):
             if self._launch_new_window(p):
                 self.statusBar().showMessage(f"Opened {p.name} in a new window", 4000)
             return
-        if p.suffix.lower() == ".json":
+        suf = p.suffix.lower()
+        if suf == ".mjkp":
             if self.tap_sync_view.load_draft_file(p):
                 self._tabs.setCurrentWidget(self.tap_sync_view)
+                self._refresh_actions()
+        elif suf == ".txt":
+            if self.tap_sync_view.load_lyrics_txt(p):
+                self._tabs.setCurrentWidget(self.tap_sync_view)
+                self._refresh_actions()
         else:
             self.open_kbp(p)
 
@@ -791,9 +842,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 4500)
 
     def _open_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open KBP Project", "", "Karaoke Builder Projects (*.kbp);;All Files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Project",
+            "",
+            "Karaoke Projects (*.kbp *.mjkp);;Karaoke Builder Projects (*.kbp);;Matt Joy Karaoke Projects (*.mjkp);;All Files (*.*)",
+        )
         if path:
-            self.open_kbp(path)
+            self._open_project_path(path)
 
     def _default_audio_dir(self) -> str:
         if self.audio.main_path and self.audio.main_path.parent.exists():
@@ -929,6 +985,7 @@ class MainWindow(QMainWindow):
                     if saved_v:
                         self.audio.load_vocal_stem(saved_v)
                     self._tabs.setCurrentWidget(self.tap_sync_view)
+                    self._refresh_actions()
                 return
             QMessageBox.critical(self, "Open Failed", f"Could not load KBP file:\n{exc}")
             return
@@ -1178,10 +1235,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Redid action", 2500)
 
     def save_kbp(self) -> bool:
-        if not self.project:
+        if self.project is None:
+            if self.tap_sync_view.draft.pages:
+                ok = self.tap_sync_view.save_draft()
+                self._refresh_actions()
+                return ok
             return False
         if self.project.source_path is None:
             return self.save_kbp_as()
+        self.project.header.ensure_default_comments()
         self.project.save()
         register_saved_project(self.project.source_path)
         if self.audio.vocal_path:
@@ -1193,11 +1255,22 @@ class MainWindow(QMainWindow):
         return True
 
     def save_kbp_as(self) -> bool:
-        if not self.project:
+        if self.project is None:
+            if self.tap_sync_view.draft.pages:
+                ok = self.tap_sync_view.save_draft_as()
+                self._refresh_actions()
+                return ok
             return False
-        default_dir = str(self.project.source_path.parent) if self.project.source_path else ""
-        path, _ = QFileDialog.getSaveFileName(self, "Save KBP Project As", default_dir, "Karaoke Builder Projects (*.kbp)")
+        suggested_name = self._suggest_kbp_filename(self.project, self.audio.main_path)
+        if self.project.source_path is not None:
+            default_target = str(self.project.source_path.parent / suggested_name)
+        elif self.audio.main_path is not None:
+            default_target = str(self.audio.main_path.parent / suggested_name)
+        else:
+            default_target = suggested_name
+        path, _ = QFileDialog.getSaveFileName(self, "Save KBP Project As", default_target, "Karaoke Builder Projects (*.kbp)")
         if path:
+            self.project.header.ensure_default_comments()
             self.project.save(path)
             register_saved_project(path)
             if self.audio.vocal_path:
@@ -1227,9 +1300,9 @@ class MainWindow(QMainWindow):
             self._on_project_mutated(f"Shift Page {p_idx + 1} ({delta:+d} cs)")
 
     def _refresh_actions(self) -> None:
-        has_proj = self.project is not None
-        self._act_save.setEnabled(has_proj)
-        self._act_save_as.setEnabled(has_proj)
+        can_save = self.project is not None or bool(self.tap_sync_view.draft.pages)
+        self._act_save.setEnabled(can_save)
+        self._act_save_as.setEnabled(can_save)
 
         self._act_undo.setEnabled(self.history.can_undo)
         self._act_undo.setText(f"&Undo: {self.history.undo_label}" if self.history.can_undo else "&Undo")
@@ -1249,24 +1322,24 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(title)
 
     @staticmethod
-    def _extract_kbp_drop(mime_data) -> Optional[str]:
+    def _extract_project_drop(mime_data) -> Optional[str]:
         if mime_data and mime_data.hasUrls():
             for url in mime_data.urls():
                 local = url.toLocalFile()
-                if local and local.lower().endswith(".kbp"):
+                if local and local.lower().endswith((".kbp", ".mjkp", ".txt")):
                     return local
         return None
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self._extract_kbp_drop(event.mimeData()):
+        if self._extract_project_drop(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        kbp_path = self._extract_kbp_drop(event.mimeData())
-        if kbp_path:
-            self.open_kbp(kbp_path)
+        dropped_path = self._extract_project_drop(event.mimeData())
+        if dropped_path:
+            self._open_project_path(dropped_path)
             event.acceptProposedAction()
         else:
             event.ignore()

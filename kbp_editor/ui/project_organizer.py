@@ -44,7 +44,7 @@ def _fmt_mtime(path: Path) -> str:
 class ProjectOrganizerDialog(QDialog):
     """
     Unified Project Organizer with two clear tabs:
-    - Saved Projects: explicitly saved .kbp files, saved .kbsync.json drafts, and imported .zip bundles
+    - Saved Projects: explicitly saved .kbp files, saved .mjkp projects, and imported .zip bundles
     - Autosaves: background Tap Sync recovery autosaves
     Supports Ctrl+Click / Shift+Click multi-select, portable .zip bundle export/import,
     and optional confirmation bypass ("Do not remind me again").
@@ -187,7 +187,7 @@ class ProjectOrganizerDialog(QDialog):
     def _inspect_saved_path(self, path: Path) -> Tuple[Path, str, str, str, str, str]:
         suffix = path.suffix.lower()
         saved_txt = _fmt_mtime(path)
-        if suffix == ".json":
+        if suffix == ".mjkp":
             try:
                 draft = TapSyncDraft.load_json(path)
                 synced = draft.synced_syllables()
@@ -304,7 +304,7 @@ class ProjectOrganizerDialog(QDialog):
         if path is None:
             return
         try:
-            if path.suffix.lower() == ".json":
+            if path.suffix.lower() == ".mjkp":
                 draft = TapSyncDraft.load_json(path)
             else:
                 draft = TapSyncDraft.from_kbp_file(path)

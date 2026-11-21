@@ -89,8 +89,8 @@ def test_draft_json_roundtrip_and_build_kbp_with_template(tmp_path):
     assert draft.pages[0].lines[0].sync_state == "full"
     assert draft.pages[1].lines[0].sync_state == "none"
 
-    # Save & reload JSON draft
-    jpath = tmp_path / "draft.kbsync.json"
+    # Save & reload .mjkp draft
+    jpath = tmp_path / "draft.mjkp"
     draft.save_json(jpath)
     loaded = TapSyncDraft.load_json(jpath)
     assert loaded.audio_path == r"C:\songs\main.flac"
@@ -295,7 +295,6 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
         assert win.tap_sync_view._btn_retap.isEnabled() is True
         assert win.tap_sync_view._build_btn.isEnabled() is True
         assert win.tap_sync_view._btn_load_lyr.isEnabled() is False
-        assert win.tap_sync_view._btn_load_draft.isEnabled() is False
         assert win.tap_sync_view._resume_btn.isEnabled() is True
 
         # Saving re-locks Tap Sync
@@ -461,4 +460,209 @@ def test_project_organizer_multi_delete_and_skip_confirm(tmp_path, monkeypatch):
         dlg._settings.setValue("confirm_delete_draft", orig_confirm)
         dlg._settings.sync()
         dlg.close()
+        app.processEvents()
+
+
+def test_default_kbp_comments_exact_format_and_preserve(tmp_path):
+    # 1) Freshly built KBP from TapSyncDraft gets the exact 10-column KBS Comments block
+    draft = TapSyncDraft.from_lyrics_text("Hel/lo world")
+    draft.pages[0].lines[0].syllables[0].start_cs = 100
+    draft.pages[0].lines[0].syllables[0].end_cs = 150
+    proj = draft.build_kbp_project()
+    raw_bytes = proj.to_bytes()
+    assert b"Comments  Hacked by Matt Joy\r\n          github.com/mattjoykaraoke\r\n\r\n-----------------------------\r\nPAGEV2\r\n" in raw_bytes
+    assert proj.header.comments == ["Hacked by Matt Joy", "github.com/mattjoykaraoke"]
+
+    # 2) Unsynced KBP with blank Comments field also gets the default comments on build
+    unsynced = _write_unsynced_kbp(tmp_path / "blank_comments.kbp")
+    draft2 = TapSyncDraft.from_kbp_file(unsynced)
+    proj2 = draft2.build_kbp_project()
+    assert b"Comments  Hacked by Matt Joy\r\n          github.com/mattjoykaraoke\r\n" in proj2.to_bytes()
+
+    # 3) Existing custom multi-line comments are parsed and preserved verbatim
+    proj.header.set_comments(["Custom Line 1", "Custom Line 2", "Tag: v1"])
+    out = tmp_path / "custom_comments.kbp"
+    proj.save(out)
+    reloaded = KbpProject.load(out)
+    assert reloaded.header.comments == ["Custom Line 1", "Custom Line 2", "Tag: v1"]
+    reloaded.header.ensure_default_comments()
+    assert reloaded.header.comments == ["Custom Line 1", "Custom Line 2", "Tag: v1"]
+    assert b"Comments  Custom Line 1\r\n          Custom Line 2\r\n          Tag: v1\r\n" in reloaded.to_bytes()
+
+
+def test_unified_save_works_for_unsynced_tap_sync_project(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QFileDialog
+    from kbp_editor.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    unsynced_path = _write_unsynced_kbp(tmp_path / "partial.kbp")
+    saved_draft = tmp_path / "partial.mjkp"
+
+    win = MainWindow()
+    try:
+        assert win._act_save.isEnabled() is False
+        assert win._act_save_as.isEnabled() is False
+
+        win.open_kbp(unsynced_path)
+        assert win.project is None
+        assert bool(win.tap_sync_view.draft.pages) is True
+        assert win._act_save.isEnabled() is True
+        assert win._act_save_as.isEnabled() is True
+
+        captured_default = []
+
+        def _fake_save(parent, caption, directory, filter_str):
+            captured_default.append(directory)
+            return (str(saved_draft), "")
+
+        monkeypatch.setattr(QFileDialog, "getSaveFileName", _fake_save)
+        assert win.save_kbp() is True
+        assert captured_default == ["Unsynced Band - Unsynced Song.mjkp"]
+        assert saved_draft.exists()
+        assert win.tap_sync_view.is_dirty is False
+    finally:
+        win.close()
+        app.processEvents()
+
+
+def test_teleprompter_wheel_scrolls_lines_and_resets_on_start_sync():
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QApplication
+    from kbp_editor.audio import AudioEngine
+    from kbp_editor.ui.tap_sync_view import TapSyncView
+
+    app = QApplication.instance() or QApplication([])
+    view = TapSyncView(AudioEngine())
+    try:
+        draft = TapSyncDraft.from_lyrics_text(
+            "Line one syl/la/bles\nLine two here\n\nLine three page two\nLine four end"
+        )
+        view._apply_draft(draft, load_audio=False)
+        tp = view._teleprompter
+        assert tp.preview_flat_idx is None
+        assert view._cursor == (0, 0, 0)
+
+        def _wheel(dy: int) -> None:
+            ev = QWheelEvent(
+                QPointF(100.0, 100.0),
+                QPointF(100.0, 100.0),
+                QPoint(0, 0),
+                QPoint(0, dy),
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+                Qt.ScrollPhase.NoScrollPhase,
+                False,
+            )
+            tp.wheelEvent(ev)
+
+        # Scroll down 3 notches -> line indices 1, 2, 3 (clamped at 3)
+        _wheel(-120)
+        assert tp.preview_flat_idx == 1
+        _wheel(-120)
+        assert tp.preview_flat_idx == 2
+        _wheel(-120)
+        assert tp.preview_flat_idx == 3
+        _wheel(-120)
+        assert tp.preview_flat_idx == 3
+
+        # Scroll back up 1 notch -> index 2
+        _wheel(120)
+        assert tp.preview_flat_idx == 2
+        # Cursor itself was never displaced
+        assert view._cursor == (0, 0, 0)
+
+        # Starting sync resets preview scroll back to the beginning/cursor
+        view.start_syncing()
+        assert tp.preview_flat_idx is None
+        assert view._cursor == (0, 0, 0)
+        view.stop_syncing()
+    finally:
+        view.close()
+        app.processEvents()
+
+
+def test_drag_and_drop_mjkp_loads_project_and_updates_organizer(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+    from PySide6.QtWidgets import QApplication
+    from kbp_editor.tap_sync import list_saved_projects
+    from kbp_editor.ui import tap_sync_view as tsv_mod
+    from kbp_editor.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+
+    reg_path = tmp_path / "saved_projects.json"
+    monkeypatch.setattr(
+        tsv_mod,
+        "register_saved_project",
+        lambda p, registry_path=None: __import__("kbp_editor.tap_sync", fromlist=["register_saved_project"]).register_saved_project(p, registry_path=reg_path),
+    )
+
+    draft = TapSyncDraft.from_lyrics_text("Drop/ped lyr/ics")
+    draft.artist = "Drop Band"
+    draft.title = "Drop Song"
+    mjkp_path = tmp_path / "Drop Band - Drop Song.mjkp"
+    draft.save_json(mjkp_path)
+
+    win = MainWindow()
+    try:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(mjkp_path))])
+
+        enter_ev = QDragEnterEvent(
+            QPointF(10, 10).toPoint(),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        win.dragEnterEvent(enter_ev)
+        assert enter_ev.isAccepted() is True
+
+        drop_ev = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        win.dropEvent(drop_ev)
+        assert drop_ev.isAccepted() is True
+        assert win.tap_sync_view.draft.artist == "Drop Band"
+        assert win.tap_sync_view.draft.title == "Drop Song"
+        assert win._tabs.currentWidget() is win.tap_sync_view
+        assert [p.resolve() for p in list_saved_projects(reg_path)] == [mjkp_path.resolve()]
+    finally:
+        win.close()
+        app.processEvents()
+
+    # Also silently accepts .txt drag-and-drop into a fresh window
+    txt_path = tmp_path / "Txt Artist - Txt Song.txt"
+    txt_path.write_text("Hel/lo world\n\nSec/ond page", encoding="utf-8")
+    win2 = MainWindow()
+    try:
+        mime2 = QMimeData()
+        mime2.setUrls([QUrl.fromLocalFile(str(txt_path))])
+        drop_ev2 = QDropEvent(
+            QPointF(10, 10),
+            Qt.DropAction.CopyAction,
+            mime2,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        win2.dropEvent(drop_ev2)
+        assert drop_ev2.isAccepted() is True
+        assert win2.tap_sync_view.draft.artist == "Txt Artist"
+        assert win2.tap_sync_view.draft.title == "Txt Song"
+        assert win2.tap_sync_view.draft.total_syllables() == 6
+    finally:
+        win2.tap_sync_view.mark_clean()
+        win2.close()
         app.processEvents()

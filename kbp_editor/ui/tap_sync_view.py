@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QLineF, QRectF, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QSettings, QThread, Qt, QLineF, QRectF, QUrl, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QFontMetrics,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -30,38 +43,124 @@ from PySide6.QtWidgets import (
 )
 
 from ..audio import AudioEngine, WaveformData
+from ..local_lyric_splitter import find_local_lyric_splitter_exe, run_local_lyric_splitter
 from ..model import KbpProject
-from ..tap_sync import TapLine, TapSyllable, TapSyncDraft, default_autosaves_dir, register_saved_project
+from ..tap_sync import (
+    TapLine,
+    TapSyllable,
+    TapSyncDraft,
+    default_autosaves_dir,
+    default_drafts_dir,
+    register_saved_project,
+)
 from .project_organizer import ProjectOrganizerDialog
 
 
 def _autosave_path() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    return Path(base) / "AdvancedKBPEditor" / "tap_sync_autosave.json"
+    return Path(base) / "AdvancedKBPEditor" / "tap_sync_autosave.mjkp"
+
+
+class _LocalLyricSplitterWorker(QThread):
+    """Background worker that runs Local Lyric Splitter CLI without freezing the dialog."""
+
+    succeeded = Signal(str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        exe_path: Path,
+        artist: str,
+        song: str,
+        audio_path: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._exe_path = exe_path
+        self._artist = artist
+        self._song = song
+        self._audio_path = audio_path
+        self._process_holder: Dict[str, object] = {}
+        self._cancelled: bool = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        proc = self._process_holder.get("proc")
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        try:
+            lyrics = run_local_lyric_splitter(
+                self._exe_path,
+                self._artist,
+                self._song,
+                audio_path=self._audio_path,
+                process_holder=self._process_holder,
+            )
+            if not self._cancelled:
+                self.succeeded.emit(lyrics)
+        except Exception as exc:
+            if not self._cancelled:
+                self.failed.emit(str(exc))
 
 
 class _LyricsInputDialog(QDialog):
-    """Modal editor to paste or edit KBS / Local Lyric Splitter lyrics."""
+    """Modal editor to obtain (via Local Lyric Splitter) or enter/edit KBS lyrics."""
 
-    def __init__(self, draft: TapSyncDraft, parent: Optional[QWidget] = None) -> None:
+    _LLS_SETTINGS_KEY = "local_lyric_splitter_exe"
+    _LLS_DOWNLOAD_URL = "https://github.com/mattjoykaraoke/LocalLyricSplitter"
+
+    def __init__(
+        self,
+        draft: TapSyncDraft,
+        parent: Optional[QWidget] = None,
+        settings: Optional[QSettings] = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Paste / Edit Lyrics for Tap Sync")
-        self.resize(620, 520)
+        self.setWindowTitle("Obtain / Enter Lyrics for Tap Sync")
+        self.resize(640, 560)
+        self._draft = draft
+        self._settings = settings or QSettings("MattJoy", "AdvancedKBPEditor")
+        self._lls_worker: Optional[_LocalLyricSplitterWorker] = None
 
         layout = QVBoxLayout(self)
         hint = QLabel(
-            "Paste lyrics using <b>/</b> for syllable splits (e.g. <code>ev/ery/thing</code>, "
-            "<code>➣➣➣/The snow</code>) and <b>blank lines</b> for page breaks:"
+            "Enter an <b>Artist</b> and <b>Title</b> to fetch, clean, and split lyrics with "
+            "<b>Local Lyric Splitter</b>, or paste/edit lyrics below using <b>/</b> for syllable splits "
+            "(e.g. <code>ev/ery/thing</code>, <code>➣➣➣/The snow</code>) and <b>blank lines</b> for page breaks:"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         form = QFormLayout()
-        self._title_edit = QLineEdit(draft.title)
         self._artist_edit = QLineEdit(draft.artist)
-        form.addRow("Title:", self._title_edit)
+        self._artist_edit.setPlaceholderText("Artist name")
+        self._title_edit = QLineEdit(draft.title)
+        self._title_edit.setPlaceholderText("Song title")
         form.addRow("Artist:", self._artist_edit)
+        form.addRow("Title:", self._title_edit)
         layout.addLayout(form)
+
+        lls_row = QHBoxLayout()
+        self._lls_btn = QPushButton("Use Local Lyric Splitter", self)
+        self._lls_btn.setStyleSheet(
+            "background-color: #1d4ed8; color: white; font-weight: bold; padding: 5px 14px;"
+        )
+        self._lls_btn.setToolTip(
+            "Automatically fetch, clean, and syllable-split lyrics using Local Lyric Splitter CLI"
+        )
+        self._lls_btn.clicked.connect(self._run_local_lyric_splitter)
+        lls_row.addWidget(self._lls_btn)
+
+        self._lls_status = QLabel("", self)
+        self._lls_status.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self._lls_status.setWordWrap(True)
+        lls_row.addWidget(self._lls_status, 1)
+        layout.addLayout(lls_row)
 
         self._text_edit = QPlainTextEdit()
         self._text_edit.setPlaceholderText(
@@ -72,14 +171,146 @@ class _LyricsInputDialog(QDialog):
             "The stars in the sky il/lu/mi/nate be/low"
         )
         self._text_edit.setFont(QFont("Consolas", 11))
-        self._text_edit.setPlainText(draft.to_lyrics_text())
+        existing_lyrics = draft.to_lyrics_text()
+        self._text_edit.setPlainText(existing_lyrics)
         layout.addWidget(self._text_edit, 1)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        if existing_lyrics.strip():
+            self._text_edit.setFocus()
+        else:
+            self._artist_edit.setFocus()
+
+    def _prompt_missing_lls(self) -> str:
+        """
+        Inform the user Local Lyric Splitter wasn't found and return:
+        'locate', 'download', or 'cancel'.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Local Lyric Splitter Not Found")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            "Local Lyric Splitter was not found in the default install location.<br><br>"
+            "If you have it installed elsewhere, click <b>Locate .exe…</b> to select "
+            "<code>Local Lyric Splitter.exe</code>.<br><br>"
+            "Need to install it? Download it from GitHub:<br>"
+            f'<a href="{self._LLS_DOWNLOAD_URL}">{self._LLS_DOWNLOAD_URL}</a>'
+        )
+        locate_btn = box.addButton("Locate .exe…", QMessageBox.ButtonRole.AcceptRole)
+        download_btn = box.addButton("Open Download Page", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(locate_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is locate_btn:
+            return "locate"
+        if clicked is download_btn:
+            return "download"
+        return "cancel"
+
+    def _resolve_lls_exe(self) -> Optional[Path]:
+        saved = self._settings.value(self._LLS_SETTINGS_KEY, "", type=str)
+        found = find_local_lyric_splitter_exe(configured_path=saved)
+        if found is not None:
+            return found
+
+        action = self._prompt_missing_lls()
+        if action == "download":
+            QDesktopServices.openUrl(QUrl(self._LLS_DOWNLOAD_URL))
+            return None
+        if action != "locate":
+            return None
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Locate Local Lyric Splitter.exe",
+            r"C:\Program Files (x86)",
+            "Executable Files (*.exe);;All Files (*.*)",
+        )
+        if not path:
+            return None
+        chosen = Path(path)
+        if not chosen.is_file():
+            QMessageBox.warning(self, "Invalid File", f"File not found:\n{chosen}")
+            return None
+        self._settings.setValue(self._LLS_SETTINGS_KEY, str(chosen))
+        self._settings.sync()
+        return chosen
+
+    def _set_lls_busy(self, busy: bool, status_text: str = "", status_color: str = "#94a3b8") -> None:
+        self._lls_btn.setEnabled(not busy)
+        self._lls_btn.setText("Fetching && Splitting…" if busy else "Use Local Lyric Splitter")
+        self._title_edit.setEnabled(not busy)
+        self._artist_edit.setEnabled(not busy)
+        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setEnabled(not busy)
+        self._lls_status.setStyleSheet(f"color: {status_color}; font-size: 11px;")
+        self._lls_status.setText(status_text)
+
+    def _run_local_lyric_splitter(self) -> None:
+        artist = self.artist_text
+        title = self.title_text
+        if not artist or not title:
+            QMessageBox.warning(
+                self,
+                "Artist & Title Required",
+                "Please enter both Artist and Title before running Local Lyric Splitter.",
+            )
+            if not artist:
+                self._artist_edit.setFocus()
+            else:
+                self._title_edit.setFocus()
+            return
+
+        exe_path = self._resolve_lls_exe()
+        if exe_path is None:
+            return
+
+        self._set_lls_busy(True, "Running Local Lyric Splitter (fetching, cleaning & splitting)…", "#93c5fd")
+        self._lls_worker = _LocalLyricSplitterWorker(
+            exe_path=exe_path,
+            artist=artist,
+            song=title,
+            audio_path=self._draft.audio_path,
+            parent=self,
+        )
+        self._lls_worker.succeeded.connect(self._on_lls_succeeded)
+        self._lls_worker.failed.connect(self._on_lls_failed)
+        self._lls_worker.start()
+
+    def _on_lls_succeeded(self, lyrics: str) -> None:
+        self._text_edit.setPlainText(lyrics)
+        self._set_lls_busy(
+            False,
+            "Lyrics fetched, cleaned & split — review below and click OK.",
+            "#86efac",
+        )
         self._text_edit.setFocus()
+
+    def _on_lls_failed(self, error_msg: str) -> None:
+        self._set_lls_busy(False, "Local Lyric Splitter failed.", "#fca5a5")
+        QMessageBox.warning(self, "Local Lyric Splitter Failed", error_msg)
+
+    def _stop_lls_worker(self) -> None:
+        if self._lls_worker is not None and self._lls_worker.isRunning():
+            self._lls_worker.cancel()
+            self._lls_worker.wait(2000)
+
+    def reject(self) -> None:
+        self._stop_lls_worker()
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        self._stop_lls_worker()
+        super().closeEvent(event)
 
     @property
     def lyrics_text(self) -> str:
@@ -111,7 +342,39 @@ class _RollingTeleprompterWidget(QWidget):
         self.is_syncing: bool = False
         self.is_locked: bool = False
         self.punch_line: Optional[Tuple[int, int]] = None
+        self.preview_flat_idx: Optional[int] = None
         self.setMinimumHeight(220)
+
+    def reset_scroll(self) -> None:
+        if self.preview_flat_idx is not None:
+            self.preview_flat_idx = None
+            self.update()
+
+    def _cursor_flat_index(self, flat_lines: List[Tuple[int, int, TapLine]]) -> int:
+        focus_coord = self.cursor or self.open_coord
+        if focus_coord is not None:
+            for idx, (p_i, l_i, _) in enumerate(flat_lines):
+                if (p_i, l_i) == (focus_coord[0], focus_coord[1]):
+                    return idx
+        return max(0, len(flat_lines) - 1)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if self.is_syncing:
+            event.ignore()
+            return
+        flat_lines = self.draft.flat_lines()
+        if not flat_lines:
+            event.ignore()
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        step = -1 if delta > 0 else 1
+        base = self.preview_flat_idx if self.preview_flat_idx is not None else self._cursor_flat_index(flat_lines)
+        self.preview_flat_idx = max(0, min(len(flat_lines) - 1, base + step))
+        self.update()
+        event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.RightButton and self.is_syncing:
@@ -134,23 +397,24 @@ class _RollingTeleprompterWidget(QWidget):
             painter.drawText(
                 self.rect().adjusted(24, 24, -24, -24),
                 Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-                "Click 'Paste / Edit Lyrics…' or 'Load Lyrics / .kbp…' to begin Tap Sync.\n\n"
-                "Use '/' for syllable splits and blank lines for page breaks.",
+                "Click 'Obtain / Enter Lyrics…', 'Load .txt / .kbp…', or drag & drop a .kbp / .mjkp file to begin Tap Sync.",
             )
             return
 
-        # Find active line index in flat_lines
-        active_flat_idx = 0
-        focus_coord = self.cursor or self.open_coord
-        if focus_coord is not None:
-            for idx, (p_i, l_i, _) in enumerate(flat_lines):
-                if (p_i, l_i) == (focus_coord[0], focus_coord[1]):
-                    active_flat_idx = idx
-                    break
+        # Find active line index in flat_lines (use wheel-scrolled preview index when browsing)
+        cursor_flat_idx = self._cursor_flat_index(flat_lines)
+        is_preview_scrolled = (
+            not self.is_syncing
+            and self.preview_flat_idx is not None
+            and 0 <= self.preview_flat_idx < len(flat_lines)
+            and self.preview_flat_idx != cursor_flat_idx
+        )
+        if not self.is_syncing and self.preview_flat_idx is not None:
+            active_flat_idx = max(0, min(len(flat_lines) - 1, self.preview_flat_idx))
         else:
-            active_flat_idx = len(flat_lines) - 1
+            active_flat_idx = cursor_flat_idx
 
-        # Top status pill (Locked / Syncing / Paused phrase / Punch-in / Ready)
+        # Top status pill (Locked / Syncing / Paused phrase / Punch-in / Previewing / Ready)
         if self.is_locked:
             synced = self.draft.synced_syllables()
             total = self.draft.total_syllables()
@@ -165,6 +429,13 @@ class _RollingTeleprompterWidget(QWidget):
         elif self.is_syncing:
             badge_txt = "● SYNCING — Tap Space on the orange syllable (hold & release Space, or Ctrl/↓/Right-Click for pauses)"
             badge_bg = QColor(22, 101, 52, 210)
+        elif is_preview_scrolled:
+            pv_p, pv_l, _ = flat_lines[active_flat_idx]
+            badge_txt = (
+                f"PREVIEWING LINE {active_flat_idx + 1}/{len(flat_lines)} (P{pv_p + 1} L{pv_l + 1}) — "
+                "Scroll to inspect splits · Click 'Start Sync' or press Space to begin"
+            )
+            badge_bg = QColor(30, 58, 95, 220)
         else:
             synced = self.draft.synced_syllables()
             total = self.draft.total_syllables()
@@ -609,8 +880,10 @@ class TapSyncView(QWidget):
         self._btn_new.clicked.connect(self.reset_fresh)
         lyr_r1.addWidget(self._btn_new)
 
-        self._btn_paste = QPushButton("Paste / Edit Lyrics…", ribbon)
-        self._btn_paste.setToolTip("Paste or edit slash-delimited lyrics (blank lines = page breaks)")
+        self._btn_paste = QPushButton("Obtain / Enter Lyrics…", ribbon)
+        self._btn_paste.setToolTip(
+            "Obtain lyrics via Local Lyric Splitter or paste/edit slash-delimited lyrics (blank lines = page breaks)"
+        )
         self._btn_paste.clicked.connect(self._open_lyrics_editor)
         lyr_r1.addWidget(self._btn_paste)
 
@@ -618,11 +891,6 @@ class TapSyncView(QWidget):
         self._btn_load_lyr.setToolTip("Load a lyric .txt file or an unsynced LYRICSV2 .kbp file")
         self._btn_load_lyr.clicked.connect(self._load_lyrics_or_kbp_dialog)
         lyr_r1.addWidget(self._btn_load_lyr)
-
-        self._btn_load_draft = QPushButton("Load Draft…", ribbon)
-        self._btn_load_draft.setToolTip("Load a saved partial-sync JSON draft")
-        self._btn_load_draft.clicked.connect(self._load_draft_dialog)
-        lyr_r2.addWidget(self._btn_load_draft)
 
         self._btn_save_draft = QPushButton("Save Project", ribbon)
         self._btn_save_draft.setToolTip("Save current project (Ctrl+S) so you can reopen right where you left off")
@@ -866,10 +1134,6 @@ class TapSyncView(QWidget):
         self._btn_load_lyr.setToolTip(
             blocked_tip if has_synced else "Load a lyric .txt file or an unsynced LYRICSV2 .kbp file"
         )
-        self._btn_load_draft.setEnabled(allow_new_draft)
-        self._btn_load_draft.setToolTip(
-            blocked_tip if has_synced else "Load a saved partial-sync JSON draft"
-        )
         # Project Organizer is always accessible (opens selected project in a new window if this one is busy)
         self._resume_btn.setEnabled(True)
         self._resume_btn.setToolTip(
@@ -1047,6 +1311,7 @@ class TapSyncView(QWidget):
             self.stop_syncing()
         self.draft = draft
         self._teleprompter.draft = draft
+        self._teleprompter.preview_flat_idx = None
         self._waveform.draft = draft
 
         self._latency_cb.blockSignals(True)
@@ -1108,7 +1373,7 @@ class TapSyncView(QWidget):
     def _open_lyrics_editor(self) -> None:
         if self._locked:
             return
-        dlg = _LyricsInputDialog(self.draft, self)
+        dlg = _LyricsInputDialog(self.draft, self, settings=self._settings)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_draft = TapSyncDraft.from_lyrics_text(dlg.lyrics_text)
@@ -1126,6 +1391,34 @@ class TapSyncView(QWidget):
         self._autosave()
         self.setFocus()
 
+    def load_lyrics_txt(self, path: str | Path) -> bool:
+        if self._locked or self._has_synced_project:
+            return False
+        p = Path(path)
+        try:
+            text = p.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = p.read_text(encoding="cp1252", errors="replace")
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Lyrics Failed", f"Could not read lyrics file:\n{exc}")
+            return False
+        draft = TapSyncDraft.from_lyrics_text(text)
+        if " - " in p.stem:
+            artist_part, title_part = p.stem.split(" - ", 1)
+            draft.artist = artist_part.strip()
+            draft.title = title_part.strip()
+        else:
+            draft.title = p.stem
+        draft.audio_path = self.draft.audio_path or (str(self.audio.main_path) if self.audio.main_path else "")
+        draft.vocal_path = self.draft.vocal_path or (str(self.audio.vocal_path) if self.audio.vocal_path else "")
+        draft.template_kbp_path = self.draft.template_kbp_path
+        self._apply_draft(draft, load_audio=False)
+        self._set_dirty(True)
+        self._autosave()
+        self.status_message.emit(f"Loaded lyrics from {p.name} ({draft.total_syllables()} syllables)", 4500)
+        self.setFocus()
+        return True
+
     def _load_lyrics_or_kbp_dialog(self) -> None:
         if self._locked or self._has_synced_project:
             return
@@ -1140,21 +1433,10 @@ class TapSyncView(QWidget):
         p = Path(path)
         if p.suffix.lower() == ".kbp":
             self.load_unsynced_kbp(p)
+            self._autosave()
+            self.setFocus()
         else:
-            try:
-                text = p.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                text = p.read_text(encoding="cp1252", errors="replace")
-            draft = TapSyncDraft.from_lyrics_text(text)
-            draft.title = p.stem
-            draft.audio_path = self.draft.audio_path or (str(self.audio.main_path) if self.audio.main_path else "")
-            draft.vocal_path = self.draft.vocal_path or (str(self.audio.vocal_path) if self.audio.vocal_path else "")
-            draft.template_kbp_path = self.draft.template_kbp_path
-            self._apply_draft(draft, load_audio=False)
-            self._set_dirty(True)
-            self.status_message.emit(f"Loaded lyrics from {p.name} ({draft.total_syllables()} syllables)", 4500)
-        self._autosave()
-        self.setFocus()
+            self.load_lyrics_txt(p)
 
     def save_draft(self) -> bool:
         """Save the current Tap Sync draft (to its existing file if set, otherwise prompting)."""
@@ -1176,6 +1458,24 @@ class TapSyncView(QWidget):
         """Prompt for a file path and save the current Tap Sync project draft."""
         return self._save_draft_dialog()
 
+    def _suggest_draft_filename(self) -> str:
+        def _clean(s: str) -> str:
+            return re.sub(r'[<>:"/\\|?*]', "", s).strip()
+
+        artist = _clean(self.draft.artist)
+        title = _clean(self.draft.title)
+        if artist and title:
+            return f"{artist} - {title}.mjkp"
+        if title:
+            return f"{title}.mjkp"
+        if artist:
+            return f"{artist}.mjkp"
+        if self.audio.main_path is not None:
+            stem = _clean(self.audio.main_path.stem)
+            if stem:
+                return f"{stem}.mjkp"
+        return ""
+
     def _save_draft_dialog(self) -> bool:
         if not self.draft.pages:
             return False
@@ -1183,8 +1483,18 @@ class TapSyncView(QWidget):
             self.draft.audio_path = str(self.audio.main_path)
         if self.audio.vocal_path:
             self.draft.vocal_path = str(self.audio.vocal_path)
-        default_dir = str(self._draft_file_path) if self._draft_file_path else ""
-        path, _ = QFileDialog.getSaveFileName(self, "Save Tap Sync Draft", default_dir, "Tap Sync Draft (*.kbsync.json);;JSON (*.json)")
+        if self._draft_file_path is not None:
+            default_target = str(self._draft_file_path)
+        else:
+            suggested_name = self._suggest_draft_filename()
+            default_dir = self.audio.main_path.parent if self.audio.main_path else None
+            if default_dir is not None and suggested_name:
+                default_target = str(default_dir / suggested_name)
+            elif default_dir is not None:
+                default_target = str(default_dir)
+            else:
+                default_target = suggested_name
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project", default_target, "Matt Joy Karaoke Project (*.mjkp)")
         if not path:
             return False
         self._draft_file_path = self.draft.save_json(path)
@@ -1192,26 +1502,6 @@ class TapSyncView(QWidget):
         self._set_dirty(False)
         self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
         return True
-
-    def _load_draft_dialog(self) -> None:
-        if self._locked or self._has_synced_project:
-            return
-        path, _ = QFileDialog.getOpenFileName(self, "Load Tap Sync Draft", "", "Tap Sync Draft (*.kbsync.json *.json);;All Files (*.*)")
-        if not path:
-            return
-        try:
-            draft = TapSyncDraft.load_json(path)
-        except Exception as exc:
-            QMessageBox.critical(self, "Load Draft Failed", f"Could not read draft JSON:\n{exc}")
-            return
-        self._draft_file_path = Path(path)
-        self._apply_draft(draft, load_audio=True)
-        self._set_dirty(False)
-        self.status_message.emit(
-            f"Loaded draft {Path(path).name} ({draft.synced_syllables()}/{draft.total_syllables()} syllables synced)",
-            4500,
-        )
-        self.setFocus()
 
     def _pick_template_kbp(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1228,17 +1518,31 @@ class TapSyncView(QWidget):
             self._autosave()
             self.status_message.emit(f"Style template set from {Path(path).name}", 4000)
 
-    def load_draft_file(self, path: str | Path) -> bool:
+    @staticmethod
+    def _is_autosave_file(path: Path) -> bool:
         try:
-            draft = TapSyncDraft.load_json(path)
+            rp = path.resolve()
+            for folder in (default_autosaves_dir(), default_drafts_dir()):
+                if rp.parent == folder.resolve():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def load_draft_file(self, path: str | Path) -> bool:
+        p = Path(path)
+        try:
+            draft = TapSyncDraft.load_json(p)
         except Exception as exc:
-            QMessageBox.critical(self, "Load Draft Failed", f"Could not read draft JSON:\n{exc}")
+            QMessageBox.critical(self, "Load Draft Failed", f"Could not read .mjkp project file:\n{exc}")
             return False
-        self._draft_file_path = Path(path)
+        self._draft_file_path = p
         self._apply_draft(draft, load_audio=True)
         self._set_dirty(False)
+        if not self._is_autosave_file(p):
+            register_saved_project(p)
         self.status_message.emit(
-            f"Loaded draft {Path(path).name} ({draft.synced_syllables()}/{draft.total_syllables()} syllables synced)",
+            f"Loaded project {p.name} ({draft.synced_syllables()}/{draft.total_syllables()} syllables synced)",
             4500,
         )
         self.setFocus()
@@ -1318,6 +1622,7 @@ class TapSyncView(QWidget):
         self._cursor = (p_idx, l_idx, s_idx)
         self._open_coord = None
         self._punch_line = None
+        self._teleprompter.preview_flat_idx = None
         if line.first_start_cs is not None:
             self.playhead_scrubbed.emit(float(max(0, line.first_start_cs - self.draft.pre_roll_cs)))
         self._sync_visuals()
@@ -1411,6 +1716,7 @@ class TapSyncView(QWidget):
         self._open_coord = None
         self._last_released_coord = None
         self._space_held_coord = None
+        self._teleprompter.preview_flat_idx = None
         self._is_syncing = True
         self._sync_btn.setEnabled(False)
         self._sync_btn.setText("● Syncing…")
