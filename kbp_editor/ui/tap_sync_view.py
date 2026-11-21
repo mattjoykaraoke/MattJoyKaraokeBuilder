@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from ..audio import AudioEngine, WaveformData
 from ..model import KbpProject
-from ..tap_sync import TapLine, TapSyllable, TapSyncDraft, default_drafts_dir
+from ..tap_sync import TapLine, TapSyllable, TapSyncDraft, default_autosaves_dir, register_saved_project
 from .project_organizer import ProjectOrganizerDialog
 
 
@@ -509,6 +509,7 @@ class TapSyncView(QWidget):
     status_message = Signal(str, int)
     main_audio_status_changed = Signal(bool, str)  # (loaded, raw_path)
     dirty_changed = Signal(bool)
+    open_project_requested = Signal(str)  # path selected in Project Organizer
 
     def __init__(self, audio: AudioEngine, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -868,11 +869,10 @@ class TapSyncView(QWidget):
         self._btn_load_draft.setToolTip(
             blocked_tip if has_synced else "Load a saved partial-sync JSON draft"
         )
-        self._resume_btn.setEnabled(allow_new_draft)
+        # Project Organizer is always accessible (opens selected project in a new window if this one is busy)
+        self._resume_btn.setEnabled(True)
         self._resume_btn.setToolTip(
-            blocked_tip
-            if has_synced
-            else "Open Project Organizer — resume saved drafts, clean up old drafts, or export/import .zip bundles"
+            "Open Project Organizer — browse Saved Projects, Autosaves, or export/import .zip bundles"
         )
 
         # Editing / tapping / building controls are enabled whenever unfrozen
@@ -997,26 +997,26 @@ class TapSyncView(QWidget):
         return True
 
     def archive_current_draft(self) -> Optional[Path]:
-        """Save the current Tap Sync draft in the background archive so it can be reopened later."""
+        """Save a background recovery autosave when the user has unsaved Tap Sync edits."""
         if not self.draft.pages:
             return None
-        # Don't clutter the unsynced drafts organizer with untouched synced .kbp imports
+        # Only autosave when there are actual unsaved Tap Sync edits (never on untouched imports)
+        if not self._dirty:
+            return None
         if self._has_synced_project and self._locked:
             return None
         if self.audio.main_path:
             self.draft.audio_path = str(self.audio.main_path)
         if self.audio.vocal_path:
             self.draft.vocal_path = str(self.audio.vocal_path)
-        target = self._draft_file_path or (default_drafts_dir() / self.draft.default_archive_filename())
+        target = default_autosaves_dir() / self.draft.default_archive_filename()
         try:
-            saved = self.draft.save_json(target)
-            self._draft_file_path = saved
-            return saved
+            return self.draft.save_json(target)
         except Exception:
             return None
 
     def reset_fresh(self) -> None:
-        """Archive the outgoing draft in the background, then start a clean empty draft."""
+        """Autosave any dirty outgoing draft, then start a clean empty draft."""
         self.archive_current_draft()
         fresh = TapSyncDraft()
         self._apply_saved_defaults_to_draft(fresh)
@@ -1032,12 +1032,10 @@ class TapSyncView(QWidget):
         pass
 
     def open_project_organizer(self) -> None:
-        if self._locked or self._has_synced_project:
-            return
         self.archive_current_draft()
         dlg = ProjectOrganizerDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_draft_path is not None:
-            self.load_draft_file(dlg.selected_draft_path)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_project_path is not None:
+            self.open_project_requested.emit(str(dlg.selected_project_path))
 
     def _autosave(self) -> None:
         self.archive_current_draft()
@@ -1166,6 +1164,7 @@ class TapSyncView(QWidget):
             if self.audio.vocal_path:
                 self.draft.vocal_path = str(self.audio.vocal_path)
             self._draft_file_path = self.draft.save_json(self._draft_file_path)
+            register_saved_project(self._draft_file_path)
             self._set_dirty(False)
             self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
             return True
@@ -1183,6 +1182,7 @@ class TapSyncView(QWidget):
         if not path:
             return False
         self._draft_file_path = self.draft.save_json(path)
+        register_saved_project(self._draft_file_path)
         self._set_dirty(False)
         self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
         return True

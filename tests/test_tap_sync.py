@@ -251,19 +251,21 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
         assert win.tap_sync_view._sync_btn.isEnabled() is False
         assert win.tap_sync_view._btn_load_lyr.isEnabled() is False
 
-        # Attempting to open an unsynced .kbp in the same instance must be blocked
-        blocked_calls = []
+        # Attempting to open another .kbp (unsynced or synced) while a project is open
+        # automatically opens it in a new window without modifying the current window
+        launched = []
         monkeypatch.setattr(
             win,
-            "_warn_synced_project_blocks_unsynced",
-            lambda target, kind="": blocked_calls.append((target, kind)),
+            "_launch_new_window",
+            lambda target=None: (launched.append(Path(target) if target else None), True)[1],
         )
         win.open_kbp(unsynced_path)
-        assert len(blocked_calls) == 1
+        assert launched == [unsynced_path]
         assert win.tap_sync_view.draft.title == "Synced Song"
         assert win.project.header.title == "Synced Song"
+        assert not hasattr(win, "_recent_menu")
 
-        # Unfreezing allows re-tapping the synced project while still blocking loading another unsynced draft
+        # Unfreezing allows re-tapping the synced project; Project Organizer stays accessible
         win.tap_sync_view.set_locked(False)
         assert win.tap_sync_view.is_locked is False
         assert win.tap_sync_view._sync_btn.isEnabled() is True
@@ -271,7 +273,7 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
         assert win.tap_sync_view._build_btn.isEnabled() is True
         assert win.tap_sync_view._btn_load_lyr.isEnabled() is False
         assert win.tap_sync_view._btn_load_draft.isEnabled() is False
-        assert win.tap_sync_view._resume_btn.isEnabled() is False
+        assert win.tap_sync_view._resume_btn.isEnabled() is True
 
         # Saving re-locks Tap Sync
         win.save_kbp()
@@ -369,29 +371,39 @@ def test_project_organizer_multi_delete_and_skip_confirm(tmp_path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtCore import QItemSelectionModel
     from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidget
+    from kbp_editor.tap_sync import register_saved_project
     from kbp_editor.ui.project_organizer import ProjectOrganizerDialog
 
     app = QApplication.instance() or QApplication([])
-    drafts_dir = tmp_path / "drafts"
-    drafts_dir.mkdir()
+    autosaves_dir = tmp_path / "autosaves"
+    autosaves_dir.mkdir()
+    reg_path = tmp_path / "saved_projects.json"
+
+    saved_kbp = _write_synced_kbp(tmp_path / "explicit.kbp", title="Explicitly Saved")
+    register_saved_project(saved_kbp, registry_path=reg_path)
+
     for name in ("Song A", "Song B", "Song C"):
         d = TapSyncDraft.from_lyrics_text("Hel/lo world")
         d.title = name
-        d.save_json(drafts_dir / d.default_archive_filename())
+        d.save_json(autosaves_dir / d.default_archive_filename())
 
-    dlg = ProjectOrganizerDialog(drafts_dir=drafts_dir)
+    dlg = ProjectOrganizerDialog(drafts_dir=autosaves_dir, registry_path=reg_path)
     orig_confirm = dlg._settings.value("confirm_delete_draft", True, type=bool)
     try:
-        assert dlg._table.selectionMode() == QTableWidget.SelectionMode.ExtendedSelection
-        assert dlg._table.rowCount() == 3
+        # Saved Projects tab shows only explicitly saved projects; Autosaves tab shows autosaves
+        assert dlg._saved_table.selectionMode() == QTableWidget.SelectionMode.ExtendedSelection
+        assert dlg._autosave_table.selectionMode() == QTableWidget.SelectionMode.ExtendedSelection
+        assert dlg._saved_table.rowCount() == 1
+        assert dlg._autosave_table.rowCount() == 3
 
-        # Ensure confirmation is enabled, then check "Do not remind me again" and delete 2 rows at once
+        # Switch to Autosaves tab, enable confirmation, check "Do not remind me again" and delete 2 rows at once
+        dlg._tabs.setCurrentWidget(dlg._autosave_table)
         dlg._settings.setValue("confirm_delete_draft", True)
         dlg._confirm_del_cb.setChecked(True)
-        sel = dlg._table.selectionModel()
+        sel = dlg._autosave_table.selectionModel()
         sel.clearSelection()
-        sel.select(dlg._table.model().index(0, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
-        sel.select(dlg._table.model().index(2, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        sel.select(dlg._autosave_table.model().index(0, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        sel.select(dlg._autosave_table.model().index(2, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         assert len(dlg._selected_entries()) == 2
 
         exec_calls = []
@@ -406,15 +418,22 @@ def test_project_organizer_multi_delete_and_skip_confirm(tmp_path, monkeypatch):
         monkeypatch.setattr(QMessageBox, "exec", _fake_exec)
         dlg._delete_selected()
         assert len(exec_calls) == 1
-        assert "2 selected saved drafts" in exec_calls[0]
-        assert dlg._table.rowCount() == 1
+        assert "2 selected autosaves" in exec_calls[0]
+        assert dlg._autosave_table.rowCount() == 1
         assert dlg._confirm_del_cb.isChecked() is False
 
-        # Deleting the remaining row should NOT show the popup again
-        dlg._table.selectRow(0)
+        # Deleting the remaining autosave should NOT show the popup again
+        dlg._autosave_table.selectRow(0)
         dlg._delete_selected()
         assert len(exec_calls) == 1
-        assert dlg._table.rowCount() == 0
+        assert dlg._autosave_table.rowCount() == 0
+
+        # Removing from Saved Projects removes from registry without deleting the .kbp on disk
+        dlg._tabs.setCurrentWidget(dlg._saved_table)
+        dlg._saved_table.selectRow(0)
+        dlg._delete_selected()
+        assert dlg._saved_table.rowCount() == 0
+        assert saved_kbp.exists()
     finally:
         dlg._settings.setValue("confirm_delete_draft", orig_confirm)
         dlg._settings.sync()

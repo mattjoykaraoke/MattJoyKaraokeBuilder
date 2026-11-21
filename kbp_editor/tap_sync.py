@@ -592,9 +592,94 @@ def default_drafts_dir() -> Path:
     return d
 
 
+def default_autosaves_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(base) / "AdvancedKBPEditor" / "autosaves"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def default_saved_projects_registry() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(base) / "AdvancedKBPEditor"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "saved_projects.json"
+
+
+def register_saved_project(path: str | Path, registry_path: Optional[Path] = None) -> None:
+    """Record an explicitly saved .kbp or .kbsync.json project in the Saved Projects registry."""
+    reg = registry_path or default_saved_projects_registry()
+    try:
+        norm = str(Path(path).resolve())
+    except Exception:
+        norm = str(Path(path))
+    items: List[str] = []
+    if reg.exists():
+        try:
+            raw = json.loads(reg.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                items = [str(x) for x in raw if x]
+        except Exception:
+            items = []
+    items = [p for p in items if p.lower() != norm.lower()]
+    items.insert(0, norm)
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def unregister_saved_projects(paths: List[str | Path], registry_path: Optional[Path] = None) -> None:
+    """Remove one or more project paths from the Saved Projects registry (does not delete files)."""
+    reg = registry_path or default_saved_projects_registry()
+    if not reg.exists():
+        return
+    remove_keys = set()
+    for p in paths:
+        try:
+            remove_keys.add(str(Path(p).resolve()).lower())
+        except Exception:
+            remove_keys.add(str(Path(p)).lower())
+    try:
+        raw = json.loads(reg.read_text(encoding="utf-8"))
+        items = [str(x) for x in raw if x] if isinstance(raw, list) else []
+    except Exception:
+        items = []
+    kept = []
+    for x in items:
+        try:
+            k = str(Path(x).resolve()).lower()
+        except Exception:
+            k = str(x).lower()
+        if k not in remove_keys:
+            kept.append(x)
+    reg.write_text(json.dumps(kept, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def list_saved_projects(registry_path: Optional[Path] = None) -> List[Path]:
+    """Return existing explicitly saved project paths (.kbp and .kbsync.json), newest-first."""
+    reg = registry_path or default_saved_projects_registry()
+    if not reg.exists():
+        return []
+    try:
+        raw = json.loads(reg.read_text(encoding="utf-8"))
+        items = [str(x) for x in raw if x] if isinstance(raw, list) else []
+    except Exception:
+        return []
+    out: List[Path] = []
+    seen = set()
+    for s in items:
+        p = Path(s)
+        if not p.is_file():
+            continue
+        k = str(p).lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
+
+
 def list_archived_drafts(drafts_dir: Optional[Path] = None) -> List[Tuple[Path, TapSyncDraft]]:
-    """Return all archived .kbsync.json drafts sorted newest-first."""
-    folder = drafts_dir or default_drafts_dir()
+    """Return all .kbsync.json drafts in a folder sorted newest-first."""
+    folder = drafts_dir or default_autosaves_dir()
     if not folder.exists():
         return []
     entries: List[Tuple[float, Path, TapSyncDraft]] = []
@@ -605,5 +690,35 @@ def list_archived_drafts(drafts_dir: Optional[Path] = None) -> List[Tuple[Path, 
             entries.append((mtime, p, d))
         except Exception:
             continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return [(p, d) for _, p, d in entries]
+
+
+def list_autosave_drafts(
+    autosaves_dir: Optional[Path] = None,
+    include_legacy: bool = True,
+) -> List[Tuple[Path, TapSyncDraft]]:
+    """Return background Tap Sync autosaves sorted newest-first (optionally including legacy drafts/)."""
+    folders: List[Path] = [autosaves_dir or default_autosaves_dir()]
+    if include_legacy and autosaves_dir is None:
+        legacy = default_drafts_dir()
+        if legacy.exists() and legacy not in folders:
+            folders.append(legacy)
+    entries: List[Tuple[float, Path, TapSyncDraft]] = []
+    seen = set()
+    for folder in folders:
+        if not folder.exists():
+            continue
+        for p in folder.glob("*.kbsync.json"):
+            key = str(p.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                d = TapSyncDraft.load_json(p)
+                mtime = p.stat().st_mtime
+                entries.append((mtime, p, d))
+            except Exception:
+                continue
     entries.sort(key=lambda item: item[0], reverse=True)
     return [(p, d) for _, p, d in entries]

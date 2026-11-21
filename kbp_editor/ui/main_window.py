@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from ..audio import AudioEngine
 from ..history import HistoryManager
 from ..model import KbpProject
+from ..tap_sync import register_saved_project
 from .display_view import DisplayRemoveView
 from .minimap_widget import SongMinimapWidget
 from .preview_widget import FloatingPreviewWindow
@@ -328,10 +329,7 @@ class MainWindow(QMainWindow):
         act_open.triggered.connect(self._open_dialog)
         m_file.addAction(act_open)
 
-        self._recent_menu = m_file.addMenu("Open &Recent Project")
-        self._rebuild_recent_menu()
-
-        act_organizer = QAction("&Project Organizer (Drafts && Bundles)…", self)
+        act_organizer = QAction("&Project Organizer (Saved Projects && Autosaves)…", self)
         act_organizer.triggered.connect(self._open_project_organizer)
         m_file.addAction(act_organizer)
 
@@ -446,6 +444,7 @@ class MainWindow(QMainWindow):
         self.tap_sync_view.status_message.connect(self.statusBar().showMessage)
         self.tap_sync_view.main_audio_status_changed.connect(self._on_tap_sync_main_audio_status)
         self.tap_sync_view.dirty_changed.connect(lambda _d: self._refresh_actions())
+        self.tap_sync_view.open_project_requested.connect(self._open_project_path)
 
         self.display_view.viewport_changed.connect(self._on_display_viewport)
         self.wiping_view.viewport_changed.connect(self._on_wiping_viewport)
@@ -654,32 +653,6 @@ class MainWindow(QMainWindow):
             )
         return ok
 
-    def _warn_synced_project_blocks_unsynced(
-        self,
-        target_path: Optional[str | Path],
-        kind_label: str = "an unsynced project",
-    ) -> None:
-        cur_name = (
-            self.project.source_path.name
-            if (self.project and self.project.source_path)
-            else (self.project.header.title if (self.project and self.project.header.title) else "the current synced project")
-        )
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setWindowTitle("Synced Project Already Open")
-        msg.setText(f"Cannot load {kind_label} into this window while '{cur_name}' is open.")
-        msg.setInformativeText(
-            "A fully synced .kbp project is already loaded in this instance.\n\n"
-            "• To work on another song at the same time, click 'Open in New Window' (or File → New Window).\n"
-            "• To edit or re-tap the current synced .kbp, switch to Tap Sync and click 'Unfreeze Tap Sync'.\n"
-            "• To clear this window first, use File → New Project."
-        )
-        btn_new_win = msg.addButton("Open in New Window", QMessageBox.ButtonRole.ActionRole)
-        msg.addButton(QMessageBox.StandardButton.Ok)
-        msg.exec()
-        if msg.clickedButton() is btn_new_win:
-            self._launch_new_window(target_path)
-
     def _on_tap_sync_project_built(self, proj: KbpProject, vocal_path: str) -> None:
         existing_source = self.project.source_path if self.project is not None else None
         if existing_source is not None:
@@ -736,7 +709,7 @@ class MainWindow(QMainWindow):
         )
         if save_path:
             self.project.save(save_path)
-            self._add_recent_project(save_path)
+            register_saved_project(save_path)
             if self.audio.vocal_path:
                 self._save_vocal_stem_for_project(Path(save_path), self.audio.vocal_path, audio_path=self.audio.main_path)
             self.history.mark_saved()
@@ -752,77 +725,25 @@ class MainWindow(QMainWindow):
                 6000,
             )
 
-    def _load_recent_projects(self) -> List[str]:
-        raw = self._settings.value("recent_projects_json", "[]", type=str)
-        try:
-            items = json.loads(raw) if raw else []
-            if isinstance(items, list):
-                return [str(x) for x in items if x]
-        except Exception:
-            pass
-        return []
+    def _has_open_project(self) -> bool:
+        return self.project is not None or bool(self.tap_sync_view.draft.pages)
 
-    def _add_recent_project(self, path: str | Path) -> None:
-        try:
-            norm = str(Path(path).resolve())
-        except Exception:
-            norm = str(Path(path))
-        items = [p for p in self._load_recent_projects() if p.lower() != norm.lower()]
-        items.insert(0, norm)
-        items = items[:10]
-        self._settings.setValue("recent_projects_json", json.dumps(items))
-        self._settings.sync()
-        self._rebuild_recent_menu()
-
-    def _clear_recent_projects(self) -> None:
-        self._settings.setValue("recent_projects_json", "[]")
-        self._settings.sync()
-        self._rebuild_recent_menu()
-
-    def _rebuild_recent_menu(self) -> None:
-        if not hasattr(self, "_recent_menu"):
-            return
-        self._recent_menu.clear()
-        items = self._load_recent_projects()
-        if not items:
-            empty = QAction("(No recent projects)", self)
-            empty.setEnabled(False)
-            self._recent_menu.addAction(empty)
-            return
-        for p_str in items:
-            p = Path(p_str)
-            act = QAction(f"{p.name}   —   {p.parent}", self)
-            act.setToolTip(p_str)
-            act.triggered.connect(lambda _chk=False, target=p_str: self._open_recent_project(target))
-            self._recent_menu.addAction(act)
-        self._recent_menu.addSeparator()
-        act_clear = QAction("Clear Recent Projects", self)
-        act_clear.triggered.connect(self._clear_recent_projects)
-        self._recent_menu.addAction(act_clear)
-
-    def _open_recent_project(self, path_str: str) -> None:
+    def _open_project_path(self, path_str: str) -> None:
         p = Path(path_str)
         if not p.exists():
-            QMessageBox.warning(self, "File Not Found", f"Recent project no longer exists:\n{path_str}")
-            items = [x for x in self._load_recent_projects() if x.lower() != path_str.lower()]
-            self._settings.setValue("recent_projects_json", json.dumps(items))
-            self._settings.sync()
-            self._rebuild_recent_menu()
+            QMessageBox.warning(self, "File Not Found", f"Project file no longer exists:\n{path_str}")
+            return
+        if self._has_open_project():
+            if self._launch_new_window(p):
+                self.statusBar().showMessage(f"Opened {p.name} in a new window", 4000)
             return
         if p.suffix.lower() == ".json":
-            if self.project is not None:
-                self._warn_synced_project_blocks_unsynced(p, "a Tap Sync draft")
-                return
             if self.tap_sync_view.load_draft_file(p):
                 self._tabs.setCurrentWidget(self.tap_sync_view)
         else:
             self.open_kbp(p)
 
     def _open_project_organizer(self) -> None:
-        if self.project is not None:
-            self._warn_synced_project_blocks_unsynced(None, "a saved Tap Sync draft")
-            return
-        self._tabs.setCurrentWidget(self.tap_sync_view)
         self.tap_sync_view.open_project_organizer()
 
     def new_project(self) -> None:
@@ -840,8 +761,6 @@ class MainWindow(QMainWindow):
         if self.tap_sync_view.is_syncing:
             self.tap_sync_view.stop_syncing()
         archived = self.tap_sync_view.archive_current_draft()
-        if archived is not None:
-            self._add_recent_project(archived)
         self.audio.clear_vocal()
         self.audio.clear_main()
         self._set_main_audio_missing_hint(False)
@@ -854,7 +773,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         msg = "Started a fresh project"
         if archived is not None:
-            msg += f" (previous draft saved: {archived.name})"
+            msg += f" (autosave kept: {archived.name})"
         self.statusBar().showMessage(msg, 4500)
 
     def _open_dialog(self) -> None:
@@ -981,15 +900,17 @@ class MainWindow(QMainWindow):
             )
 
     def open_kbp(self, path: str | Path) -> None:
+        # If another project is already open in this window, automatically open the new file in a fresh window
+        if self._has_open_project():
+            if self._launch_new_window(path):
+                self.statusBar().showMessage(f"Opened {Path(path).name} in a new window", 4000)
+            return
+
         try:
             proj = KbpProject.load(path)
         except ValueError as exc:
             if "LYRICSV2" in str(exc):
-                if self.project is not None:
-                    self._warn_synced_project_blocks_unsynced(path, "an unsynced .kbp file")
-                    return
                 if self.tap_sync_view.load_unsynced_kbp(path):
-                    self._add_recent_project(path)
                     saved_v = self._get_saved_vocal_stem(Path(path), self.audio.main_path or self.tap_sync_view.draft.audio_path)
                     if saved_v:
                         self.audio.load_vocal_stem(saved_v)
@@ -1001,16 +922,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open Failed", f"Could not load KBP file:\n{exc}")
             return
 
-        if self.history.is_dirty:
-            reply = QMessageBox.question(
-                self,
-                "Unsaved Changes",
-                "You have unsaved .kbp changes. Open the new .kbp file and discard unsaved changes?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
         if self.tap_sync_view.is_syncing:
             self.tap_sync_view.stop_syncing()
 
@@ -1018,7 +929,6 @@ class MainWindow(QMainWindow):
 
         self.project = proj
         self.history.reset(proj, label=f"Open {Path(path).name}")
-        self._add_recent_project(path)
 
         bak_path: Optional[Path] = None
         if proj.load_issues or flushed_gaps > 0:
@@ -1254,6 +1164,7 @@ class MainWindow(QMainWindow):
         if self.project.source_path is None:
             return self.save_kbp_as()
         self.project.save()
+        register_saved_project(self.project.source_path)
         if self.audio.vocal_path:
             self._save_vocal_stem_for_project(self.project.source_path, self.audio.vocal_path, audio_path=self.audio.main_path)
         self.history.mark_saved()
@@ -1269,6 +1180,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save KBP Project As", default_dir, "Karaoke Builder Projects (*.kbp)")
         if path:
             self.project.save(path)
+            register_saved_project(path)
             if self.audio.vocal_path:
                 self._save_vocal_stem_for_project(Path(path), self.audio.vocal_path, audio_path=self.audio.main_path)
             self.history.mark_saved()
