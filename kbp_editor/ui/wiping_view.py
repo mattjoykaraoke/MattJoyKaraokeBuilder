@@ -822,8 +822,9 @@ class _WipingTimelineCanvas(QWidget):
         vis_start = self.scroll_x_cs - 60.0
         vis_end = self.scroll_x_cs + self.view_span_cs() + 60.0
 
-        # Collect all lines whose syllables intersect the visible time window
-        visible_lines: List[Tuple[int, int, Line]] = []
+        # Collect all non-empty lines globally (for scroll-invariant sublane layout) and mark visible ones
+        all_lines: List[Tuple[int, int, Line]] = []
+        visible_coords: Set[Tuple[int, int]] = set()
         used_styles: Set[str] = {"A", "B", "C"}
         for p_idx, page in enumerate(self.project.pages):
             # Subtle vertical page marker + draggable Page badge (P1, P2, ...) at page start
@@ -853,8 +854,9 @@ class _WipingTimelineCanvas(QWidget):
                     continue
                 if line.style:
                     used_styles.add(line.style.upper())
+                all_lines.append((p_idx, l_idx, line))
                 if line.last_syl_end >= vis_start and line.first_syl_start <= vis_end:
-                    visible_lines.append((p_idx, l_idx, line))
+                    visible_coords.add((p_idx, l_idx))
 
         # Always keep one extra drop track below the highest used style (up to [F]) so lines can be dragged down further
         highest = max(used_styles)
@@ -863,11 +865,14 @@ class _WipingTimelineCanvas(QWidget):
 
         style_order = sorted(used_styles)
 
-        # Group visible lines by style track ([A], [B], [C], ...) and sub-pack overlaps within each track
+        # Assign sublanes globally across the whole song per style track so scrolling never shifts lines vertically
         track_sublanes: Dict[str, List[Tuple[int, int, int, Line]]] = {st: [] for st in style_order}
         track_sublane_counts: Dict[str, int] = {}
         for st in style_order:
-            st_lines = [(p, l, ln) for p, l, ln in visible_lines if (ln.style or "A").upper() == st]
+            st_lines = sorted(
+                ((p, l, ln) for p, l, ln in all_lines if (ln.style or "A").upper() == st),
+                key=lambda item: (item[2].first_syl_start, item[0], item[1]),
+            )
             sub_ends: List[int] = []
             for p_idx, l_idx, line in st_lines:
                 assigned = -1
@@ -879,13 +884,18 @@ class _WipingTimelineCanvas(QWidget):
                 if assigned == -1:
                     assigned = len(sub_ends)
                     sub_ends.append(line.last_syl_end)
-                track_sublanes[st].append((assigned, p_idx, l_idx, line))
-            track_sublane_counts[st] = max(1, len(sub_ends))
+                if (p_idx, l_idx) in visible_coords:
+                    track_sublanes[st].append((assigned, p_idx, l_idx, line))
+            track_sublane_counts[st] = max((sub_i + 1 for sub_i, _, _, _ in track_sublanes[st]), default=1)
 
         total_sublanes = sum(track_sublane_counts.values())
-        lane_h = min(96.0, max(50.0, (height - 8.0) / max(1, total_sublanes)))
+        base_lane_h = min(82.0, max(54.0, (height - 8.0) / max(1, len(style_order))))
+        if total_sublanes * base_lane_h > max(1.0, height - 8.0):
+            lane_h = max(46.0, (height - 8.0) / max(1, total_sublanes))
+        else:
+            lane_h = base_lane_h
         label_h = 16.0
-        block_h = max(28.0, min(58.0, lane_h - label_h - 8.0))
+        block_h = max(28.0, min(56.0, lane_h - label_h - 8.0))
 
         # Paint dedicated track bands ([A], [B], [C], ...) with drag-drop hover highlight
         cur_y = float(top + 4)
@@ -913,7 +923,7 @@ class _WipingTimelineCanvas(QWidget):
             painter.drawText(st_badge, Qt.AlignmentFlag.AlignCenter, f"[{st}]")
 
             if not track_sublanes[st]:
-                hint_txt = f"Drag any line down here to move it to [{st}] (concurrent track)" if st == "B" else f"[{st}] track"
+                hint_txt = f"Drag any line down here to move it to [{st}] (concurrent track/second style)" if st == "B" else f"[{st}] track"
                 painter.setFont(QFont("Segoe UI", 8))
                 painter.setPen(QColor(lbl_c.red(), lbl_c.green(), lbl_c.blue(), 95))
                 painter.drawText(QRectF(34.0, y_top, float(w - 40), band_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, hint_txt)
