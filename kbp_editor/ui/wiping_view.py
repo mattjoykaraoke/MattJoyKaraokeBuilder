@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from PySide6.QtCore import Qt, QLineF, QPoint, QRectF, Signal
+from PySide6.QtCore import QSettings, Qt, QLineF, QPoint, QRectF, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -1585,6 +1585,7 @@ class LyricsWipingView(QWidget):
         self._word_adjust_active: bool = False
         self._saved_px_per_cs: float = DEFAULT_WIPING_PX_PER_CS
         self._saved_scroll_x_cs: float = 0.0
+        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -1639,16 +1640,17 @@ class LyricsWipingView(QWidget):
         # Section 1: Sync & Display
         sec_sync, sync_r1, sync_r2 = _make_section("Sync & Display")
         self._sticky_cb = QCheckBox("Sticky Borders", ribbon)
-        self._sticky_cb.setChecked(True)
+        self._sticky_cb.setChecked(self._settings.value("wiping_sticky_borders", True, type=bool))
         self._sticky_cb.toggled.connect(self._on_sticky)
         sync_r1.addWidget(self._sticky_cb)
 
         self._follow_cb = QCheckBox("Follow Playhead", ribbon)
-        self._follow_cb.setChecked(True)
+        self._follow_cb.setChecked(self._settings.value("wiping_follow_playhead", True, type=bool))
+        self._follow_cb.toggled.connect(self._on_follow)
         sync_r1.addWidget(self._follow_cb)
 
         self._snap_ph_cb = QCheckBox("Snap to Playhead", ribbon)
-        self._snap_ph_cb.setChecked(True)
+        self._snap_ph_cb.setChecked(self._settings.value("wiping_snap_to_playhead", True, type=bool))
         self._snap_ph_cb.setToolTip("Magnetically snap syllable/line/page edges to the playhead while dragging")
         self._snap_ph_cb.toggled.connect(self._on_snap_playhead)
         sync_r1.addWidget(self._snap_ph_cb)
@@ -1692,7 +1694,7 @@ class LyricsWipingView(QWidget):
         _add_btn(l_r1, "Join", "Join current line with the next line", self._join_line)
         _add_btn(l_r1, "Delete", "Delete the selected line", self._delete_line)
         _add_btn(l_r2, "Select", "Highlight all syllables in the current line to slide it (or drag into [B])", self._select_current_line)
-        _add_btn(l_r2, "Duplicate", "Duplicate selected line onto [B] / [C] track in place", self._duplicate_selected_line)
+        _add_btn(l_r2, "Duplicate", "Duplicate selected line in place onto the next style track", self._duplicate_selected_line)
         self._style_combo = QComboBox(ribbon)
         self._style_combo.setFixedWidth(92)
         self._style_combo.setToolTip("Set style ([A]–[F]) for selected line(s)")
@@ -1711,7 +1713,7 @@ class LyricsWipingView(QWidget):
         _add_btn(p_r1, "Join", "Merge current page with the next page", self._join_page)
         _add_btn(p_r1, "Delete", "Delete the current page", self._delete_page)
         _add_btn(p_r2, "Select", "Highlight all syllables on the current page to slide it", self._select_current_page)
-        _add_btn(p_r2, "Duplicate", "Duplicate current page in-line on [B] / [C] track so you can drag it", self._duplicate_selected_page)
+        _add_btn(p_r2, "Duplicate", "Duplicate current page in place onto the next style track so you can drag it", self._duplicate_selected_page)
         ribbon_layout.addLayout(sec_pages)
         ribbon_layout.addWidget(_make_divider())
 
@@ -1761,6 +1763,8 @@ class LyricsWipingView(QWidget):
         self._word_adjust_bar.setVisible(False)
 
         self.canvas = _WipingTimelineCanvas(audio, right_box)
+        self.canvas.sticky_borders = self._sticky_cb.isChecked()
+        self.canvas.snap_to_playhead = self._snap_ph_cb.isChecked()
         self.canvas.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
         self.canvas.line_clicked.connect(self._on_canvas_line_clicked)
         self.canvas.syllable_selected.connect(self._on_canvas_syllable_selected)
@@ -2093,12 +2097,18 @@ class LyricsWipingView(QWidget):
             act_sel.triggered.connect(lambda: self.canvas.select_whole_line(p_idx, l_idx, center=False))
             menu.addAction(act_sel)
 
+            cur_ln = self.canvas.get_line(p_idx, l_idx)
+            next_l_st = (
+                self.project.pick_duplicate_style([cur_ln])
+                if (self.project and cur_ln is not None)
+                else "B"
+            )
             menu.addSeparator()
             for label, fn in [
                 ("Add Line…", self._add_line),
                 ("Split Line at Selected Syllable", self._split_line),
                 ("Join with Next Line", self._join_line),
-                ("Duplicate Line → [B]/[C]", self._duplicate_selected_line),
+                (f"Duplicate Line → Style [{next_l_st}]", self._duplicate_selected_line),
                 ("Delete Line", self._delete_line),
             ]:
                 act = QAction(label, self)
@@ -2106,7 +2116,6 @@ class LyricsWipingView(QWidget):
                 menu.addAction(act)
 
             style_menu = menu.addMenu("Set Line Style")
-            cur_ln = self.canvas.get_line(p_idx, l_idx)
             cur_st = cur_ln.style.upper() if cur_ln else "A"
             for i in range(self._style_combo.count()):
                 st_letter = str(self._style_combo.itemData(i))
@@ -2122,12 +2131,17 @@ class LyricsWipingView(QWidget):
             act_sel.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=False))
             menu.addAction(act_sel)
 
+            next_p_st = (
+                self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
+                if (self.project and 0 <= p_idx < len(self.project.pages))
+                else "B"
+            )
             menu.addSeparator()
             for label, fn in [
                 ("Add Page…", self._add_page),
                 ("Split Page", self._split_page),
                 ("Join with Next Page", self._join_page),
-                (f"Duplicate Page {p_idx + 1} → [B]/[C]", lambda: self._duplicate_page_idx(p_idx)),
+                (f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", lambda: self._duplicate_page_idx(p_idx)),
                 ("Delete Page", self._delete_page),
             ]:
                 act = QAction(label, self)
@@ -2153,12 +2167,18 @@ class LyricsWipingView(QWidget):
         p_idx, l_idx = data
         menu = QMenu(self)
 
+        next_p_st = (
+            self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
+            if (self.project and 0 <= p_idx < len(self.project.pages))
+            else "B"
+        )
+
         if l_idx < 0:
             act_sel_page = QAction(f"Select Whole Page {p_idx + 1} (for sliding)", self)
             act_sel_page.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=True))
             menu.addAction(act_sel_page)
 
-            act_dup_page = QAction(f"Duplicate Page {p_idx + 1} → [B]/[C]", self)
+            act_dup_page = QAction(f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", self)
             act_dup_page.triggered.connect(lambda: self._duplicate_page_idx(p_idx))
             menu.addAction(act_dup_page)
 
@@ -2193,12 +2213,17 @@ class LyricsWipingView(QWidget):
         act_join.triggered.connect(self._join_line)
         menu.addAction(act_join)
 
-        act_dup_l = QAction("Duplicate Line → [B]/[C]", self)
+        cur_ln = self.canvas.get_line(p_idx, l_idx)
+        next_l_st = (
+            self.project.pick_duplicate_style([cur_ln])
+            if (self.project and cur_ln is not None)
+            else "B"
+        )
+        act_dup_l = QAction(f"Duplicate Line → Style [{next_l_st}]", self)
         act_dup_l.triggered.connect(self._duplicate_selected_line)
         menu.addAction(act_dup_l)
 
         style_menu = menu.addMenu("Set Line Style")
-        cur_ln = self.canvas.get_line(p_idx, l_idx)
         cur_st = cur_ln.style.upper() if cur_ln else "A"
         for i in range(self._style_combo.count()):
             st_letter = str(self._style_combo.itemData(i))
@@ -2209,7 +2234,7 @@ class LyricsWipingView(QWidget):
             act_st.triggered.connect(lambda _chk=False, lt=st_letter: self._set_selected_lines_style(lt))
             style_menu.addAction(act_st)
 
-        act_dup_p = QAction(f"Duplicate Page {p_idx + 1} → [B]/[C]", self)
+        act_dup_p = QAction(f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", self)
         act_dup_p.triggered.connect(lambda: self._duplicate_page_idx(p_idx))
         menu.addAction(act_dup_p)
 
@@ -2222,9 +2247,17 @@ class LyricsWipingView(QWidget):
 
     def _on_sticky(self, checked: bool) -> None:
         self.canvas.sticky_borders = checked
+        self._settings.setValue("wiping_sticky_borders", bool(checked))
+        self._settings.sync()
+
+    def _on_follow(self, checked: bool) -> None:
+        self._settings.setValue("wiping_follow_playhead", bool(checked))
+        self._settings.sync()
 
     def _on_snap_playhead(self, checked: bool) -> None:
         self.canvas.snap_to_playhead = checked
+        self._settings.setValue("wiping_snap_to_playhead", bool(checked))
+        self._settings.sync()
 
     def _snap_start(self) -> None:
         if not self.project:

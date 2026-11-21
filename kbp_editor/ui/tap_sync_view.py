@@ -109,6 +109,7 @@ class _RollingTeleprompterWidget(QWidget):
         self.cursor: Optional[Tuple[int, int, int]] = None      # next syllable to tap
         self.open_coord: Optional[Tuple[int, int, int]] = None  # currently sustaining syllable
         self.is_syncing: bool = False
+        self.is_locked: bool = False
         self.punch_line: Optional[Tuple[int, int]] = None
         self.setMinimumHeight(220)
 
@@ -149,8 +150,13 @@ class _RollingTeleprompterWidget(QWidget):
         else:
             active_flat_idx = len(flat_lines) - 1
 
-        # Top status pill (Syncing / Paused phrase / Punch-in / Ready)
-        if self.punch_line is not None and self.is_syncing:
+        # Top status pill (Locked / Syncing / Paused phrase / Punch-in / Ready)
+        if self.is_locked:
+            synced = self.draft.synced_syllables()
+            total = self.draft.total_syllables()
+            badge_txt = f"🔒 LOCKED ({synced}/{total} syllables synced) — Click 'Unfreeze Tap Sync' above to re-tap or modify"
+            badge_bg = QColor(71, 56, 30, 225)
+        elif self.punch_line is not None and self.is_syncing:
             badge_txt = f"● RE-TAPPING P{self.punch_line[0] + 1} L{self.punch_line[1] + 1}  (stops automatically at end of line)"
             badge_bg = QColor(180, 83, 9, 210)
         elif self.is_syncing and self.open_coord is None and self.cursor is not None:
@@ -248,15 +254,6 @@ class _RollingTeleprompterWidget(QWidget):
                 painter.setPen(color)
                 painter.drawText(int(round(x)), int(round(text_y)), syl.text)
                 x += sw
-
-        # Bottom shortcut hint strip
-        painter.setFont(QFont("Segoe UI", 8))
-        painter.setPen(QColor(120, 132, 150))
-        painter.drawText(
-            QRectF(16.0, float(h - 22), float(w - 32), 18.0),
-            Qt.AlignmentFlag.AlignCenter,
-            "Space: Tap orange syllable (hold & release for pauses)  •  Esc: Pause sync  •  Ctrl / ↓ / Right-Click: End phrase  •  Backspace: Undo  •  R: Re-tap line",
-        )
 
 
 class _TapWaveformStrip(QWidget):
@@ -519,23 +516,46 @@ class TapSyncView(QWidget):
         self._item_by_coord: Dict[Tuple[int, int], QTreeWidgetItem] = {}
 
         self._is_syncing: bool = False
+        self._locked: bool = False
+        self._lock_reason: str = ""
+        self._has_synced_project: bool = False
         self._cursor: Optional[Tuple[int, int, int]] = None
         self._open_coord: Optional[Tuple[int, int, int]] = None
         self._last_released_coord: Optional[Tuple[int, int, int]] = None
         self._space_held_coord: Optional[Tuple[int, int, int]] = None
         self._space_press_cs: int = 0
         self._punch_line: Optional[Tuple[int, int]] = None
+        self._pending_punch_line: Optional[Tuple[int, int]] = None
+        self._pending_seek_cs: Optional[float] = None
         self._draft_file_path: Optional[Path] = None
         self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._build_ui()
-        # Open fresh on startup (load any saved default style template, but do NOT auto-load last draft)
-        saved_tpl = self._settings.value("default_template_kbp", "", type=str)
-        if saved_tpl and Path(saved_tpl).exists():
-            self.draft.template_kbp_path = saved_tpl
+        # Open fresh on startup (apply saved timing preferences & default style template, but do NOT auto-load last draft)
+        self._apply_saved_defaults_to_draft(self.draft)
+        self._sync_timing_widgets_from_draft()
         self._refresh_template_btn()
         self._refresh_resume_btn()
+
+    def _apply_saved_defaults_to_draft(self, draft: TapSyncDraft) -> None:
+        draft.latency_enabled = self._settings.value("tap_latency_enabled", True, type=bool)
+        draft.latency_cs = self._settings.value("tap_latency_cs", 4, type=int)
+        draft.pre_roll_cs = self._settings.value("tap_pre_roll_cs", 150, type=int)
+        saved_tpl = self._settings.value("default_template_kbp", "", type=str)
+        if saved_tpl and Path(saved_tpl).exists():
+            draft.template_kbp_path = saved_tpl
+
+    def _sync_timing_widgets_from_draft(self) -> None:
+        self._latency_cb.blockSignals(True)
+        self._latency_cb.setChecked(self.draft.latency_enabled)
+        self._latency_cb.blockSignals(False)
+        self._latency_spin.blockSignals(True)
+        self._latency_spin.setValue(max(0, min(15, self.draft.latency_cs)))
+        self._latency_spin.blockSignals(False)
+        self._preroll_spin.blockSignals(True)
+        self._preroll_spin.setValue(max(0.0, min(5.0, self.draft.pre_roll_cs / 100.0)))
+        self._preroll_spin.blockSignals(False)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -580,30 +600,30 @@ class TapSyncView(QWidget):
 
         # Section 1: Lyrics & Draft
         sec_lyr, lyr_r1, lyr_r2 = _make_section("Lyrics & Draft")
-        btn_new = QPushButton("New", ribbon)
-        btn_new.setToolTip("Start a fresh blank Tap Sync draft")
-        btn_new.clicked.connect(self.reset_fresh)
-        lyr_r1.addWidget(btn_new)
+        self._btn_new = QPushButton("New", ribbon)
+        self._btn_new.setToolTip("Start a fresh blank Tap Sync draft")
+        self._btn_new.clicked.connect(self.reset_fresh)
+        lyr_r1.addWidget(self._btn_new)
 
-        btn_paste = QPushButton("Paste / Edit Lyrics…", ribbon)
-        btn_paste.setToolTip("Paste or edit slash-delimited lyrics (blank lines = page breaks)")
-        btn_paste.clicked.connect(self._open_lyrics_editor)
-        lyr_r1.addWidget(btn_paste)
+        self._btn_paste = QPushButton("Paste / Edit Lyrics…", ribbon)
+        self._btn_paste.setToolTip("Paste or edit slash-delimited lyrics (blank lines = page breaks)")
+        self._btn_paste.clicked.connect(self._open_lyrics_editor)
+        lyr_r1.addWidget(self._btn_paste)
 
-        btn_load_lyr = QPushButton("Load .txt / .kbp…", ribbon)
-        btn_load_lyr.setToolTip("Load a lyric .txt file or an unsynced LYRICSV2 .kbp file")
-        btn_load_lyr.clicked.connect(self._load_lyrics_or_kbp_dialog)
-        lyr_r1.addWidget(btn_load_lyr)
+        self._btn_load_lyr = QPushButton("Load .txt / .kbp…", ribbon)
+        self._btn_load_lyr.setToolTip("Load a lyric .txt file or an unsynced LYRICSV2 .kbp file")
+        self._btn_load_lyr.clicked.connect(self._load_lyrics_or_kbp_dialog)
+        lyr_r1.addWidget(self._btn_load_lyr)
 
-        btn_load_draft = QPushButton("Load Draft…", ribbon)
-        btn_load_draft.setToolTip("Load a saved partial-sync JSON draft")
-        btn_load_draft.clicked.connect(self._load_draft_dialog)
-        lyr_r2.addWidget(btn_load_draft)
+        self._btn_load_draft = QPushButton("Load Draft…", ribbon)
+        self._btn_load_draft.setToolTip("Load a saved partial-sync JSON draft")
+        self._btn_load_draft.clicked.connect(self._load_draft_dialog)
+        lyr_r2.addWidget(self._btn_load_draft)
 
-        btn_save_draft = QPushButton("Save Draft…", ribbon)
-        btn_save_draft.setToolTip("Save current partial sync + audio paths to a JSON draft")
-        btn_save_draft.clicked.connect(self._save_draft_dialog)
-        lyr_r2.addWidget(btn_save_draft)
+        self._btn_save_draft = QPushButton("Save Draft…", ribbon)
+        self._btn_save_draft.setToolTip("Save current partial sync + audio paths to a JSON draft")
+        self._btn_save_draft.clicked.connect(self._save_draft_dialog)
+        lyr_r2.addWidget(self._btn_save_draft)
 
         self._resume_btn = QPushButton("Projects…", ribbon)
         self._resume_btn.setToolTip("Open Project Organizer — resume saved drafts, clean up old drafts, or export/import .zip bundles")
@@ -627,30 +647,37 @@ class TapSyncView(QWidget):
         self._pause_btn.clicked.connect(self.stop_syncing)
         tap_r1.addWidget(self._pause_btn)
 
-        btn_retap = QPushButton("Re-tap Line (R)", ribbon)
-        btn_retap.setToolTip("Clear only the selected line, rewind with pre-roll, and re-tap just that line")
-        btn_retap.clicked.connect(self.start_retap_selected_line)
-        tap_r1.addWidget(btn_retap)
+        self._btn_back_line = QPushButton("◀ Back Line (←)", ribbon)
+        self._btn_back_line.setToolTip(
+            "Restart current line (or step back to previous line if pressed again), erasing subsequent syncs and rewinding to the previous line's end"
+        )
+        self._btn_back_line.clicked.connect(self.restart_or_back_line)
+        tap_r1.addWidget(self._btn_back_line)
 
-        btn_end_phrase = QPushButton("End Phrase (Ctrl)", ribbon)
-        btn_end_phrase.setToolTip("Mark end of held note / pause mid-line without starting the next syllable")
-        btn_end_phrase.clicked.connect(self._end_current_phrase)
-        tap_r2.addWidget(btn_end_phrase)
+        self._btn_retap = QPushButton("Re-tap Line (R)", ribbon)
+        self._btn_retap.setToolTip("Clear only the selected line, rewind with pre-roll, and re-tap just that line")
+        self._btn_retap.clicked.connect(self.start_retap_selected_line)
+        tap_r1.addWidget(self._btn_retap)
 
-        btn_undo_tap = QPushButton("Undo Tap", ribbon)
-        btn_undo_tap.setToolTip("Step back one syllable (Backspace)")
-        btn_undo_tap.clicked.connect(self._undo_last_tap)
-        tap_r2.addWidget(btn_undo_tap)
+        self._btn_end_phrase = QPushButton("End Phrase (Ctrl)", ribbon)
+        self._btn_end_phrase.setToolTip("Mark end of held note / pause mid-line without starting the next syllable")
+        self._btn_end_phrase.clicked.connect(self._end_current_phrase)
+        tap_r2.addWidget(self._btn_end_phrase)
 
-        btn_clear_line = QPushButton("Clear Line", ribbon)
-        btn_clear_line.setToolTip("Clear timestamps on the selected line")
-        btn_clear_line.clicked.connect(self._clear_selected_line)
-        tap_r2.addWidget(btn_clear_line)
+        self._btn_undo_tap = QPushButton("Undo Tap (Z)", ribbon)
+        self._btn_undo_tap.setToolTip("Step back one syllable (Z or Backspace)")
+        self._btn_undo_tap.clicked.connect(self._undo_last_tap)
+        tap_r2.addWidget(self._btn_undo_tap)
 
-        btn_clear_all = QPushButton("Clear All", ribbon)
-        btn_clear_all.setToolTip("Clear all synced timestamps in the entire song to start over")
-        btn_clear_all.clicked.connect(self._clear_all_syncs)
-        tap_r2.addWidget(btn_clear_all)
+        self._btn_clear_line = QPushButton("Clear Line", ribbon)
+        self._btn_clear_line.setToolTip("Clear timestamps on the selected line")
+        self._btn_clear_line.clicked.connect(self._clear_selected_line)
+        tap_r2.addWidget(self._btn_clear_line)
+
+        self._btn_clear_all = QPushButton("Clear All", ribbon)
+        self._btn_clear_all.setToolTip("Clear all synced timestamps in the entire song to start over")
+        self._btn_clear_all.clicked.connect(self._clear_all_syncs)
+        tap_r2.addWidget(self._btn_clear_all)
 
         rl.addLayout(sec_tap)
         rl.addWidget(_div())
@@ -671,7 +698,7 @@ class TapSyncView(QWidget):
         self._latency_spin.valueChanged.connect(self._on_settings_changed)
         time_r1.addWidget(self._latency_spin)
 
-        time_r2.addWidget(QLabel("Pre-roll:", ribbon))
+        time_r1.addWidget(QLabel("Pre-roll:", ribbon))
         self._preroll_spin = QDoubleSpinBox(ribbon)
         self._preroll_spin.setRange(0.0, 5.0)
         self._preroll_spin.setSingleStep(0.5)
@@ -679,7 +706,17 @@ class TapSyncView(QWidget):
         self._preroll_spin.setSuffix(" s")
         self._preroll_spin.setFixedWidth(60)
         self._preroll_spin.valueChanged.connect(self._on_settings_changed)
-        time_r2.addWidget(self._preroll_spin)
+        time_r1.addWidget(self._preroll_spin)
+
+        self._play_on_retap_cb = QCheckBox("Play immediately on re-tap", ribbon)
+        saved_play_retap = self._settings.value("tap_play_on_retap", True, type=bool)
+        self._play_on_retap_cb.setChecked(saved_play_retap)
+        self._play_on_retap_cb.setToolTip(
+            "When checked: Back Line (←) and Re-tap Line (R) start playback immediately.\n"
+            "When unchecked: cues the playhead and pauses so you can catch your breath and press Space when ready."
+        )
+        self._play_on_retap_cb.toggled.connect(self._on_play_on_retap_toggled)
+        time_r2.addWidget(self._play_on_retap_cb)
 
         rl.addLayout(sec_time)
         rl.addWidget(_div())
@@ -737,12 +774,146 @@ class TapSyncView(QWidget):
         splitter.addWidget(right_box)
         splitter.setStretchFactor(1, 1)
 
+        # Lock / Freeze banner (shown when Tap Sync is frozen after save/import, or unlocked while editing a synced KBP)
+        self._lock_banner = QFrame(self)
+        self._lock_banner.setObjectName("tapSyncLockBanner")
+        lb_layout = QHBoxLayout(self._lock_banner)
+        lb_layout.setContentsMargins(10, 5, 10, 5)
+        lb_layout.setSpacing(10)
+        self._lock_label = QLabel("", self._lock_banner)
+        self._lock_label.setWordWrap(True)
+        lb_layout.addWidget(self._lock_label, 1)
+        self._lock_toggle_btn = QPushButton("🔓 Unfreeze Tap Sync", self._lock_banner)
+        self._lock_toggle_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._lock_toggle_btn.clicked.connect(self._toggle_lock)
+        lb_layout.addWidget(self._lock_toggle_btn)
+        self._lock_banner.setVisible(False)
+
         root.addWidget(ribbon)
+        root.addWidget(self._lock_banner)
         root.addWidget(splitter, 1)
 
     @property
     def is_syncing(self) -> bool:
         return self._is_syncing
+
+    @property
+    def is_locked(self) -> bool:
+        return self._locked
+
+    @property
+    def has_synced_project(self) -> bool:
+        return self._has_synced_project
+
+    def set_synced_project_active(self, active: bool) -> None:
+        self._has_synced_project = bool(active)
+        self._update_lock_ui()
+
+    def set_locked(self, locked: bool, reason: str = "") -> None:
+        if locked and self._is_syncing:
+            self.stop_syncing()
+        self._locked = bool(locked)
+        if reason:
+            self._lock_reason = reason
+        elif not locked:
+            self._lock_reason = ""
+        self._update_lock_ui()
+        self._sync_visuals()
+
+    def _toggle_lock(self) -> None:
+        if self._locked:
+            self.set_locked(False)
+            self.status_message.emit(
+                "Tap Sync unfrozen — select any line to re-tap, then click 'Apply to .kbp →' when done",
+                5000,
+            )
+            self.setFocus()
+        else:
+            self.set_locked(True, reason="Locked")
+            self.status_message.emit("Tap Sync locked", 3000)
+
+    def _update_lock_ui(self) -> None:
+        locked = self._locked
+        has_synced = self._has_synced_project
+
+        # Buttons that replace the current project with a different/unsynced draft are blocked whenever
+        # Tap Sync is locked OR a synced project is already open in this window.
+        allow_new_draft = (not locked) and (not has_synced)
+        blocked_tip = (
+            "A synced .kbp project is open in this window. "
+            "Use File → New Project to clear this window, or File → New Window for another song."
+        )
+        self._btn_new.setEnabled(allow_new_draft)
+        self._btn_new.setToolTip(blocked_tip if has_synced else "Start a fresh blank Tap Sync draft")
+        self._btn_load_lyr.setEnabled(allow_new_draft)
+        self._btn_load_lyr.setToolTip(
+            blocked_tip if has_synced else "Load a lyric .txt file or an unsynced LYRICSV2 .kbp file"
+        )
+        self._btn_load_draft.setEnabled(allow_new_draft)
+        self._btn_load_draft.setToolTip(
+            blocked_tip if has_synced else "Load a saved partial-sync JSON draft"
+        )
+        self._resume_btn.setEnabled(allow_new_draft)
+        self._resume_btn.setToolTip(
+            blocked_tip
+            if has_synced
+            else "Open Project Organizer — resume saved drafts, clean up old drafts, or export/import .zip bundles"
+        )
+
+        # Editing / tapping / building controls are enabled whenever unfrozen
+        can_edit = not locked
+        self._btn_paste.setEnabled(can_edit)
+        self._btn_save_draft.setEnabled(can_edit)
+        self._sync_btn.setEnabled(can_edit and not self._is_syncing)
+        self._pause_btn.setEnabled(can_edit and self._is_syncing)
+        self._btn_back_line.setEnabled(can_edit)
+        self._btn_retap.setEnabled(can_edit)
+        self._btn_end_phrase.setEnabled(can_edit)
+        self._btn_undo_tap.setEnabled(can_edit)
+        self._btn_clear_line.setEnabled(can_edit)
+        self._btn_clear_all.setEnabled(can_edit)
+        self._tpl_btn.setEnabled(can_edit)
+        self._build_btn.setEnabled(can_edit)
+
+        if has_synced:
+            self._build_btn.setText("Apply to .kbp →")
+            self._build_btn.setToolTip("Apply your re-tapped timings back to the open .kbp project in Lyrics Wiping")
+        else:
+            self._build_btn.setText("Build .kbp →")
+            self._build_btn.setToolTip("Build a .kbp project from your tapped lyrics and open it in Lyrics Wiping")
+
+        if locked:
+            reason_txt = f" ({self._lock_reason})" if self._lock_reason else ""
+            self._lock_banner.setStyleSheet(
+                "QFrame#tapSyncLockBanner { background-color: #2c2416; border: 1px solid #92600e; border-radius: 4px; }"
+                "QLabel { color: #fde68a; font-size: 11px; }"
+            )
+            self._lock_label.setText(
+                f"<b>🔒 Tap Sync is frozen{reason_txt}.</b>  "
+                "You can click lines, scrub the waveform, and press Space to play/pause. "
+                "Click <b>Unfreeze Tap Sync</b> to re-tap or modify timings."
+            )
+            self._lock_toggle_btn.setText("🔓 Unfreeze Tap Sync")
+            self._lock_toggle_btn.setStyleSheet(
+                "background-color: #b45309; color: white; font-weight: bold; padding: 3px 12px;"
+            )
+            self._lock_banner.setVisible(True)
+        elif has_synced:
+            self._lock_banner.setStyleSheet(
+                "QFrame#tapSyncLockBanner { background-color: #172536; border: 1px solid #2563eb; border-radius: 4px; }"
+                "QLabel { color: #bfdbfe; font-size: 11px; }"
+            )
+            self._lock_label.setText(
+                "<b>🔓 Tap Sync unlocked for editing.</b>  "
+                "Re-tap any line (R) or section, then click <b>Apply to .kbp →</b> to update Lyrics Wiping &amp; Display."
+            )
+            self._lock_toggle_btn.setText("🔒 Re-lock Tap Sync")
+            self._lock_toggle_btn.setStyleSheet(
+                "background-color: #334155; color: #e2e8f0; font-weight: bold; padding: 3px 12px;"
+            )
+            self._lock_banner.setVisible(True)
+        else:
+            self._lock_banner.setVisible(False)
 
     def set_playhead_cs(self, cs: float) -> None:
         self._waveform.playhead_cs = cs
@@ -753,6 +924,16 @@ class TapSyncView(QWidget):
         span_cs = max(50.0, self._waveform.width() / max(1e-6, self._waveform.px_per_cs))
         return (left_cs, span_cs)
 
+    def zoom(self, factor: float) -> None:
+        self._waveform.px_per_cs = max(0.5, min(10.0, self._waveform.px_per_cs * factor))
+        self._waveform.invalidate_cache()
+        self._waveform.update()
+
+    def reset_zoom(self) -> None:
+        self._waveform.px_per_cs = 2.4
+        self._waveform.invalidate_cache()
+        self._waveform.update()
+
     def on_waveform_loaded(self) -> None:
         if self.audio.main_path:
             self.draft.audio_path = str(self.audio.main_path)
@@ -761,13 +942,35 @@ class TapSyncView(QWidget):
         self._waveform.invalidate_cache()
         self._waveform.update()
 
+    def load_synced_project(
+        self,
+        proj: KbpProject,
+        audio_path: str = "",
+        vocal_path: str = "",
+        locked: bool = True,
+        reason: str = "Synced .kbp imported",
+    ) -> None:
+        """Populate Tap Sync from an open synced KbpProject and freeze it by default."""
+        draft = TapSyncDraft.from_kbp_project(proj, audio_path=audio_path, vocal_path=vocal_path)
+        draft.latency_enabled = self._settings.value("tap_latency_enabled", True, type=bool)
+        draft.latency_cs = self._settings.value("tap_latency_cs", 4, type=int)
+        draft.pre_roll_cs = self._settings.value("tap_pre_roll_cs", 150, type=int)
+        self._draft_file_path = None
+        self._has_synced_project = True
+        self._apply_draft(draft, load_audio=False)
+        self.set_locked(locked, reason=reason)
+
     def load_unsynced_kbp(self, path: str | Path) -> bool:
         try:
             draft = TapSyncDraft.from_kbp_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Import Failed", f"Could not parse KBP file:\n{exc}")
             return False
+        self._has_synced_project = False
+        self._locked = False
+        self._lock_reason = ""
         audio_ok = self._apply_draft(draft, load_audio=True)
+        self._update_lock_ui()
         msg = f"Loaded lyrics from {Path(path).name} ({draft.total_syllables()} syllables)"
         if audio_ok and draft.audio_path:
             msg += f" — main audio: {Path(draft.audio_path).name}"
@@ -779,6 +982,9 @@ class TapSyncView(QWidget):
     def archive_current_draft(self) -> Optional[Path]:
         """Save the current Tap Sync draft in the background archive so it can be reopened later."""
         if not self.draft.pages:
+            return None
+        # Don't clutter the unsynced drafts organizer with untouched synced .kbp imports
+        if self._has_synced_project and self._locked:
             return None
         if self.audio.main_path:
             self.draft.audio_path = str(self.audio.main_path)
@@ -796,16 +1002,20 @@ class TapSyncView(QWidget):
         """Archive the outgoing draft in the background, then start a clean empty draft."""
         self.archive_current_draft()
         fresh = TapSyncDraft()
-        saved_tpl = self._settings.value("default_template_kbp", "", type=str)
-        if saved_tpl and Path(saved_tpl).exists():
-            fresh.template_kbp_path = saved_tpl
+        self._apply_saved_defaults_to_draft(fresh)
         self._draft_file_path = None
+        self._has_synced_project = False
+        self._locked = False
+        self._lock_reason = ""
         self._apply_draft(fresh, load_audio=False)
+        self._update_lock_ui()
 
     def _refresh_resume_btn(self) -> None:
         pass
 
     def open_project_organizer(self) -> None:
+        if self._locked or self._has_synced_project:
+            return
         self.archive_current_draft()
         dlg = ProjectOrganizerDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_draft_path is not None:
@@ -868,8 +1078,18 @@ class TapSyncView(QWidget):
         self.draft.latency_enabled = self._latency_cb.isChecked()
         self.draft.latency_cs = self._latency_spin.value()
         self.draft.pre_roll_cs = int(round(self._preroll_spin.value() * 100))
+        self._settings.setValue("tap_latency_enabled", self.draft.latency_enabled)
+        self._settings.setValue("tap_latency_cs", self.draft.latency_cs)
+        self._settings.setValue("tap_pre_roll_cs", self.draft.pre_roll_cs)
+        self._settings.sync()
+
+    def _on_play_on_retap_toggled(self, checked: bool) -> None:
+        self._settings.setValue("tap_play_on_retap", bool(checked))
+        self._settings.sync()
 
     def _open_lyrics_editor(self) -> None:
+        if self._locked:
+            return
         dlg = _LyricsInputDialog(self.draft, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -888,6 +1108,8 @@ class TapSyncView(QWidget):
         self.setFocus()
 
     def _load_lyrics_or_kbp_dialog(self) -> None:
+        if self._locked or self._has_synced_project:
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load Lyrics or Unsynced KBP",
@@ -929,6 +1151,8 @@ class TapSyncView(QWidget):
         self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
 
     def _load_draft_dialog(self) -> None:
+        if self._locked or self._has_synced_project:
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Load Tap Sync Draft", "", "Tap Sync Draft (*.kbsync.json *.json);;All Files (*.*)")
         if not path:
             return
@@ -1058,6 +1282,7 @@ class TapSyncView(QWidget):
         self._teleprompter.cursor = self._cursor
         self._teleprompter.open_coord = self._open_coord
         self._teleprompter.is_syncing = self._is_syncing
+        self._teleprompter.is_locked = self._locked
         self._teleprompter.punch_line = self._punch_line
         self._teleprompter.update()
         self._waveform.update()
@@ -1126,12 +1351,20 @@ class TapSyncView(QWidget):
         return None
 
     def start_syncing(self, punch_line: Optional[Tuple[int, int]] = None, seek_cs: Optional[float] = None) -> None:
-        if not self.draft.pages:
+        if self._locked or not self.draft.pages:
             return
         if self._cursor is None:
             self._cursor = self.draft.first_unsynced_coord() or (0, 0, 0)
+        if punch_line is None and self._pending_punch_line is not None:
+            punch_line = self._pending_punch_line
+        if seek_cs is None and self._pending_seek_cs is not None:
+            seek_cs = self._pending_seek_cs
+        self._pending_punch_line = None
+        self._pending_seek_cs = None
+
         self._punch_line = punch_line
         self._open_coord = None
+        self._last_released_coord = None
         self._space_held_coord = None
         self._is_syncing = True
         self._sync_btn.setEnabled(False)
@@ -1179,6 +1412,8 @@ class TapSyncView(QWidget):
             self.start_syncing()
 
     def start_retap_selected_line(self) -> None:
+        if self._locked:
+            return
         coord = self._selected_line_coord()
         if coord is None:
             return
@@ -1194,9 +1429,100 @@ class TapSyncView(QWidget):
             seek_cs = float(max(0, old_start - self.draft.pre_roll_cs))
         else:
             seek_cs = self._pre_roll_start_for((p_i, l_i, 0))
-        self.start_syncing(punch_line=(p_i, l_i), seek_cs=seek_cs)
+
+        if self._play_on_retap_cb.isChecked():
+            self.start_syncing(punch_line=(p_i, l_i), seek_cs=seek_cs)
+        else:
+            if self._is_syncing:
+                self.stop_syncing()
+            self._pending_punch_line = (p_i, l_i)
+            self._pending_seek_cs = seek_cs
+            if seek_cs is not None:
+                self.audio.set_position_cs(seek_cs, scrub_audio=False)
+                self._waveform.playhead_cs = seek_cs
+            self._autosave()
+            self._sync_visuals()
+            self.status_message.emit(f"Cued re-tap for P{p_i + 1} L{l_i + 1} — press Space when ready", 3500)
+            self.setFocus()
+
+    def restart_or_back_line(self) -> None:
+        """
+        KBS-style Back / Restart Line (Left Arrow):
+        - If the current line has any tapped syllables, erases this line and all subsequent lines.
+        - If already at the start of an unsynced line (or pressed repeatedly), steps back to the
+          previous line and erases it and all subsequent lines.
+        - Rewinds to the end of the previous synced line (minus pre-roll) and either plays
+          immediately or pauses depending on 'Play immediately on re-tap'.
+        """
+        if self._locked:
+            return
+        flat_lines = self.draft.flat_lines()
+        if not flat_lines:
+            return
+
+        focus = self._cursor or self._open_coord
+        cur_idx = len(flat_lines) - 1
+        if focus is not None:
+            for i, (p_i, l_i, _) in enumerate(flat_lines):
+                if (p_i, l_i) == (focus[0], focus[1]):
+                    cur_idx = i
+                    break
+        else:
+            sel = self._selected_line_coord()
+            if sel is not None:
+                for i, (p_i, l_i, _) in enumerate(flat_lines):
+                    if (p_i, l_i) == sel:
+                        cur_idx = i
+                        break
+
+        cur_line = flat_lines[cur_idx][2]
+        line_has_progress = (cur_line.first_start_cs is not None) or (
+            self._open_coord is not None and (self._open_coord[0], self._open_coord[1]) == (flat_lines[cur_idx][0], flat_lines[cur_idx][1])
+        )
+        if line_has_progress:
+            target_idx = cur_idx
+        else:
+            target_idx = max(0, cur_idx - 1)
+
+        # Erase target line and everything subsequent so continuous resyncing stays clean
+        for i in range(target_idx, len(flat_lines)):
+            p_i, l_i, ln = flat_lines[i]
+            ln.clear_timing()
+            self._update_tree_line(p_i, l_i)
+
+        tp, tl, _ = flat_lines[target_idx]
+        self._cursor = (tp, tl, 0)
+        self._open_coord = None
+        self._last_released_coord = None
+        self._space_held_coord = None
+        self._punch_line = None
+        self._pending_punch_line = None
+
+        # Find end of the previous synced line
+        prev_end: Optional[int] = None
+        for i in range(target_idx - 1, -1, -1):
+            end_val = flat_lines[i][2].last_end_cs
+            if end_val is not None:
+                prev_end = end_val
+                break
+        seek_cs = float(max(0, prev_end - self.draft.pre_roll_cs)) if prev_end is not None else 0.0
+
+        if self._play_on_retap_cb.isChecked():
+            self.start_syncing(punch_line=None, seek_cs=seek_cs)
+        else:
+            if self._is_syncing:
+                self.stop_syncing()
+            self._pending_seek_cs = seek_cs
+            self.audio.set_position_cs(seek_cs, scrub_audio=False)
+            self._waveform.playhead_cs = seek_cs
+            self._autosave()
+            self._sync_visuals()
+            self.status_message.emit(f"Cued P{tp + 1} L{tl + 1} from previous line end — press Space when ready", 3500)
+            self.setFocus()
 
     def _clear_selected_line(self) -> None:
+        if self._locked:
+            return
         coord = self._selected_line_coord()
         if coord is None:
             return
@@ -1210,7 +1536,7 @@ class TapSyncView(QWidget):
         self._sync_visuals()
 
     def _clear_all_syncs(self) -> None:
-        if not self.draft.pages:
+        if self._locked or not self.draft.pages:
             return
         reply = QMessageBox.question(
             self,
@@ -1318,6 +1644,8 @@ class TapSyncView(QWidget):
             self._build_kbp()
 
     def _undo_last_tap(self) -> None:
+        if self._locked:
+            return
         target = self._open_coord
         if target is None and self._cursor is not None:
             target = self._prev_coord(self._cursor)
@@ -1338,6 +1666,8 @@ class TapSyncView(QWidget):
         self._sync_visuals()
 
     def _build_kbp(self) -> None:
+        if self._locked:
+            return
         if not self.draft.pages:
             QMessageBox.information(self, "No Lyrics", "Paste or load lyrics before building a .kbp project.")
             return
@@ -1370,6 +1700,13 @@ class TapSyncView(QWidget):
             event.accept()
             return
         key = event.key()
+        if self._locked:
+            if key == Qt.Key.Key_Space:
+                self.audio.toggle_play()
+                event.accept()
+                return
+            super().keyPressEvent(event)
+            return
         if key == Qt.Key.Key_Space:
             if self._is_syncing:
                 self._tap_next_syllable()
@@ -1381,7 +1718,13 @@ class TapSyncView(QWidget):
             self._end_current_phrase()
             event.accept()
             return
-        if key == Qt.Key.Key_Backspace:
+        if key == Qt.Key.Key_Left:
+            self.restart_or_back_line()
+            event.accept()
+            return
+        if key == Qt.Key.Key_Backspace or (
+            key == Qt.Key.Key_Z and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        ):
             self._undo_last_tap()
             event.accept()
             return

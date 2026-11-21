@@ -300,6 +300,40 @@ class TapSyncDraft:
         return cls(pages=pages)
 
     @classmethod
+    def from_kbp_project(
+        cls,
+        proj: KbpProject,
+        audio_path: str = "",
+        vocal_path: str = "",
+    ) -> "TapSyncDraft":
+        """Build a TapSyncDraft directly from an in-memory synced KbpProject, preserving timings and header."""
+        pages: List[TapPage] = []
+        for page in proj.pages:
+            t_lines: List[TapLine] = []
+            for line in page.lines:
+                t_syls = [TapSyllable(text=s.text, start_cs=s.start, end_cs=s.end) for s in line.syllables]
+                if t_syls:
+                    t_lines.append(TapLine(syllables=t_syls, style=line.style, align=line.align))
+            if t_lines:
+                pages.append(TapPage(lines=t_lines))
+
+        resolved_audio = audio_path
+        if not resolved_audio and proj.header.audio_path:
+            if proj.source_path is not None:
+                resolved_audio = cls._resolve_audio_path(proj.header.audio_path, proj.source_path.parent)
+            else:
+                resolved_audio = proj.header.audio_path
+
+        return cls(
+            pages=pages,
+            title=proj.header.title,
+            artist=proj.header.artist,
+            audio_path=resolved_audio,
+            vocal_path=vocal_path,
+            raw_header_lines=list(proj.header.raw_lines),
+        )
+
+    @classmethod
     def from_kbp_file(cls, path: str | Path) -> "TapSyncDraft":
         """
         Parse an unsynced KBP file (LYRICSV2) or a synced KBP file (PAGEV2) into a TapSyncDraft,
@@ -336,22 +370,7 @@ class TapSyncDraft:
 
         # Fallback: synced PAGEV2 .kbp — import its syllables & existing timings!
         proj = KbpProject.load(p)
-        pages: List[TapPage] = []
-        for page in proj.pages:
-            t_lines: List[TapLine] = []
-            for line in page.lines:
-                t_syls = [TapSyllable(text=s.text, start_cs=s.start, end_cs=s.end) for s in line.syllables]
-                if t_syls:
-                    t_lines.append(TapLine(syllables=t_syls, style=line.style, align=line.align))
-            if t_lines:
-                pages.append(TapPage(lines=t_lines))
-        return cls(
-            pages=pages,
-            title=proj.header.title,
-            artist=proj.header.artist,
-            audio_path=cls._resolve_audio_path(proj.header.audio_path, p.parent),
-            raw_header_lines=list(proj.header.raw_lines),
-        )
+        return cls.from_kbp_project(proj)
 
     @staticmethod
     def _resolve_audio_path(raw_audio: str, kbp_dir: Path) -> str:

@@ -192,15 +192,27 @@ def test_duplicate_line_and_page_assigns_b_and_c_styles():
     assert dup_l2 is not None
     assert dup_l2.style == "C"
 
+    # Duplicating that [C] line advances to [D], [E], [F], then wraps to [A]
+    dup_l3 = proj.duplicate_line(0, 2)
+    assert dup_l3 is not None and dup_l3.style == "D"
+    dup_l4 = proj.duplicate_line(0, 3)
+    assert dup_l4 is not None and dup_l4.style == "E"
+    dup_l5 = proj.duplicate_line(0, 4)
+    assert dup_l5 is not None and dup_l5.style == "F"
+    dup_l6 = proj.duplicate_line(0, 5)
+    assert dup_l6 is not None and dup_l6.style == "A"
+
     # Duplicating Page 2 ([A]) with pick_duplicate_style produces [B]
     style_b = proj.pick_duplicate_style(proj.pages[1].lines)
     assert style_b == "B"
     new_p = proj.duplicate_page(page_number=2, target_style=style_b)
     assert all(ln.style == "B" for ln in new_p.lines)
 
-    # Duplicating the new [B] page picks [C]
+    # Duplicating the new [B] page picks [C], and a [C] page picks [D]
     style_c = proj.pick_duplicate_style(new_p.lines)
     assert style_c == "C"
+    new_p_c = proj.duplicate_page(page_number=3, target_style=style_c)
+    assert proj.pick_duplicate_style(new_p_c.lines) == "D"
 
     # In-place page duplication keeps exact same timestamps for dragging
     src_start = proj.pages[0].first_syl_start

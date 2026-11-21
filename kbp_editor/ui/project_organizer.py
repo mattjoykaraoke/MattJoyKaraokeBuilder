@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -64,9 +64,11 @@ class ProjectOrganizerDialog(QDialog):
         self._table.cellDoubleClicked.connect(lambda _r, _c: self._open_selected())
         root.addWidget(self._table, 1)
 
+        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
         row_bundle = QHBoxLayout()
-        self._inc_audio_cb = QCheckBox("Include main audio & vocal stem when exporting .zip bundle", self)
-        self._inc_audio_cb.setChecked(True)
+        self._inc_audio_cb = QCheckBox("Include main audio && vocal stem when exporting .zip bundle", self)
+        self._inc_audio_cb.setChecked(self._settings.value("bundle_include_audio", True, type=bool))
+        self._inc_audio_cb.toggled.connect(self._on_inc_audio_toggled)
         row_bundle.addWidget(self._inc_audio_cb)
         row_bundle.addStretch()
         root.addLayout(row_bundle)
@@ -109,6 +111,10 @@ class ProjectOrganizerDialog(QDialog):
         root.addLayout(btns)
 
         self._refresh_table()
+
+    def _on_inc_audio_toggled(self, checked: bool) -> None:
+        self._settings.setValue("bundle_include_audio", bool(checked))
+        self._settings.sync()
 
     def _refresh_table(self) -> None:
         self._entries = list_archived_drafts(self._drafts_dir)

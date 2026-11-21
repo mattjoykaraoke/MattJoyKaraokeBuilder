@@ -163,3 +163,127 @@ def test_export_and_import_portable_project_bundle(tmp_path):
     assert imported.pages[0].lines[0].syllables[0].start_cs == 100
     assert Path(imported.audio_path).is_file() and Path(imported.audio_path).read_bytes() == b"FAKE_MAIN_AUDIO"
     assert Path(imported.vocal_path).is_file() and Path(imported.vocal_path).read_bytes() == b"FAKE_VOCAL_AUDIO"
+
+
+def _write_synced_kbp(path: Path, title: str = "Synced Song") -> Path:
+    path.write_bytes(
+        "\r\n".join([
+            "-----------------------------",
+            "KARAOKE BUILDER STUDIO",
+            "HEADERV2",
+            "'Palette Colours (0-15)",
+            "  055,FFF,000,E70,940",
+            "  Style00,Default,1,2,3,4",
+            "    Arial,12,B,0",
+            "    2,2,2,2,0,0,0,L",
+            "  StyleEnd",
+            f"Title     {title}",
+            "Artist    Synced Band",
+            "Audio     ",
+            "-----------------------------",
+            "PAGEV2",
+            "C/A/100/400/0/0/0",
+            "Hel/ 150/200/0",
+            "lo/ 200/280/0",
+            "world/ 280/360/0",
+            "",
+        ]).encode("utf-8")
+    )
+    return path
+
+
+def _write_unsynced_kbp(path: Path, title: str = "Unsynced Song") -> Path:
+    path.write_bytes(
+        "\r\n".join([
+            "-----------------------------",
+            "KARAOKE BUILDER STUDIO",
+            "HEADERV2",
+            "'Palette Colours (0-15)",
+            "  055,FFF,000,E70,940",
+            "  Style00,Default,1,2,3,4",
+            "    Arial,12,B,0",
+            "    2,2,2,2,0,0,0,L",
+            "  StyleEnd",
+            f"Title     {title}",
+            "Artist    Unsynced Band",
+            "Audio     ",
+            "-----------------------------",
+            "LYRICSV2",
+            "Other/ song lyr/ics",
+            "-----------------------------",
+            "",
+        ]).encode("utf-8")
+    )
+    return path
+
+
+def test_from_kbp_project_preserves_timings_and_header(tmp_path):
+    kbp_path = _write_synced_kbp(tmp_path / "synced.kbp")
+    proj = KbpProject.load(kbp_path)
+    draft = TapSyncDraft.from_kbp_project(proj)
+    assert draft.title == "Synced Song"
+    assert draft.artist == "Synced Band"
+    assert draft.total_syllables() == 3
+    assert draft.synced_syllables() == 3
+    assert draft.pages[0].lines[0].syllables[0].start_cs == 150
+    assert draft.pages[0].lines[0].syllables[2].end_cs == 360
+    assert draft.raw_header_lines is not None
+
+
+def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from kbp_editor.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    synced_path = _write_synced_kbp(tmp_path / "synced.kbp")
+    unsynced_path = _write_unsynced_kbp(tmp_path / "unsynced.kbp")
+
+    win = MainWindow()
+    try:
+        win.open_kbp(synced_path)
+        assert win.project is not None
+        assert win.tap_sync_view.is_locked is True
+        assert win.tap_sync_view.has_synced_project is True
+        assert win.tap_sync_view.draft.title == "Synced Song"
+        assert win.tap_sync_view.draft.synced_syllables() == 3
+        assert win.tap_sync_view._sync_btn.isEnabled() is False
+        assert win.tap_sync_view._btn_load_lyr.isEnabled() is False
+
+        # Attempting to open an unsynced .kbp in the same instance must be blocked
+        blocked_calls = []
+        monkeypatch.setattr(
+            win,
+            "_warn_synced_project_blocks_unsynced",
+            lambda target, kind="": blocked_calls.append((target, kind)),
+        )
+        win.open_kbp(unsynced_path)
+        assert len(blocked_calls) == 1
+        assert win.tap_sync_view.draft.title == "Synced Song"
+        assert win.project.header.title == "Synced Song"
+
+        # Unfreezing allows re-tapping the synced project while still blocking loading another unsynced draft
+        win.tap_sync_view.set_locked(False)
+        assert win.tap_sync_view.is_locked is False
+        assert win.tap_sync_view._sync_btn.isEnabled() is True
+        assert win.tap_sync_view._btn_retap.isEnabled() is True
+        assert win.tap_sync_view._build_btn.isEnabled() is True
+        assert win.tap_sync_view._btn_load_lyr.isEnabled() is False
+        assert win.tap_sync_view._btn_load_draft.isEnabled() is False
+        assert win.tap_sync_view._resume_btn.isEnabled() is False
+
+        # Saving re-locks Tap Sync
+        win.save_kbp()
+        assert win.tap_sync_view.is_locked is True
+
+        # Starting a fresh project clears synced project and unlocks Tap Sync
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **kw: QMessageBox.StandardButton.Yes)
+        win.new_project()
+        assert win.project is None
+        assert win.tap_sync_view.is_locked is False
+        assert win.tap_sync_view.has_synced_project is False
+        assert win.tap_sync_view._btn_load_lyr.isEnabled() is True
+    finally:
+        win.close()
+        app.processEvents()

@@ -975,11 +975,19 @@ class KbpProject:
         return True
 
     def pick_duplicate_style(self, lines: Sequence[Line]) -> str:
-        """Pick [B] for duplicated [A] tracks, or [C] if [B] is already in use."""
-        styles = {ln.style for ln in lines}
-        if "B" in styles:
-            return "C"
-        return "B"
+        """Pick the next style letter after the highest style in ``lines`` (A→B→C→D→E→F→A)."""
+        letters = ["A", "B", "C", "D", "E", "F"]
+        for k in sorted(self.header.styles.keys()):
+            ku = k.upper()
+            if ku not in letters:
+                letters.append(ku)
+        if not lines:
+            return "B"
+        used = {(ln.style or "A").upper() for ln in lines}
+        indices = [letters.index(st) for st in used if st in letters]
+        if not indices:
+            return "B"
+        return letters[(max(indices) + 1) % len(letters)]
 
     def duplicate_line(
         self,
@@ -988,7 +996,7 @@ class KbpProject:
         target_style: Optional[str] = None,
         shift_cs: int = 0,
     ) -> Optional[Line]:
-        """Duplicate a single line on the same page, assigning style [B]/[C] by default."""
+        """Duplicate a single line on the same page, advancing to the next style by default."""
         if not (0 <= page_idx < len(self.pages)):
             return None
         page = self.pages[page_idx]

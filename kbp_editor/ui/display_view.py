@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QLineF, QRectF, Signal
+from PySide6.QtCore import QSettings, Qt, QLineF, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -456,6 +456,7 @@ class DisplayRemoveView(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.project: Optional[KbpProject] = None
+        self._settings = QSettings("MattJoy", "AdvancedKBPEditor")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
@@ -463,17 +464,20 @@ class DisplayRemoveView(QWidget):
 
         bar1 = QHBoxLayout()
         self._page_disp_cb = QCheckBox("Page Display")
+        self._page_disp_cb.setChecked(self._settings.value("display_page_display", False, type=bool))
         self._page_disp_cb.setToolTip("Drag one left handle to move display_start for the entire page")
         self._page_disp_cb.toggled.connect(self._on_modes_changed)
         bar1.addWidget(self._page_disp_cb)
 
         self._page_rem_cb = QCheckBox("Page Removal")
+        self._page_rem_cb.setChecked(self._settings.value("display_page_removal", False, type=bool))
         self._page_rem_cb.setToolTip("Drag one right handle to move display_end for the entire page")
         self._page_rem_cb.toggled.connect(self._on_modes_changed)
         bar1.addWidget(self._page_rem_cb)
 
         self._follow_cb = QCheckBox("Follow Playhead")
-        self._follow_cb.setChecked(True)
+        self._follow_cb.setChecked(self._settings.value("display_follow_playhead", True, type=bool))
+        self._follow_cb.toggled.connect(self._on_display_prefs_changed)
         bar1.addWidget(self._follow_cb)
 
         self._auto_reset_cb = QCheckBox("Auto Reset Display")
@@ -508,16 +512,18 @@ class DisplayRemoveView(QWidget):
         bar2.addWidget(QLabel("➣➣➣ Lead-in (cs):"))
         self._opt_lead_spin = QSpinBox()
         self._opt_lead_spin.setRange(0, 300)
-        self._opt_lead_spin.setValue(DEFAULT_OPTIMIZED_LEAD_IN_CS)
+        self._opt_lead_spin.setValue(self._settings.value("display_opt_lead_in_cs", DEFAULT_OPTIMIZED_LEAD_IN_CS, type=int))
         self._opt_lead_spin.setFixedWidth(64)
+        self._opt_lead_spin.valueChanged.connect(self._on_display_prefs_changed)
         bar2.addWidget(self._opt_lead_spin)
 
         bar2.addWidget(QLabel("Gap ≥ (cs):"))
         self._gap_spin = QSpinBox()
         self._gap_spin.setRange(50, 2000)
         self._gap_spin.setSingleStep(50)
-        self._gap_spin.setValue(DEFAULT_GAP_THRESHOLD_CS)
+        self._gap_spin.setValue(self._settings.value("display_gap_threshold_cs", DEFAULT_GAP_THRESHOLD_CS, type=int))
         self._gap_spin.setFixedWidth(70)
+        self._gap_spin.valueChanged.connect(self._on_display_prefs_changed)
         bar2.addWidget(self._gap_spin)
 
         btn_opt_page = QPushButton("Optimize Page")
@@ -531,6 +537,8 @@ class DisplayRemoveView(QWidget):
         bar2.addStretch()
 
         self.canvas = _DisplayTimelineCanvas(self)
+        self.canvas.page_display_mode = self._page_disp_cb.isChecked()
+        self.canvas.page_removal_mode = self._page_rem_cb.isChecked()
         self.canvas.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
         self.canvas.selection_changed.connect(self.selection_changed.emit)
         self.canvas.project_mutated.connect(self.project_mutated.emit)
@@ -612,6 +620,15 @@ class DisplayRemoveView(QWidget):
     def _on_modes_changed(self) -> None:
         self.canvas.page_display_mode = self._page_disp_cb.isChecked()
         self.canvas.page_removal_mode = self._page_rem_cb.isChecked()
+        self._settings.setValue("display_page_display", self.canvas.page_display_mode)
+        self._settings.setValue("display_page_removal", self.canvas.page_removal_mode)
+        self._settings.sync()
+
+    def _on_display_prefs_changed(self) -> None:
+        self._settings.setValue("display_follow_playhead", self._follow_cb.isChecked())
+        self._settings.setValue("display_opt_lead_in_cs", self._opt_lead_spin.value())
+        self._settings.setValue("display_gap_threshold_cs", self._gap_spin.value())
+        self._settings.sync()
 
     def _on_hscroll(self, value: int) -> None:
         self.canvas.set_scroll_x_cs(float(value))

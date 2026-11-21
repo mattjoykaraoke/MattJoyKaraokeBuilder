@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QProcess, QSettings, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -103,12 +104,32 @@ class MainWindow(QMainWindow):
         saved_auto_reset = self._settings.value("auto_reset_display", True, type=bool)
         self.wiping_view.set_auto_reset_display(saved_auto_reset)
         self.display_view.set_auto_reset_display(saved_auto_reset)
+        saved_scrub = self._settings.value("scrub_audio_enabled", False, type=bool)
+        self._scrub_audio_cb.blockSignals(True)
+        self._scrub_audio_cb.setChecked(saved_scrub)
+        self._scrub_audio_cb.blockSignals(False)
+        self.audio.set_scrub_audio_enabled(saved_scrub)
+        saved_speed = self._settings.value("playback_speed", "100%", type=str)
+        if saved_speed in ("50%", "75%", "100%"):
+            self._speed_combo.setCurrentText(saved_speed)
+        self._preview_user_enabled = self._settings.value("preview_visible", True, type=bool)
+        self._preview_btn.blockSignals(True)
+        self._preview_btn.setChecked(self._preview_user_enabled)
+        self._preview_btn.blockSignals(False)
         self._build_menus()
+        self._act_preview.blockSignals(True)
+        self._act_preview.setChecked(self._preview_user_enabled)
+        self._act_preview.blockSignals(False)
         self._wire_signals()
         self._refresh_actions()
 
         if initial_file:
-            self.open_kbp(initial_file)
+            p_init = Path(initial_file)
+            if p_init.suffix.lower() == ".json":
+                if self.tap_sync_view.load_draft_file(p_init):
+                    self._tabs.setCurrentWidget(self.tap_sync_view)
+            else:
+                self.open_kbp(initial_file)
 
     def _rebuild_page_buttons(self) -> None:
         while self._page_bar_layout.count():
@@ -204,6 +225,8 @@ class MainWindow(QMainWindow):
                 self.wiping_view.exit_word_adjust_mode()
             if self.preview_win.isVisible():
                 self.preview_win.hide()
+            if self.project is not None and self.tap_sync_view.is_locked:
+                self._sync_tap_view_from_project(locked=True)
             self.tap_sync_view.set_playhead_cs(cs)
             self.minimap.set_viewport(*self.tap_sync_view.viewport_window_cs())
             self.tap_sync_view.setFocus()
@@ -259,7 +282,7 @@ class MainWindow(QMainWindow):
         self._scrub_audio_cb = QCheckBox("Scrub Audio")
         self._scrub_audio_cb.setChecked(False)
         self._scrub_audio_cb.setToolTip("Hear short audio snippets while dragging the playhead")
-        self._scrub_audio_cb.toggled.connect(self.audio.set_scrub_audio_enabled)
+        self._scrub_audio_cb.toggled.connect(self._on_scrub_audio_toggled)
         layout.addWidget(self._scrub_audio_cb)
 
         layout.addSpacing(12)
@@ -295,6 +318,11 @@ class MainWindow(QMainWindow):
         act_new.triggered.connect(self.new_project)
         m_file.addAction(act_new)
 
+        act_new_win = QAction("New &Window", self)
+        act_new_win.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        act_new_win.triggered.connect(lambda: self._launch_new_window())
+        m_file.addAction(act_new_win)
+
         act_open = QAction("&Open .kbp…", self)
         act_open.setShortcut(QKeySequence.StandardKey.Open)
         act_open.triggered.connect(self._open_dialog)
@@ -303,7 +331,7 @@ class MainWindow(QMainWindow):
         self._recent_menu = m_file.addMenu("Open &Recent Project")
         self._rebuild_recent_menu()
 
-        act_organizer = QAction("&Project Organizer (Drafts & Bundles)…", self)
+        act_organizer = QAction("&Project Organizer (Drafts && Bundles)…", self)
         act_organizer.triggered.connect(self._open_project_organizer)
         m_file.addAction(act_organizer)
 
@@ -355,14 +383,16 @@ class MainWindow(QMainWindow):
         act_shift_page.triggered.connect(self._shift_selected_page)
         m_edit.addAction(act_shift_page)
 
-        act_dup_line = QAction("Duplicate Selected &Line ([B]/[C])", self)
-        act_dup_line.triggered.connect(self.wiping_view._duplicate_selected_line)
-        m_edit.addAction(act_dup_line)
+        self._act_dup_line = QAction("Duplicate Selected &Line (Next Style)", self)
+        self._act_dup_line.triggered.connect(self.wiping_view._duplicate_selected_line)
+        m_edit.addAction(self._act_dup_line)
 
-        act_dup_page = QAction("&Duplicate Selected Page ([B]/[C])", self)
-        act_dup_page.setShortcut(QKeySequence("Ctrl+D"))
-        act_dup_page.triggered.connect(self.wiping_view._duplicate_selected_page)
-        m_edit.addAction(act_dup_page)
+        self._act_dup_page = QAction("&Duplicate Selected Page (Next Style)", self)
+        self._act_dup_page.setShortcut(QKeySequence("Ctrl+D"))
+        self._act_dup_page.triggered.connect(self.wiping_view._duplicate_selected_page)
+        m_edit.addAction(self._act_dup_page)
+
+        m_edit.aboutToShow.connect(self._update_edit_menu_labels)
 
         m_edit.addSeparator()
         self._act_word_adjust = QAction("&Word Adjust Mode (Enter)", self)
@@ -434,11 +464,18 @@ class MainWindow(QMainWindow):
 
     def _on_auto_reset_display_changed(self, enabled: bool) -> None:
         self._settings.setValue("auto_reset_display", bool(enabled))
+        self._settings.sync()
         self.wiping_view.set_auto_reset_display(enabled)
         self.display_view.set_auto_reset_display(enabled)
         if enabled and self.project is not None:
             self.project.optimize_windows()
             self._on_project_mutated("Auto Reset Display (with ➣➣➣ Optimization)")
+
+    def _on_scrub_audio_toggled(self, enabled: bool) -> None:
+        self.audio.set_scrub_audio_enabled(enabled)
+        if hasattr(self, "_settings"):
+            self._settings.setValue("scrub_audio_enabled", bool(enabled))
+            self._settings.sync()
 
     def _on_waveform_loaded(self) -> None:
         self.wiping_view.canvas.invalidate_wave_cache()
@@ -485,16 +522,27 @@ class MainWindow(QMainWindow):
     def _on_speed_changed(self, text: str) -> None:
         rate = {"50%": 0.5, "75%": 0.75, "100%": 1.0}.get(text, 1.0)
         self.audio.set_playback_rate(rate)
+        if hasattr(self, "_settings"):
+            self._settings.setValue("playback_speed", text)
+            self._settings.sync()
 
     def _zoom_active(self, factor: float) -> None:
-        if self._tabs.currentWidget() is self.display_view:
+        cur = self._tabs.currentWidget()
+        if cur is self.display_view:
             self.display_view.zoom(factor)
+        elif cur is self.tap_sync_view:
+            self.tap_sync_view.zoom(factor)
+            self.minimap.set_viewport(*self.tap_sync_view.viewport_window_cs())
         else:
             self.wiping_view.zoom(factor)
 
     def _reset_zoom_active(self) -> None:
-        if self._tabs.currentWidget() is self.display_view:
+        cur = self._tabs.currentWidget()
+        if cur is self.display_view:
             self.display_view.reset_zoom()
+        elif cur is self.tap_sync_view:
+            self.tap_sync_view.reset_zoom()
+            self.minimap.set_viewport(*self.tap_sync_view.viewport_window_cs())
         else:
             self.wiping_view.reset_zoom()
 
@@ -509,6 +557,23 @@ class MainWindow(QMainWindow):
 
     def _play_selected_word(self) -> None:
         self.wiping_view.play_current_word()
+
+    def _update_edit_menu_labels(self) -> None:
+        if self.project and self.project.pages:
+            p_idx = self.wiping_view.canvas.page_idx
+            l_idx = self.wiping_view.canvas.line_idx
+            if 0 <= p_idx < len(self.project.pages):
+                page = self.project.pages[p_idx]
+                next_p_st = self.project.pick_duplicate_style(page.lines)
+                self._act_dup_page.setText(f"&Duplicate Selected Page → Style [{next_p_st}]")
+                if 0 <= l_idx < len(page.lines):
+                    next_l_st = self.project.pick_duplicate_style([page.lines[l_idx]])
+                    self._act_dup_line.setText(f"Duplicate Selected &Line → Style [{next_l_st}]")
+                else:
+                    self._act_dup_line.setText("Duplicate Selected &Line (Next Style)")
+                return
+        self._act_dup_line.setText("Duplicate Selected &Line (Next Style)")
+        self._act_dup_page.setText("&Duplicate Selected Page (Next Style)")
 
     def _toggle_word_adjust_from_menu(self, checked: bool) -> None:
         if checked:
@@ -562,10 +627,70 @@ class MainWindow(QMainWindow):
             return f"{_clean(audio_path.stem) or 'untitled'}.kbp"
         return "untitled.kbp"
 
+    def _sync_tap_view_from_project(self, locked: bool = True, reason: str = "") -> None:
+        if self.project is None:
+            return
+        self.tap_sync_view.load_synced_project(
+            self.project,
+            audio_path=str(self.audio.main_path) if self.audio.main_path else "",
+            vocal_path=str(self.audio.vocal_path) if self.audio.vocal_path else "",
+            locked=locked,
+            reason=reason or ("Synced .kbp imported" if not self.tap_sync_view._lock_reason else self.tap_sync_view._lock_reason),
+        )
+
+    def _launch_new_window(self, file_path: Optional[str | Path] = None) -> bool:
+        """Spawn a separate instance of Advanced KBP Editor (optionally opening a file)."""
+        script = str(Path(sys.argv[0]).resolve())
+        args = [script]
+        if file_path is not None:
+            args.append(str(Path(file_path)))
+        ok = QProcess.startDetached(sys.executable, args, str(Path(script).parent))
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "Could Not Open New Window",
+                "Failed to launch a new instance of Advanced KBP Editor.",
+            )
+        return ok
+
+    def _warn_synced_project_blocks_unsynced(
+        self,
+        target_path: Optional[str | Path],
+        kind_label: str = "an unsynced project",
+    ) -> None:
+        cur_name = (
+            self.project.source_path.name
+            if (self.project and self.project.source_path)
+            else (self.project.header.title if (self.project and self.project.header.title) else "the current synced project")
+        )
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Synced Project Already Open")
+        msg.setText(f"Cannot load {kind_label} into this window while '{cur_name}' is open.")
+        msg.setInformativeText(
+            "A fully synced .kbp project is already loaded in this instance.\n\n"
+            "• To work on another song at the same time, click 'Open in New Window' (or File → New Window).\n"
+            "• To edit or re-tap the current synced .kbp, switch to Tap Sync and click 'Unfreeze Tap Sync'.\n"
+            "• To clear this window first, use File → New Project."
+        )
+        btn_new_win = msg.addButton("Open in New Window", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton(QMessageBox.StandardButton.Ok)
+        msg.exec()
+        if msg.clickedButton() is btn_new_win:
+            self._launch_new_window(target_path)
+
     def _on_tap_sync_project_built(self, proj: KbpProject, vocal_path: str) -> None:
+        existing_source = self.project.source_path if self.project is not None else None
+        if existing_source is not None:
+            proj.source_path = existing_source
+
         self.project = proj
-        self.history.reset(proj, label="Build KBP from Tap Sync")
-        self.history.mark_dirty()
+        if existing_source is not None:
+            self.history.push("Update from Tap Sync", proj)
+        else:
+            self.history.reset(proj, label="Build KBP from Tap Sync")
+            self.history.mark_dirty()
+        self.tap_sync_view.set_synced_project_active(True)
         self._bind_project_to_views(preserve_view=False)
         self._rebuild_page_buttons()
         if proj.header.audio_path and (self.audio.main_path is None or str(self.audio.main_path) != proj.header.audio_path):
@@ -579,6 +704,24 @@ class MainWindow(QMainWindow):
             self._scrub_to(float(proj.pages[0].display_start))
         self._sync_minimap_from_active_tab()
         self._refresh_actions()
+
+        if existing_source is not None:
+            reply = QMessageBox.question(
+                self,
+                "Save Updated KBP Project",
+                f"Apply and save the updated sync to '{existing_source.name}' now?\n\n"
+                "(Choose No to review it in Lyrics Wiping first and press Ctrl+S when ready.)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.save_kbp()
+            else:
+                self.statusBar().showMessage(
+                    f"Applied Tap Sync changes to {existing_source.name} — unsaved (press Ctrl+S to save)",
+                    6000,
+                )
+            return
 
         # Prompt to save immediately so the newly built KBP is safely on disk
         default_dir = self.audio.main_path.parent if self.audio.main_path else None
@@ -596,9 +739,10 @@ class MainWindow(QMainWindow):
             if self.audio.vocal_path:
                 self._save_vocal_stem_for_project(Path(save_path), self.audio.vocal_path, audio_path=self.audio.main_path)
             self.history.mark_saved()
+            self._sync_tap_view_from_project(locked=True, reason="Sync saved")
             self._refresh_actions()
             self.statusBar().showMessage(
-                f"Built and saved {Path(save_path).name} ({len(proj.pages)} pages)",
+                f"Built and saved {Path(save_path).name} ({len(proj.pages)} pages) — Tap Sync frozen",
                 6000,
             )
         else:
@@ -665,12 +809,18 @@ class MainWindow(QMainWindow):
             self._rebuild_recent_menu()
             return
         if p.suffix.lower() == ".json":
+            if self.project is not None:
+                self._warn_synced_project_blocks_unsynced(p, "a Tap Sync draft")
+                return
             if self.tap_sync_view.load_draft_file(p):
                 self._tabs.setCurrentWidget(self.tap_sync_view)
         else:
             self.open_kbp(p)
 
     def _open_project_organizer(self) -> None:
+        if self.project is not None:
+            self._warn_synced_project_blocks_unsynced(None, "a saved Tap Sync draft")
+            return
         self._tabs.setCurrentWidget(self.tap_sync_view)
         self.tap_sync_view.open_project_organizer()
 
@@ -834,6 +984,9 @@ class MainWindow(QMainWindow):
             proj = KbpProject.load(path)
         except ValueError as exc:
             if "LYRICSV2" in str(exc):
+                if self.project is not None:
+                    self._warn_synced_project_blocks_unsynced(path, "an unsynced .kbp file")
+                    return
                 if self.tap_sync_view.load_unsynced_kbp(path):
                     self._add_recent_project(path)
                     saved_v = self._get_saved_vocal_stem(Path(path), self.audio.main_path or self.tap_sync_view.draft.audio_path)
@@ -846,6 +999,19 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Open Failed", f"Could not load KBP file:\n{exc}")
             return
+
+        if self.history.is_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "You have unsaved .kbp changes. Open the new .kbp file and discard unsaved changes?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if self.tap_sync_view.is_syncing:
+            self.tap_sync_view.stop_syncing()
 
         flushed_gaps = proj.flush_one_cs_gaps()
 
@@ -881,6 +1047,11 @@ class MainWindow(QMainWindow):
                 self._audio_src_combo.blockSignals(True)
                 self._audio_src_combo.setCurrentIndex(0)
                 self._audio_src_combo.blockSignals(False)
+
+        # Populate Tap Sync with the imported synced project and freeze it so it can be inspected or unfrozen to re-tap
+        self._sync_tap_view_from_project(locked=True, reason="Synced .kbp imported")
+        if self._tabs.currentWidget() is self.tap_sync_view:
+            self._tabs.setCurrentWidget(self.wiping_view)
 
         if proj.pages:
             self._highlight_page_button(0)
@@ -953,6 +1124,9 @@ class MainWindow(QMainWindow):
 
     def _set_preview_visible(self, visible: bool) -> None:
         self._preview_user_enabled = bool(visible)
+        if hasattr(self, "_settings"):
+            self._settings.setValue("preview_visible", self._preview_user_enabled)
+            self._settings.sync()
         if visible:
             if not self._preview_positioned:
                 g = self.geometry()
@@ -1016,6 +1190,7 @@ class MainWindow(QMainWindow):
         if self.audio.vocal_path:
             self._save_vocal_stem_for_project(self.project.source_path, self.audio.vocal_path, audio_path=self.audio.main_path)
         self.history.mark_saved()
+        self._sync_tap_view_from_project(locked=True, reason="Sync saved")
         self._refresh_actions()
         self.statusBar().showMessage(f"Saved {self.project.source_path.name}", 3500)
 
@@ -1029,6 +1204,7 @@ class MainWindow(QMainWindow):
             if self.audio.vocal_path:
                 self._save_vocal_stem_for_project(Path(path), self.audio.vocal_path, audio_path=self.audio.main_path)
             self.history.mark_saved()
+            self._sync_tap_view_from_project(locked=True, reason="Sync saved")
             self._refresh_actions()
             self.statusBar().showMessage(f"Saved {Path(path).name}", 3500)
 
