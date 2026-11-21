@@ -12,6 +12,10 @@ DEFAULT_CLEAR_HOLD_CS = 50
 DEFAULT_OPTIMIZED_LEAD_IN_CS = 25
 DEFAULT_GAP_THRESHOLD_CS = 300
 DEFAULT_LEAD_IN_MARKER = "➣➣➣"
+DEFAULT_KBP_COMMENTS: Tuple[str, ...] = (
+    "Hacked by Matt Joy",
+    "github.com/mattjoykaraoke",
+)
 
 
 def parse_12bit_rgb(code: str) -> Tuple[int, int, int]:
@@ -77,6 +81,7 @@ class KbpHeader:
     artist: str = ""
     audio_path: str = ""
     status: str = "1"
+    comments: List[str] = field(default_factory=list)
 
     def color(self, idx: int, fallback: Tuple[int, int, int] = (255, 255, 255)) -> Tuple[int, int, int]:
         if 0 <= idx < len(self.palette):
@@ -180,6 +185,22 @@ class KbpHeader:
                 header.audio_path = line[5:].strip()
             elif line.startswith("Status"):
                 header.status = line[6:].strip()
+            elif line.startswith("Comments"):
+                parsed_comments: List[str] = []
+                first = line[8:].lstrip(" \t").rstrip()
+                if first:
+                    parsed_comments.append(first)
+                j = i + 1
+                while j < n:
+                    cont = raw_lines[j]
+                    if cont.startswith("          ") and cont.strip():
+                        parsed_comments.append(cont[10:].rstrip())
+                        j += 1
+                    else:
+                        break
+                header.comments = parsed_comments
+                i = j
+                continue
 
             i += 1
 
@@ -210,6 +231,43 @@ class KbpHeader:
             if line.startswith("Artist") or line.startswith("Title"):
                 insert_at = i + 1
         self.raw_lines.insert(insert_at, f"Audio   {new_path}")
+
+    def set_comments(self, lines: Sequence[str]) -> None:
+        """
+        Update the HEADERV2 Comments block using exact KBS fixed-column formatting:
+          Comments  <line 1>
+                    <line 2>
+        (10-character prefix: 'Comments  ' on line 1, 10 spaces on continuation lines).
+        """
+        cleaned = [str(ln).rstrip("\r\n") for ln in lines if str(ln).strip()]
+        self.comments = list(cleaned)
+        if cleaned:
+            formatted = [f"Comments  {cleaned[0]}"] + [f"          {ln}" for ln in cleaned[1:]]
+        else:
+            formatted = ["Comments  "]
+
+        for i, line in enumerate(self.raw_lines):
+            if line.startswith("Comments"):
+                end = i + 1
+                while end < len(self.raw_lines):
+                    cont = self.raw_lines[end]
+                    if cont.startswith("          ") and cont.strip():
+                        end += 1
+                    else:
+                        break
+                self.raw_lines[i:end] = formatted
+                return
+
+        # No existing Comments field — append cleanly with blank separator lines
+        if self.raw_lines and self.raw_lines[-1].strip():
+            self.raw_lines.append("")
+        self.raw_lines.extend(formatted)
+        self.raw_lines.append("")
+
+    def ensure_default_comments(self, default_lines: Sequence[str] = DEFAULT_KBP_COMMENTS) -> None:
+        """Populate the default KBS Comments block if no comments are currently set."""
+        if not self.comments:
+            self.set_comments(default_lines)
 
 
 @dataclass

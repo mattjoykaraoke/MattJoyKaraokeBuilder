@@ -510,6 +510,7 @@ class TapSyncView(QWidget):
     main_audio_status_changed = Signal(bool, str)  # (loaded, raw_path)
     dirty_changed = Signal(bool)
     open_project_requested = Signal(str)  # path selected in Project Organizer
+    save_project_requested = Signal()  # unified Save Project action
 
     def __init__(self, audio: AudioEngine, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -623,9 +624,9 @@ class TapSyncView(QWidget):
         self._btn_load_draft.clicked.connect(self._load_draft_dialog)
         lyr_r2.addWidget(self._btn_load_draft)
 
-        self._btn_save_draft = QPushButton("Save Draft…", ribbon)
-        self._btn_save_draft.setToolTip("Save current partial sync + audio paths to a JSON draft")
-        self._btn_save_draft.clicked.connect(self._save_draft_dialog)
+        self._btn_save_draft = QPushButton("Save Project", ribbon)
+        self._btn_save_draft.setToolTip("Save current project (Ctrl+S) so you can reopen right where you left off")
+        self._btn_save_draft.clicked.connect(self.save_project_requested.emit)
         lyr_r2.addWidget(self._btn_save_draft)
 
         self._resume_btn = QPushButton("Projects…", ribbon)
@@ -1033,7 +1034,8 @@ class TapSyncView(QWidget):
 
     def open_project_organizer(self) -> None:
         self.archive_current_draft()
-        dlg = ProjectOrganizerDialog(self)
+        parent = self.window() if self.window() is not None else self
+        dlg = ProjectOrganizerDialog(parent)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_project_path is not None:
             self.open_project_requested.emit(str(dlg.selected_project_path))
 
@@ -1168,6 +1170,10 @@ class TapSyncView(QWidget):
             self._set_dirty(False)
             self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
             return True
+        return self._save_draft_dialog()
+
+    def save_draft_as(self) -> bool:
+        """Prompt for a file path and save the current Tap Sync project draft."""
         return self._save_draft_dialog()
 
     def _save_draft_dialog(self) -> bool:

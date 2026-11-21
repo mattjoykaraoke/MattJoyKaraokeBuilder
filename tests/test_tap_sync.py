@@ -250,6 +250,7 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
         assert win.tap_sync_view.draft.synced_syllables() == 3
         assert win.tap_sync_view._sync_btn.isEnabled() is False
         assert win.tap_sync_view._btn_load_lyr.isEnabled() is False
+        assert win.tap_sync_view._resume_btn.isEnabled() is True
 
         # Attempting to open another .kbp (unsynced or synced) while a project is open
         # automatically opens it in a new window without modifying the current window
@@ -264,6 +265,28 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
         assert win.tap_sync_view.draft.title == "Synced Song"
         assert win.project.header.title == "Synced Song"
         assert not hasattr(win, "_recent_menu")
+
+        # Opening Project Organizer while a synced .kbp is loaded (and Tap Sync is frozen/inactive)
+        # works and opens the selected project in a new window
+        from PySide6.QtWidgets import QDialog
+        from kbp_editor.ui import tap_sync_view as tsv_mod
+
+        opened_parents = []
+
+        class _FakeOrganizer:
+            def __init__(self, parent=None):
+                opened_parents.append(parent)
+                self.selected_project_path = unsynced_path
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(tsv_mod, "ProjectOrganizerDialog", _FakeOrganizer)
+        launched.clear()
+        win._open_project_organizer()
+        assert opened_parents == [win]
+        assert launched == [unsynced_path]
+        assert win.project.header.title == "Synced Song"
 
         # Unfreezing allows re-tapping the synced project; Project Organizer stays accessible
         win.tap_sync_view.set_locked(False)

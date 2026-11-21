@@ -75,7 +75,8 @@ DEFAULT_KBP_HEADER_LINES: List[str] = [
     "Intro     ",
     "Outro     ",
     "",
-    "Comments  ",
+    "Comments  Hacked by Matt Joy",
+    "          github.com/mattjoykaraoke",
     "",
 ]
 
@@ -547,6 +548,7 @@ class TapSyncDraft:
             self._set_header_field(header.raw_lines, "Artist", self.artist)
         if self.audio_path:
             header.set_audio_path(self.audio_path)
+        header.ensure_default_comments()
 
         built_pages: List[Page] = []
         cursor_cs = 100

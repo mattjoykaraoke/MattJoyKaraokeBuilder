@@ -133,6 +133,7 @@ class MainWindow(QMainWindow):
             if p_init.suffix.lower() == ".json":
                 if self.tap_sync_view.load_draft_file(p_init):
                     self._tabs.setCurrentWidget(self.tap_sync_view)
+                    self._refresh_actions()
             else:
                 self.open_kbp(initial_file)
 
@@ -457,6 +458,7 @@ class MainWindow(QMainWindow):
         self.tap_sync_view.main_audio_status_changed.connect(self._on_tap_sync_main_audio_status)
         self.tap_sync_view.dirty_changed.connect(lambda _d: self._refresh_actions())
         self.tap_sync_view.open_project_requested.connect(self._open_project_path)
+        self.tap_sync_view.save_project_requested.connect(self.save_kbp)
 
         self.display_view.viewport_changed.connect(self._on_display_viewport)
         self.wiping_view.viewport_changed.connect(self._on_wiping_viewport)
