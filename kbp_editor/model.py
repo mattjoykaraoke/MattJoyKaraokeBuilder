@@ -193,6 +193,24 @@ class KbpHeader:
             ]
         return header
 
+    def set_audio_path(self, path: str | Path) -> None:
+        """Update the project's main audio path in both `audio_path` and `raw_lines`."""
+        new_path = str(path)
+        self.audio_path = new_path
+        for i, line in enumerate(self.raw_lines):
+            if line.startswith("Audio"):
+                rest = line[5:]
+                pad_len = len(rest) - len(rest.lstrip(" \t"))
+                pad = rest[:pad_len] if pad_len > 0 else "   "
+                self.raw_lines[i] = f"Audio{pad}{new_path}"
+                return
+        # No existing Audio line — insert after Artist/Title if present, else append
+        insert_at = len(self.raw_lines)
+        for i, line in enumerate(self.raw_lines):
+            if line.startswith("Artist") or line.startswith("Title"):
+                insert_at = i + 1
+        self.raw_lines.insert(insert_at, f"Audio   {new_path}")
+
 
 @dataclass
 class Syllable:

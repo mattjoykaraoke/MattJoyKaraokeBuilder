@@ -423,3 +423,23 @@ def test_flush_one_cs_gaps_zero_drift():
     l0.syllables[1].end = 1190
     assert proj.flush_one_cs_gaps() == 0
     assert l0.syllables[1].end == 1190
+
+
+def test_header_set_audio_path_updates_existing_and_missing(tmp_path):
+    # Case 1: Header with existing Audio line preserves prefix and updates round-trip
+    hdr = KbpHeader.parse([
+        "Title   My Song",
+        "Artist  My Band",
+        "Audio   C:\\missing\\old.mp3",
+    ])
+    hdr.set_audio_path(r"C:\music\fixed.flac")
+    assert hdr.audio_path == r"C:\music\fixed.flac"
+    assert "Audio   C:\\music\\fixed.flac" in hdr.raw_lines
+    reparsed = KbpHeader.parse(hdr.raw_lines)
+    assert reparsed.audio_path == r"C:\music\fixed.flac"
+
+    # Case 2: Header without Audio line inserts one cleanly
+    hdr2 = KbpHeader.parse(["Title   No Audio Yet", "Artist  Band"])
+    hdr2.set_audio_path(r"C:\music\added.wav")
+    assert hdr2.audio_path == r"C:\music\added.wav"
+    assert KbpHeader.parse(hdr2.raw_lines).audio_path == r"C:\music\added.wav"

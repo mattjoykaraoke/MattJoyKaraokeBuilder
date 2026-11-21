@@ -804,7 +804,7 @@ class _WipingTimelineCanvas(QWidget):
                 self._draw_wave_layer(p, self.audio.vocal_waveform, w, 0, height, QColor(65, 225, 200, 210))
             if self.audio.main_waveform is None and self.audio.vocal_waveform is None:
                 p.setPen(QColor(120, 128, 140))
-                p.drawText(QRectF(0, 0, w, height), Qt.AlignmentFlag.AlignCenter, "No audio waveform loaded (check Audio path in KBP or load a vocal stem)")
+                p.drawText(QRectF(0, 0, w, height), Qt.AlignmentFlag.AlignCenter, "No audio waveform loaded (click 'Load Main Audio…' or 'Load Vocal Stem…' below)")
             p.end()
             self._wave_cache = pm
             self._wave_cache_key = cache_key

@@ -162,16 +162,28 @@ class AudioEngine(QObject):
                 self._last_tick_wall = now
                 self._smooth_cs = self._clock_ms / 10.0
 
+    def clear_main(self) -> None:
+        """Clear any previously loaded main audio and waveform."""
+        if self.is_playing and not self.use_vocal_audio:
+            self.pause()
+        self.main_path = None
+        self.main_waveform = None
+        if not self.use_vocal_audio:
+            self._player.setSource(QUrl())
+        self.duration_cs = self.vocal_waveform.duration_cs if self.vocal_waveform is not None else 0
+        self.waveform_loaded.emit()
+
     def load_main(self, path: str | Path) -> bool:
         p = Path(path)
-        if not p.exists():
+        if not p.exists() or not p.is_file():
+            return False
+        try:
+            wf = WaveformData.from_file(p)
+        except Exception:
             return False
         self.main_path = p
-        try:
-            self.main_waveform = WaveformData.from_file(p)
-            self.duration_cs = self.main_waveform.duration_cs
-        except Exception:
-            self.main_waveform = None
+        self.main_waveform = wf
+        self.duration_cs = wf.duration_cs
         if not self.use_vocal_audio:
             self._player.setSource(QUrl.fromLocalFile(str(p)))
         self.waveform_loaded.emit()
@@ -179,15 +191,18 @@ class AudioEngine(QObject):
 
     def load_vocal_stem(self, path: str | Path) -> bool:
         p = Path(path)
-        if not p.exists():
+        if not p.exists() or not p.is_file():
+            return False
+        try:
+            wf = WaveformData.from_file(p)
+        except Exception:
             return False
         self.vocal_path = p
-        try:
-            self.vocal_waveform = WaveformData.from_file(p)
-            if self.duration_cs == 0:
-                self.duration_cs = self.vocal_waveform.duration_cs
-        except Exception:
-            self.vocal_waveform = None
+        self.vocal_waveform = wf
+        if self.duration_cs == 0:
+            self.duration_cs = wf.duration_cs
+        if self.use_vocal_audio:
+            self._player.setSource(QUrl.fromLocalFile(str(p)))
         self.waveform_loaded.emit()
         return True
 

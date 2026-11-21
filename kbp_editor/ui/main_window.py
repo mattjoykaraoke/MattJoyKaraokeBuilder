@@ -221,7 +221,13 @@ class MainWindow(QMainWindow):
         self._audio_src_combo.currentIndexChanged.connect(lambda idx: self.audio.set_use_vocal_audio(idx == 1))
         layout.addWidget(self._audio_src_combo)
 
+        self._load_main_btn = QPushButton("Load Main Audio…")
+        self._load_main_btn.setToolTip("Load or replace the project's main audio track")
+        self._load_main_btn.clicked.connect(self._open_main_audio_dialog)
+        layout.addWidget(self._load_main_btn)
+
         self._load_vocal_btn = QPushButton("Load Vocal Stem…")
+        self._load_vocal_btn.setToolTip("Load an isolated vocal stem for visual/audio alignment")
         self._load_vocal_btn.clicked.connect(self._open_vocal_stem_dialog)
         layout.addWidget(self._load_vocal_btn)
 
@@ -275,6 +281,10 @@ class MainWindow(QMainWindow):
         m_file.addAction(self._act_save_as)
 
         m_file.addSeparator()
+        act_main_audio = QAction("Load &Main Audio…", self)
+        act_main_audio.triggered.connect(self._open_main_audio_dialog)
+        m_file.addAction(act_main_audio)
+
         act_vocal = QAction("Load &Vocal Stem Audio…", self)
         act_vocal.triggered.connect(self._open_vocal_stem_dialog)
         m_file.addAction(act_vocal)
@@ -484,11 +494,64 @@ class MainWindow(QMainWindow):
         if path:
             self.open_kbp(path)
 
+    def _default_audio_dir(self) -> str:
+        if self.project and self.project.source_path:
+            return str(self.project.source_path.parent)
+        return ""
+
+    def _set_main_audio_missing_hint(self, missing: bool, raw_path: str = "") -> None:
+        if missing:
+            self._load_main_btn.setStyleSheet("background-color: #b45309; color: white; font-weight: bold;")
+            detail = f"\nMissing/unreadable path in KBP:\n{raw_path}" if raw_path else "\nNo audio path set in KBP."
+            self._load_main_btn.setToolTip(f"Main audio could not be loaded — click to locate it.{detail}")
+        else:
+            self._load_main_btn.setStyleSheet("")
+            self._load_main_btn.setToolTip("Load or replace the project's main audio track")
+
+    def _open_main_audio_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Main Audio",
+            self._default_audio_dir(),
+            "Audio Files (*.mp3 *.flac *.wav *.ogg);;All Files (*.*)",
+        )
+        if not path:
+            return
+        if not self.audio.load_main(path):
+            QMessageBox.warning(
+                self,
+                "Audio Load Failed",
+                f"Could not read audio file:\n{path}\n\nThe file may be corrupted or in an unsupported format.",
+            )
+            return
+        self._set_main_audio_missing_hint(False)
+        if self._audio_src_combo.currentIndex() != 0 and self.audio.vocal_path is None:
+            self._audio_src_combo.setCurrentIndex(0)
+        if self.project is not None:
+            norm = str(Path(path))
+            if self.project.header.audio_path != norm:
+                self.project.header.set_audio_path(norm)
+                self._on_project_mutated(f"Set Main Audio → {Path(path).name}")
+                return
+        self.statusBar().showMessage(f"Loaded main audio: {Path(path).name}", 4000)
+
     def _open_vocal_stem_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load Vocal Stem Audio", "", "Audio Files (*.flac *.wav *.mp3 *.ogg);;All Files (*.*)")
-        if path:
-            if self.audio.load_vocal_stem(path):
-                self.statusBar().showMessage(f"Loaded vocal stem: {Path(path).name}", 4000)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Vocal Stem Audio",
+            self._default_audio_dir(),
+            "Audio Files (*.flac *.wav *.mp3 *.ogg);;All Files (*.*)",
+        )
+        if not path:
+            return
+        if self.audio.load_vocal_stem(path):
+            self.statusBar().showMessage(f"Loaded vocal stem: {Path(path).name}", 4000)
+        else:
+            QMessageBox.warning(
+                self,
+                "Vocal Stem Load Failed",
+                f"Could not read vocal stem file:\n{path}\n\nThe file may be corrupted or in an unsupported format.",
+            )
 
     def open_kbp(self, path: str | Path) -> None:
         try:
@@ -513,8 +576,12 @@ class MainWindow(QMainWindow):
         self._bind_project_to_views(preserve_view=False)
         self._rebuild_page_buttons()
 
-        if proj.header.audio_path and Path(proj.header.audio_path).exists():
-            self.audio.load_main(proj.header.audio_path)
+        audio_loaded = False
+        if proj.header.audio_path:
+            audio_loaded = self.audio.load_main(proj.header.audio_path)
+        if not audio_loaded:
+            self.audio.clear_main()
+        self._set_main_audio_missing_hint(not audio_loaded, proj.header.audio_path)
 
         if proj.pages:
             self._highlight_page_button(0)
@@ -525,7 +592,9 @@ class MainWindow(QMainWindow):
         if flushed_gaps > 0:
             bak_info = f", backup: {bak_path.name}" if bak_path is not None else ""
             msg += f" — flushed {flushed_gaps} × 1 cs gap{'s' if flushed_gaps != 1 else ''}{bak_info}"
-        self.statusBar().showMessage(msg, 6000 if flushed_gaps > 0 else 4000)
+        if not audio_loaded:
+            msg += " — main audio missing/unreadable (click 'Load Main Audio…')"
+        self.statusBar().showMessage(msg, 7000 if (flushed_gaps > 0 or not audio_loaded) else 4000)
 
         if proj.load_issues:
             self._show_repair_warning(Path(path), proj.load_issues, bak_path)
