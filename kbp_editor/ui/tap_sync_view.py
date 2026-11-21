@@ -508,6 +508,7 @@ class TapSyncView(QWidget):
     project_built = Signal(object, str)  # (KbpProject, vocal_path)
     status_message = Signal(str, int)
     main_audio_status_changed = Signal(bool, str)  # (loaded, raw_path)
+    dirty_changed = Signal(bool)
 
     def __init__(self, audio: AudioEngine, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -516,6 +517,7 @@ class TapSyncView(QWidget):
         self._item_by_coord: Dict[Tuple[int, int], QTreeWidgetItem] = {}
 
         self._is_syncing: bool = False
+        self._dirty: bool = False
         self._locked: bool = False
         self._lock_reason: str = ""
         self._has_synced_project: bool = False
@@ -798,6 +800,19 @@ class TapSyncView(QWidget):
         return self._is_syncing
 
     @property
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def _set_dirty(self, dirty: bool) -> None:
+        val = bool(dirty)
+        if self._dirty != val:
+            self._dirty = val
+            self.dirty_changed.emit(val)
+
+    def mark_clean(self) -> None:
+        self._set_dirty(False)
+
+    @property
     def is_locked(self) -> bool:
         return self._locked
 
@@ -958,6 +973,7 @@ class TapSyncView(QWidget):
         self._draft_file_path = None
         self._has_synced_project = True
         self._apply_draft(draft, load_audio=False)
+        self._set_dirty(False)
         self.set_locked(locked, reason=reason)
 
     def load_unsynced_kbp(self, path: str | Path) -> bool:
@@ -970,6 +986,7 @@ class TapSyncView(QWidget):
         self._locked = False
         self._lock_reason = ""
         audio_ok = self._apply_draft(draft, load_audio=True)
+        self._set_dirty(False)
         self._update_lock_ui()
         msg = f"Loaded lyrics from {Path(path).name} ({draft.total_syllables()} syllables)"
         if audio_ok and draft.audio_path:
@@ -1008,6 +1025,7 @@ class TapSyncView(QWidget):
         self._locked = False
         self._lock_reason = ""
         self._apply_draft(fresh, load_audio=False)
+        self._set_dirty(False)
         self._update_lock_ui()
 
     def _refresh_resume_btn(self) -> None:
@@ -1104,6 +1122,7 @@ class TapSyncView(QWidget):
         new_draft.latency_cs = self._latency_spin.value()
         new_draft.pre_roll_cs = int(round(self._preroll_spin.value() * 100))
         self._apply_draft(new_draft, load_audio=False)
+        self._set_dirty(True)
         self._autosave()
         self.setFocus()
 
@@ -1132,13 +1151,29 @@ class TapSyncView(QWidget):
             draft.vocal_path = self.draft.vocal_path or (str(self.audio.vocal_path) if self.audio.vocal_path else "")
             draft.template_kbp_path = self.draft.template_kbp_path
             self._apply_draft(draft, load_audio=False)
+            self._set_dirty(True)
             self.status_message.emit(f"Loaded lyrics from {p.name} ({draft.total_syllables()} syllables)", 4500)
         self._autosave()
         self.setFocus()
 
-    def _save_draft_dialog(self) -> None:
+    def save_draft(self) -> bool:
+        """Save the current Tap Sync draft (to its existing file if set, otherwise prompting)."""
         if not self.draft.pages:
-            return
+            return False
+        if self._draft_file_path is not None:
+            if self.audio.main_path:
+                self.draft.audio_path = str(self.audio.main_path)
+            if self.audio.vocal_path:
+                self.draft.vocal_path = str(self.audio.vocal_path)
+            self._draft_file_path = self.draft.save_json(self._draft_file_path)
+            self._set_dirty(False)
+            self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
+            return True
+        return self._save_draft_dialog()
+
+    def _save_draft_dialog(self) -> bool:
+        if not self.draft.pages:
+            return False
         if self.audio.main_path:
             self.draft.audio_path = str(self.audio.main_path)
         if self.audio.vocal_path:
@@ -1146,9 +1181,11 @@ class TapSyncView(QWidget):
         default_dir = str(self._draft_file_path) if self._draft_file_path else ""
         path, _ = QFileDialog.getSaveFileName(self, "Save Tap Sync Draft", default_dir, "Tap Sync Draft (*.kbsync.json);;JSON (*.json)")
         if not path:
-            return
+            return False
         self._draft_file_path = self.draft.save_json(path)
+        self._set_dirty(False)
         self.status_message.emit(f"Saved Tap Sync draft: {self._draft_file_path.name}", 4000)
+        return True
 
     def _load_draft_dialog(self) -> None:
         if self._locked or self._has_synced_project:
@@ -1163,6 +1200,7 @@ class TapSyncView(QWidget):
             return
         self._draft_file_path = Path(path)
         self._apply_draft(draft, load_audio=True)
+        self._set_dirty(False)
         self.status_message.emit(
             f"Loaded draft {Path(path).name} ({draft.synced_syllables()}/{draft.total_syllables()} syllables synced)",
             4500,
@@ -1192,6 +1230,7 @@ class TapSyncView(QWidget):
             return False
         self._draft_file_path = Path(path)
         self._apply_draft(draft, load_audio=True)
+        self._set_dirty(False)
         self.status_message.emit(
             f"Loaded draft {Path(path).name} ({draft.synced_syllables()}/{draft.total_syllables()} syllables synced)",
             4500,
@@ -1421,6 +1460,7 @@ class TapSyncView(QWidget):
         line = self.draft.pages[p_i].lines[l_i]
         old_start = line.first_start_cs
         line.clear_timing()
+        self._set_dirty(True)
         self._update_tree_line(p_i, l_i)
         self._cursor = (p_i, l_i, 0)
 
@@ -1489,6 +1529,7 @@ class TapSyncView(QWidget):
             p_i, l_i, ln = flat_lines[i]
             ln.clear_timing()
             self._update_tree_line(p_i, l_i)
+        self._set_dirty(True)
 
         tp, tl, _ = flat_lines[target_idx]
         self._cursor = (tp, tl, 0)
@@ -1528,6 +1569,7 @@ class TapSyncView(QWidget):
             return
         p_i, l_i = coord
         self.draft.pages[p_i].lines[l_i].clear_timing()
+        self._set_dirty(True)
         self._update_tree_line(p_i, l_i)
         self._cursor = (p_i, l_i, 0)
         self._open_coord = None
@@ -1554,6 +1596,7 @@ class TapSyncView(QWidget):
             for l_i, line in enumerate(page.lines):
                 line.clear_timing()
                 self._update_tree_line(p_i, l_i)
+        self._set_dirty(True)
         self._cursor = (0, 0, 0) if (self.draft.pages and self.draft.pages[0].lines and self.draft.pages[0].lines[0].syllables) else None
         self._open_coord = None
         self._last_released_coord = None
@@ -1592,6 +1635,7 @@ class TapSyncView(QWidget):
 
         cur_syl.start_cs = now_cs
         cur_syl.end_cs = None
+        self._set_dirty(True)
         self._open_coord = cur_coord
         self._space_held_coord = cur_coord
         self._space_press_cs = now_cs
@@ -1617,6 +1661,7 @@ class TapSyncView(QWidget):
         open_syl = self._get_syl(self._open_coord)
         if open_syl is not None and open_syl.start_cs is not None:
             open_syl.end_cs = max(open_syl.start_cs + 1, now_cs)
+            self._set_dirty(True)
             self._update_tree_line(self._open_coord[0], self._open_coord[1])
         finished_punch = self._punch_line is not None and self._cursor is None
         finished_song = self._cursor is None
@@ -1659,6 +1704,7 @@ class TapSyncView(QWidget):
         syl = self._get_syl(target)
         if syl is not None:
             syl.clear()
+            self._set_dirty(True)
             self._update_tree_line(target[0], target[1])
         self._cursor = target
         self._open_coord = None
@@ -1693,6 +1739,7 @@ class TapSyncView(QWidget):
 
         self._autosave()
         proj = self.draft.build_kbp_project()
+        self._set_dirty(False)
         self.project_built.emit(proj, self.draft.vocal_path)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:

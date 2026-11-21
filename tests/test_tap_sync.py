@@ -287,3 +287,136 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
     finally:
         win.close()
         app.processEvents()
+
+
+def test_close_prompts_for_unsaved_lyrics_and_tap_sync_changes(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from kbp_editor.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    synced_path = _write_synced_kbp(tmp_path / "synced_close.kbp")
+    unsynced_path = _write_unsynced_kbp(tmp_path / "unsynced_close.kbp")
+
+    win = MainWindow()
+    try:
+        # 1) Unsaved Lyrics Wiping edit -> Cancel blocks close, Save saves & allows close
+        win.open_kbp(synced_path)
+        assert not win._has_unsaved_changes()
+        win.project.shift_all(10)
+        win._on_project_mutated("Shift +10 cs")
+        assert win.history.is_dirty is True
+        assert win.windowTitle().startswith("*")
+
+        prompts = []
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *a, **kw: (prompts.append(a[2]), QMessageBox.StandardButton.Cancel)[1],
+        )
+        ev = QCloseEvent()
+        win.closeEvent(ev)
+        assert ev.isAccepted() is False
+        assert len(prompts) == 1
+
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *a, **kw: (prompts.append(a[2]), QMessageBox.StandardButton.Save)[1],
+        )
+        ev2 = QCloseEvent()
+        win.closeEvent(ev2)
+        assert ev2.isAccepted() is True
+        assert win.history.is_dirty is False
+        assert KbpProject.load(synced_path).pages[0].lines[0].syllables[0].start == 160
+
+        # 2) Unsaved Tap Sync edit on an unsynced draft -> Cancel blocks close, Discard allows close
+        win.new_project()
+        win.open_kbp(unsynced_path)
+        assert win.tap_sync_view.is_dirty is False
+        win.tap_sync_view._clear_selected_line()
+        assert win.tap_sync_view.is_dirty is True
+        assert win.windowTitle().startswith("*")
+
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *a, **kw: QMessageBox.StandardButton.Cancel,
+        )
+        ev3 = QCloseEvent()
+        win.closeEvent(ev3)
+        assert ev3.isAccepted() is False
+
+        monkeypatch.setattr(
+            QMessageBox,
+            "warning",
+            lambda *a, **kw: QMessageBox.StandardButton.Discard,
+        )
+        ev4 = QCloseEvent()
+        win.closeEvent(ev4)
+        assert ev4.isAccepted() is True
+    finally:
+        win.tap_sync_view.mark_clean()
+        win.history.mark_saved()
+        win.close()
+        app.processEvents()
+
+
+def test_project_organizer_multi_delete_and_skip_confirm(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QItemSelectionModel
+    from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidget
+    from kbp_editor.ui.project_organizer import ProjectOrganizerDialog
+
+    app = QApplication.instance() or QApplication([])
+    drafts_dir = tmp_path / "drafts"
+    drafts_dir.mkdir()
+    for name in ("Song A", "Song B", "Song C"):
+        d = TapSyncDraft.from_lyrics_text("Hel/lo world")
+        d.title = name
+        d.save_json(drafts_dir / d.default_archive_filename())
+
+    dlg = ProjectOrganizerDialog(drafts_dir=drafts_dir)
+    orig_confirm = dlg._settings.value("confirm_delete_draft", True, type=bool)
+    try:
+        assert dlg._table.selectionMode() == QTableWidget.SelectionMode.ExtendedSelection
+        assert dlg._table.rowCount() == 3
+
+        # Ensure confirmation is enabled, then check "Do not remind me again" and delete 2 rows at once
+        dlg._settings.setValue("confirm_delete_draft", True)
+        dlg._confirm_del_cb.setChecked(True)
+        sel = dlg._table.selectionModel()
+        sel.clearSelection()
+        sel.select(dlg._table.model().index(0, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        sel.select(dlg._table.model().index(2, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        assert len(dlg._selected_entries()) == 2
+
+        exec_calls = []
+
+        def _fake_exec(msg_self):
+            exec_calls.append(msg_self.text())
+            cb = msg_self.checkBox()
+            assert cb is not None and cb.text() == "Do not remind me again"
+            cb.setChecked(True)
+            return QMessageBox.StandardButton.Yes
+
+        monkeypatch.setattr(QMessageBox, "exec", _fake_exec)
+        dlg._delete_selected()
+        assert len(exec_calls) == 1
+        assert "2 selected saved drafts" in exec_calls[0]
+        assert dlg._table.rowCount() == 1
+        assert dlg._confirm_del_cb.isChecked() is False
+
+        # Deleting the remaining row should NOT show the popup again
+        dlg._table.selectRow(0)
+        dlg._delete_selected()
+        assert len(exec_calls) == 1
+        assert dlg._table.rowCount() == 0
+    finally:
+        dlg._settings.setValue("confirm_delete_draft", orig_confirm)
+        dlg._settings.sync()
+        dlg.close()
+        app.processEvents()

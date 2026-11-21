@@ -53,7 +53,7 @@ class ProjectOrganizerDialog(QDialog):
         self._table = QTableWidget(0, 4, self)
         self._table.setHorizontalHeaderLabels(["Project / Song", "Sync Progress", "Audio Files", "Last Saved"])
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         hdr = self._table.horizontalHeader()
@@ -71,6 +71,10 @@ class ProjectOrganizerDialog(QDialog):
         self._inc_audio_cb.toggled.connect(self._on_inc_audio_toggled)
         row_bundle.addWidget(self._inc_audio_cb)
         row_bundle.addStretch()
+        self._confirm_del_cb = QCheckBox("Confirm before deleting drafts", self)
+        self._confirm_del_cb.setChecked(self._settings.value("confirm_delete_draft", True, type=bool))
+        self._confirm_del_cb.toggled.connect(self._on_confirm_del_toggled)
+        row_bundle.addWidget(self._confirm_del_cb)
         root.addLayout(row_bundle)
 
         btns = QHBoxLayout()
@@ -116,6 +120,10 @@ class ProjectOrganizerDialog(QDialog):
         self._settings.setValue("bundle_include_audio", bool(checked))
         self._settings.sync()
 
+    def _on_confirm_del_toggled(self, checked: bool) -> None:
+        self._settings.setValue("confirm_delete_draft", bool(checked))
+        self._settings.sync()
+
     def _refresh_table(self) -> None:
         self._entries = list_archived_drafts(self._drafts_dir)
         self._table.setRowCount(len(self._entries))
@@ -139,11 +147,21 @@ class ProjectOrganizerDialog(QDialog):
         if self._entries:
             self._table.selectRow(0)
 
+    def _selected_entries(self) -> List[Tuple[Path, TapSyncDraft]]:
+        sel_model = self._table.selectionModel()
+        rows = sorted({idx.row() for idx in sel_model.selectedRows()}) if sel_model is not None else []
+        if not rows:
+            cur = self._table.currentRow()
+            if 0 <= cur < len(self._entries):
+                rows = [cur]
+        return [self._entries[r] for r in rows if 0 <= r < len(self._entries)]
+
     def _current_entry(self) -> Optional[Tuple[Path, TapSyncDraft]]:
         row = self._table.currentRow()
         if 0 <= row < len(self._entries):
             return self._entries[row]
-        return None
+        selected = self._selected_entries()
+        return selected[0] if selected else None
 
     def _open_selected(self) -> None:
         entry = self._current_entry()
@@ -188,22 +206,43 @@ class ProjectOrganizerDialog(QDialog):
         self.accept()
 
     def _delete_selected(self) -> None:
-        entry = self._current_entry()
-        if entry is None:
+        entries = self._selected_entries()
+        if not entries:
             return
-        path, draft = entry
-        reply = QMessageBox.question(
-            self,
-            "Delete Draft",
-            f"Delete saved draft '{draft.display_name}'?\n(Original audio files are NOT deleted.)",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        if self._settings.value("confirm_delete_draft", True, type=bool):
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Question)
+            if len(entries) == 1:
+                msg.setWindowTitle("Delete Draft")
+                msg.setText(
+                    f"Delete saved draft '{entries[0][1].display_name}'?\n"
+                    "(Original audio files are NOT deleted.)"
+                )
+            else:
+                msg.setWindowTitle("Delete Drafts")
+                msg.setText(
+                    f"Delete {len(entries)} selected saved drafts?\n"
+                    "(Original audio files are NOT deleted.)"
+                )
+            cb = QCheckBox("Do not remind me again", msg)
+            msg.setCheckBox(cb)
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+            if msg.exec() != QMessageBox.StandardButton.Yes:
+                return
+            if cb.isChecked():
+                self._settings.setValue("confirm_delete_draft", False)
+                self._settings.sync()
+                self._confirm_del_cb.blockSignals(True)
+                self._confirm_del_cb.setChecked(False)
+                self._confirm_del_cb.blockSignals(False)
+
+        for path, _ in entries:
             try:
                 path.unlink(missing_ok=True)
             except Exception:
                 pass
-            self._refresh_table()
+        self._refresh_table()
 
     def _cleanup_completed(self) -> None:
         completed = [

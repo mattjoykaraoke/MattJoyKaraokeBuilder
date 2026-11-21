@@ -445,6 +445,7 @@ class MainWindow(QMainWindow):
         self.tap_sync_view.project_built.connect(self._on_tap_sync_project_built)
         self.tap_sync_view.status_message.connect(self.statusBar().showMessage)
         self.tap_sync_view.main_audio_status_changed.connect(self._on_tap_sync_main_audio_status)
+        self.tap_sync_view.dirty_changed.connect(lambda _d: self._refresh_actions())
 
         self.display_view.viewport_changed.connect(self._on_display_viewport)
         self.wiping_view.viewport_changed.connect(self._on_wiping_viewport)
@@ -825,11 +826,11 @@ class MainWindow(QMainWindow):
         self.tap_sync_view.open_project_organizer()
 
     def new_project(self) -> None:
-        if self.history.is_dirty:
+        if self.history.is_dirty or self.tap_sync_view.is_dirty:
             reply = QMessageBox.question(
                 self,
                 "New Project",
-                "You have unsaved .kbp changes. Start a fresh project anyway?",
+                "You have unsaved changes. Start a fresh project anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             )
             if reply != QMessageBox.StandardButton.Yes:
@@ -1152,7 +1153,74 @@ class MainWindow(QMainWindow):
         if not self._preview_positioned and self._act_preview.isChecked():
             self._set_preview_visible(True)
 
+    def _has_unsaved_changes(self) -> bool:
+        return bool(self.history.is_dirty or self.tap_sync_view.is_dirty)
+
+    def _confirm_save_before_close(self) -> bool:
+        """
+        Prompt the user if there are unsaved .kbp or Tap Sync changes.
+        Returns True if safe to proceed with closing, False to cancel closing.
+        """
+        if self.tap_sync_view.is_syncing:
+            self.tap_sync_view.stop_syncing()
+
+        kbp_dirty = self.project is not None and self.history.is_dirty
+        tap_dirty = self.tap_sync_view.is_dirty
+        if not kbp_dirty and not tap_dirty:
+            return True
+
+        if self.project is not None:
+            proj_name = (
+                self.project.source_path.name
+                if self.project.source_path
+                else (self.project.header.title or "Untitled .kbp")
+            )
+            if tap_dirty and kbp_dirty:
+                detail = (
+                    f"'{proj_name}' has unsaved changes in both Tap Sync and Lyrics Wiping / Display.\n\n"
+                    "Choose Save to apply your Tap Sync edits and save the .kbp file before closing."
+                )
+            elif tap_dirty:
+                detail = (
+                    f"'{proj_name}' has unapplied edits in Tap Sync.\n\n"
+                    "Choose Save to apply those edits and save the .kbp file before closing."
+                )
+            else:
+                detail = f"'{proj_name}' has unsaved changes.\n\nDo you want to save before closing?"
+        else:
+            draft_name = self.tap_sync_view.draft.display_name
+            detail = (
+                f"Tap Sync draft '{draft_name}' has unsaved changes.\n\n"
+                "Do you want to save your Tap Sync draft before closing?"
+            )
+
+        reply = QMessageBox.warning(
+            self,
+            "Unsaved Changes",
+            detail,
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if reply == QMessageBox.StandardButton.Cancel:
+            return False
+        if reply == QMessageBox.StandardButton.Discard:
+            return True
+
+        # User chose Save
+        if self.project is not None:
+            if tap_dirty and self.tap_sync_view.draft.pages:
+                existing_source = self.project.source_path
+                rebuilt = self.tap_sync_view.draft.build_kbp_project()
+                rebuilt.source_path = existing_source
+                self.project = rebuilt
+                self.tap_sync_view.mark_clean()
+            return self.save_kbp()
+        return self.tap_sync_view.save_draft()
+
     def closeEvent(self, event) -> None:
+        if not self._confirm_save_before_close():
+            event.ignore()
+            return
         self.preview_win.close()
         super().closeEvent(event)
 
@@ -1180,12 +1248,11 @@ class MainWindow(QMainWindow):
             self._refresh_actions()
             self.statusBar().showMessage("Redid action", 2500)
 
-    def save_kbp(self) -> None:
+    def save_kbp(self) -> bool:
         if not self.project:
-            return
+            return False
         if self.project.source_path is None:
-            self.save_kbp_as()
-            return
+            return self.save_kbp_as()
         self.project.save()
         if self.audio.vocal_path:
             self._save_vocal_stem_for_project(self.project.source_path, self.audio.vocal_path, audio_path=self.audio.main_path)
@@ -1193,10 +1260,11 @@ class MainWindow(QMainWindow):
         self._sync_tap_view_from_project(locked=True, reason="Sync saved")
         self._refresh_actions()
         self.statusBar().showMessage(f"Saved {self.project.source_path.name}", 3500)
+        return True
 
-    def save_kbp_as(self) -> None:
+    def save_kbp_as(self) -> bool:
         if not self.project:
-            return
+            return False
         default_dir = str(self.project.source_path.parent) if self.project.source_path else ""
         path, _ = QFileDialog.getSaveFileName(self, "Save KBP Project As", default_dir, "Karaoke Builder Projects (*.kbp)")
         if path:
@@ -1207,6 +1275,8 @@ class MainWindow(QMainWindow):
             self._sync_tap_view_from_project(locked=True, reason="Sync saved")
             self._refresh_actions()
             self.statusBar().showMessage(f"Saved {Path(path).name}", 3500)
+            return True
+        return False
 
     def _shift_whole_track(self) -> None:
         if not self.project:
@@ -1237,9 +1307,14 @@ class MainWindow(QMainWindow):
         self._act_redo.setText(f"&Redo: {self.history.redo_label}" if self.history.can_redo else "&Redo")
 
         title = "Advanced KBP Editor"
+        dirty = "*" if (self.history.is_dirty or self.tap_sync_view.is_dirty) else ""
         if self.project and self.project.source_path:
-            dirty = "*" if self.history.is_dirty else ""
             title = f"{dirty}{self.project.source_path.name} — Advanced KBP Editor"
+        elif self.project:
+            proj_name = self.project.header.title or "Untitled.kbp"
+            title = f"{dirty}{proj_name} — Advanced KBP Editor"
+        elif self.tap_sync_view.is_dirty:
+            title = f"*{self.tap_sync_view.draft.display_name} — Advanced KBP Editor"
         self.setWindowTitle(title)
 
     @staticmethod
