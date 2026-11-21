@@ -28,7 +28,9 @@ from ..audio import AudioEngine
 from ..history import HistoryManager
 from ..model import KbpProject
 from ..tap_sync import register_saved_project
+from .about_dialog import AboutDialog
 from .display_view import DisplayRemoveView
+from .finishing_view import FinishingView
 from .minimap_widget import SongMinimapWidget
 from .preview_widget import FloatingPreviewWindow
 from .tap_sync_view import TapSyncView
@@ -74,14 +76,16 @@ class MainWindow(QMainWindow):
         self._rebuild_page_buttons()
         nav_layout.addLayout(self._page_bar_layout)
 
-        # Tabs: Tap Sync (modular), Lyrics Wiping, Display / Remove
+        # Tabs: Tap Sync (modular), Lyrics Wiping, Display / Remove, Finishing
         self._tabs = QTabWidget(central)
         self.tap_sync_view = TapSyncView(self.audio, self._tabs)
         self.wiping_view = LyricsWipingView(self.audio, self._tabs)
         self.display_view = DisplayRemoveView(self._tabs)
+        self.finishing_view = FinishingView(self._tabs)
         self._tabs.addTab(self.tap_sync_view, "Tap Sync")
         self._tabs.addTab(self.wiping_view, "Lyrics Wiping (Manual Alignment)")
         self._tabs.addTab(self.display_view, "Display / Remove Window")
+        self._tabs.addTab(self.finishing_view, "Finishing")
         self._tabs.setCurrentWidget(self.wiping_view)
         self._tabs.currentChanged.connect(self._sync_minimap_from_active_tab)
 
@@ -231,6 +235,11 @@ class MainWindow(QMainWindow):
             self.tap_sync_view.set_playhead_cs(cs)
             self.minimap.set_viewport(*self.tap_sync_view.viewport_window_cs())
             self.tap_sync_view.setFocus()
+        elif cur_tab is self.finishing_view:
+            if self.wiping_view.is_word_adjust_mode:
+                self.wiping_view.exit_word_adjust_mode()
+            if self.preview_win.isVisible():
+                self.preview_win.hide()
         else:
             if self._preview_user_enabled and not self.preview_win.isVisible() and self.isVisible():
                 self._set_preview_visible(True)
@@ -419,6 +428,9 @@ class MainWindow(QMainWindow):
         act_reset_zoom.setShortcut(QKeySequence("Ctrl+0"))
         act_reset_zoom.triggered.connect(self._reset_zoom_active)
         m_view.addAction(act_reset_zoom)
+
+        act_about = mb.addAction("&About")
+        act_about.triggered.connect(self._open_about_dialog)
 
         self.preview_win.visibility_changed.connect(self._on_preview_visibility_changed)
 
@@ -1010,9 +1022,14 @@ class MainWindow(QMainWindow):
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
 
+    def _open_about_dialog(self) -> None:
+        dlg = AboutDialog(self)
+        dlg.exec()
+
     def _bind_project_to_views(self, preserve_view: bool = False) -> None:
         self.display_view.set_project(self.project, preserve_view=preserve_view)
         self.wiping_view.set_project(self.project, preserve_view=preserve_view)
+        self.finishing_view.set_project(self.project)
         self.preview_win.canvas.set_project(self.project)
         self.minimap.set_project(self.project)
 

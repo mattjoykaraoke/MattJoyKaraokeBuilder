@@ -1,0 +1,29 @@
+Copyright (c) 2026 Matt Joy. All Rights Reserved.
+
+PROPRIETARY SOFTWARE LICENSE
+
+This software ("Advanced KBP Editor"), including its source code, UI design,
+documentation, and associated assets (excluding third-party open-source
+libraries listed in THIRD_PARTY_LICENSES.md), is the proprietary intellectual
+property of Matt Joy.
+
+1. No Reuse Without Permission
+   You may NOT copy, reuse, modify, merge, publish, distribute, sublicense,
+   or sell any part of the source code or create derivative works from this
+   software without express prior written permission from the copyright holder
+   (Matt Joy — mattjoykaraoke@gmail.com).
+
+2. Third-Party Open-Source Components
+   This software uses third-party open-source libraries licensed under LGPL,
+   BSD, and MIT licenses (detailed in THIRD_PARTY_LICENSES.md). Nothing in
+   this license restricts the rights granted to you under those respective
+   open-source licenses with respect to those third-party libraries, including
+   your right under LGPL to replace or relink the dynamically linked LGPL
+   shared libraries.
+
+3. Disclaimer of Warranty
+   THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+   THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
