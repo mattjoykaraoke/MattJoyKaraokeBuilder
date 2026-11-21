@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
@@ -499,6 +500,31 @@ class MainWindow(QMainWindow):
             return str(self.project.source_path.parent)
         return ""
 
+    @staticmethod
+    def _vocal_stem_key(kbp_path: Path) -> str:
+        try:
+            return str(kbp_path.resolve()).lower()
+        except Exception:
+            return str(kbp_path).lower()
+
+    def _load_vocal_stem_map(self) -> Dict[str, str]:
+        raw = self._settings.value("vocal_stems_json", "{}", type=str)
+        try:
+            data = json.loads(raw) if raw else {}
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _get_saved_vocal_stem(self, kbp_path: Path) -> Optional[str]:
+        return self._load_vocal_stem_map().get(self._vocal_stem_key(kbp_path))
+
+    def _save_vocal_stem_for_project(self, kbp_path: Path, vocal_path: str | Path) -> None:
+        mapping = self._load_vocal_stem_map()
+        mapping[self._vocal_stem_key(kbp_path)] = str(Path(vocal_path))
+        self._settings.setValue("vocal_stems_json", json.dumps(mapping))
+
     def _set_main_audio_missing_hint(self, missing: bool, raw_path: str = "") -> None:
         if missing:
             self._load_main_btn.setStyleSheet("background-color: #b45309; color: white; font-weight: bold;")
@@ -545,6 +571,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         if self.audio.load_vocal_stem(path):
+            if self.project and self.project.source_path:
+                self._save_vocal_stem_for_project(self.project.source_path, path)
             self.statusBar().showMessage(f"Loaded vocal stem: {Path(path).name}", 4000)
         else:
             QMessageBox.warning(
@@ -583,6 +611,17 @@ class MainWindow(QMainWindow):
             self.audio.clear_main()
         self._set_main_audio_missing_hint(not audio_loaded, proj.header.audio_path)
 
+        vocal_loaded = False
+        saved_vocal = self._get_saved_vocal_stem(Path(path))
+        if saved_vocal:
+            vocal_loaded = self.audio.load_vocal_stem(saved_vocal)
+        if not vocal_loaded:
+            self.audio.clear_vocal()
+            if self._audio_src_combo.currentIndex() != 0:
+                self._audio_src_combo.blockSignals(True)
+                self._audio_src_combo.setCurrentIndex(0)
+                self._audio_src_combo.blockSignals(False)
+
         if proj.pages:
             self._highlight_page_button(0)
             self._scrub_to(float(proj.pages[0].display_start))
@@ -592,6 +631,8 @@ class MainWindow(QMainWindow):
         if flushed_gaps > 0:
             bak_info = f", backup: {bak_path.name}" if bak_path is not None else ""
             msg += f" — flushed {flushed_gaps} × 1 cs gap{'s' if flushed_gaps != 1 else ''}{bak_info}"
+        if vocal_loaded and saved_vocal:
+            msg += f" — vocal stem: {Path(saved_vocal).name}"
         if not audio_loaded:
             msg += " — main audio missing/unreadable (click 'Load Main Audio…')"
         self.statusBar().showMessage(msg, 7000 if (flushed_gaps > 0 or not audio_loaded) else 4000)
@@ -720,6 +761,8 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save KBP Project As", default_dir, "Karaoke Builder Projects (*.kbp)")
         if path:
             self.project.save(path)
+            if self.audio.vocal_path:
+                self._save_vocal_stem_for_project(Path(path), self.audio.vocal_path)
             self.history.mark_saved()
             self._refresh_actions()
             self.statusBar().showMessage(f"Saved {Path(path).name}", 3500)

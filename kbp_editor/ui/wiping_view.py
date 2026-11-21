@@ -708,18 +708,8 @@ class _WipingTimelineCanvas(QWidget):
             _draw_marker(cur_line.display_end, QColor(251, 146, 60), f"L{self.line_idx + 1} REM", RULER_H + 22, width=1.2)
 
     def _paint_grid(self, painter: QPainter, w: int, h: int) -> None:
-        if self.px_per_cs >= 8.0:
-            step_cs = 5
-        elif self.px_per_cs >= 4.0:
-            step_cs = 10
-        elif self.px_per_cs >= 2.0:
-            step_cs = 25
-        elif self.px_per_cs >= 1.2:
-            step_cs = 50
-        elif self.px_per_cs >= 0.4:
-            step_cs = 100
-        else:
-            step_cs = 500
+        steps = (5, 10, 25, 50, 100, 200, 500, 1000)
+        step_cs = next((s for s in steps if s * self.px_per_cs >= 28.0), steps[-1])
         start_cs = int(self.scroll_x_cs // step_cs) * step_cs
         end_cs = self.x_to_cs(w) + step_cs
         painter.setPen(QPen(QColor(38, 42, 50), 1))
@@ -733,16 +723,8 @@ class _WipingTimelineCanvas(QWidget):
         painter.drawLine(0, RULER_H - 1, w, RULER_H - 1)
         painter.setFont(QFont("Segoe UI", 8))
 
-        if self.px_per_cs >= 8.0:
-            step_cs = 10
-        elif self.px_per_cs >= 3.5:
-            step_cs = 25
-        elif self.px_per_cs >= 1.5:
-            step_cs = 50
-        elif self.px_per_cs >= 0.5:
-            step_cs = 100
-        else:
-            step_cs = 500
+        steps = (5, 10, 25, 50, 100, 200, 500, 1000)
+        step_cs = next((s for s in steps if s * self.px_per_cs >= 78.0), steps[-1])
         start_cs = int(self.scroll_x_cs // step_cs) * step_cs
         end_cs = self.x_to_cs(w) + step_cs
         for t in range(start_cs, end_cs + 1, step_cs):

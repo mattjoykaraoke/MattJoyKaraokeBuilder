@@ -32,6 +32,14 @@ HANDLE_HIT_PX = 8
 
 
 DEFAULT_DISPLAY_PX_PER_CS = 0.25
+_TIME_STEPS_CS = (5, 10, 25, 50, 100, 200, 500, 1000, 1500, 3000, 6000)
+
+
+def _nice_step_cs(px_per_cs: float, min_px: float) -> int:
+    for step in _TIME_STEPS_CS:
+        if step * px_per_cs >= min_px:
+            return step
+    return _TIME_STEPS_CS[-1]
 
 
 class _DisplayTimelineCanvas(QWidget):
@@ -147,20 +155,16 @@ class _DisplayTimelineCanvas(QWidget):
         self._paint_playhead(painter, h)
 
     def _paint_grid(self, painter: QPainter, w: int, h: int) -> None:
-        step_cs = 100
-        if self.px_per_cs < 0.08:
-            step_cs = 1000
-        elif self.px_per_cs < 0.2:
-            step_cs = 500
-        elif self.px_per_cs > 1.0:
-            step_cs = 50
+        step_cs = _nice_step_cs(self.px_per_cs, min_px=24.0)
+        major_cs = _nice_step_cs(self.px_per_cs, min_px=76.0)
 
         start_cs = int(self.scroll_x_cs // step_cs) * step_cs
         end_cs = self.x_to_cs(w) + step_cs
-        painter.setPen(QPen(QColor(42, 46, 54), 1))
         for t in range(start_cs, end_cs + 1, step_cs):
             x = int(self.cs_to_x(t))
             if x >= LABEL_COL_W:
+                is_major = (t % major_cs == 0)
+                painter.setPen(QPen(QColor(52, 57, 67) if is_major else QColor(36, 40, 47), 1))
                 painter.drawLine(x, RULER_H, x, h)
 
     def _paint_ruler(self, painter: QPainter, w: int) -> None:
@@ -173,18 +177,32 @@ class _DisplayTimelineCanvas(QWidget):
         painter.setPen(QColor(175, 182, 195))
         painter.drawText(8, 0, LABEL_COL_W - 16, RULER_H, Qt.AlignmentFlag.AlignVCenter, "Page / Line (click to jump)")
 
-        step_cs = 500 if self.px_per_cs < 0.2 else (100 if self.px_per_cs < 1.0 else 50)
-        start_cs = int(self.scroll_x_cs // step_cs) * step_cs
-        end_cs = self.x_to_cs(w) + step_cs
-        for t in range(start_cs, end_cs + 1, step_cs):
+        minor_cs = _nice_step_cs(self.px_per_cs, min_px=24.0)
+        major_cs = _nice_step_cs(self.px_per_cs, min_px=76.0)
+        start_cs = int(self.scroll_x_cs // minor_cs) * minor_cs
+        end_cs = self.x_to_cs(w) + major_cs
+
+        painter.save()
+        painter.setClipRect(LABEL_COL_W + 1, 0, max(0, w - LABEL_COL_W - 1), RULER_H)
+        for t in range(start_cs, end_cs + 1, minor_cs):
             x = int(self.cs_to_x(t))
-            if x >= LABEL_COL_W:
-                painter.setPen(QColor(95, 102, 115))
-                painter.drawLine(x, RULER_H - 7, x, RULER_H - 1)
+            if x < LABEL_COL_W:
+                continue
+            is_major = (t % major_cs == 0)
+            painter.setPen(QColor(115, 124, 138) if is_major else QColor(72, 78, 90))
+            tick_h = 8 if is_major else 4
+            painter.drawLine(x, RULER_H - tick_h, x, RULER_H - 1)
+            if is_major:
                 sec = t / 100.0
-                lbl = f"{int(sec // 60)}:{sec % 60:04.1f}"
-                painter.setPen(QColor(185, 192, 205))
-                painter.drawText(x + 3, 2, 60, RULER_H - 6, Qt.AlignmentFlag.AlignVCenter, lbl)
+                if major_cs >= 100:
+                    lbl = f"{int(sec // 60)}:{int(sec % 60):02d}"
+                elif major_cs >= 10:
+                    lbl = f"{int(sec // 60)}:{sec % 60:04.1f}"
+                else:
+                    lbl = f"{int(sec // 60)}:{sec % 60:05.2f}"
+                painter.setPen(QColor(195, 202, 215))
+                painter.drawText(x + 4, 2, 68, RULER_H - 6, Qt.AlignmentFlag.AlignVCenter, lbl)
+        painter.restore()
 
     def _paint_rows(self, painter: QPainter, w: int, h: int) -> None:
         # 1. Paint Page section headers matching the Lyrics Wiping left bar

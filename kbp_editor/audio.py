@@ -173,6 +173,21 @@ class AudioEngine(QObject):
         self.duration_cs = self.vocal_waveform.duration_cs if self.vocal_waveform is not None else 0
         self.waveform_loaded.emit()
 
+    def clear_vocal(self) -> None:
+        """Clear any previously loaded vocal stem audio and waveform."""
+        if self.is_playing and self.use_vocal_audio:
+            self.pause()
+        self.vocal_path = None
+        self.vocal_waveform = None
+        if self.use_vocal_audio:
+            self.use_vocal_audio = False
+            if self.main_path and self.main_path.exists():
+                self._player.setSource(QUrl.fromLocalFile(str(self.main_path)))
+            else:
+                self._player.setSource(QUrl())
+        self.duration_cs = self.main_waveform.duration_cs if self.main_waveform is not None else 0
+        self.waveform_loaded.emit()
+
     def load_main(self, path: str | Path) -> bool:
         p = Path(path)
         if not p.exists() or not p.is_file():
