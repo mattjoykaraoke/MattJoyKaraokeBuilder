@@ -19,6 +19,9 @@ from .model import (
     Page,
     SEPARATOR,
     Syllable,
+    extract_kbp_header_lines,
+    parse_line_to_syllables,
+    read_kbp_text,
 )
 
 
@@ -79,24 +82,6 @@ DEFAULT_KBP_HEADER_LINES: List[str] = [
     "          github.com/mattjoykaraoke",
     "",
 ]
-
-
-def parse_line_to_syllables(raw_line: str) -> List[str]:
-    """
-    Parse a single KBS / Local Lyric Splitter line into KBP syllable strings.
-    - Spaces separate words (trailing space attached to the last syllable of each word except the final word).
-    - '/' splits a word into explicit syllables (e.g. 'ev/ery/thing' -> ['ev', 'ery', 'thing'],
-      '➣➣➣/The snow' -> ['➣➣➣', 'The ', 'snow']).
-    """
-    words = [w for w in raw_line.strip().split(" ") if w]
-    out: List[str] = []
-    for w_idx, word in enumerate(words):
-        parts = [p for p in word.split("/") if p]
-        for p_idx, part in enumerate(parts):
-            is_last_of_word = p_idx == len(parts) - 1
-            is_last_word = w_idx == len(words) - 1
-            out.append(part + (" " if (is_last_of_word and not is_last_word) else ""))
-    return out
 
 
 @dataclass
@@ -341,20 +326,10 @@ class TapSyncDraft:
         preserving its HEADERV2 (styles, colors, fonts, title, artist, audio path).
         """
         p = Path(path)
-        raw = p.read_bytes()
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")
-        raw_lines = text.splitlines()
+        raw_lines = read_kbp_text(p).splitlines()
 
-        lyrics_idx = next((i for i, l in enumerate(raw_lines) if l.strip() == "LYRICSV2"), None)
+        lyrics_idx, header_lines = extract_kbp_header_lines(raw_lines, section_markers=("LYRICSV2",))
         if lyrics_idx is not None:
-            # Extract header up to the separator preceding LYRICSV2
-            sep_idx = lyrics_idx - 1
-            while sep_idx > 0 and not raw_lines[sep_idx].startswith("---"):
-                sep_idx -= 1
-            header_lines = raw_lines[:sep_idx]
             header = KbpHeader.parse(header_lines)
 
             body_lines: List[str] = []
@@ -499,30 +474,9 @@ class TapSyncDraft:
         p = Path(path)
         if not p.exists():
             return None
-        raw = p.read_bytes()
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")
-        raw_lines = text.splitlines()
-        marker = next((i for i, l in enumerate(raw_lines) if l.strip() in ("PAGEV2", "LYRICSV2")), None)
-        if marker is None:
-            return None
-        sep = marker - 1
-        while sep > 0 and not raw_lines[sep].startswith("---"):
-            sep -= 1
-        return raw_lines[:sep]
-
-    @staticmethod
-    def _set_header_field(raw_lines: List[str], field_name: str, value: str) -> None:
-        for i, line in enumerate(raw_lines):
-            if line.startswith(field_name):
-                rest = line[len(field_name) :]
-                pad_len = len(rest) - len(rest.lstrip(" \t"))
-                pad = rest[:pad_len] if pad_len > 0 else "   "
-                raw_lines[i] = f"{field_name}{pad}{value}"
-                return
-        raw_lines.append(f"{field_name}     {value}")
+        raw_lines = read_kbp_text(p).splitlines()
+        marker_idx, header_lines = extract_kbp_header_lines(raw_lines, section_markers=("PAGEV2", "LYRICSV2"))
+        return header_lines if marker_idx is not None else None
 
     def build_kbp_project(self, default_tail_cs: int = 35) -> KbpProject:
         """
@@ -541,11 +495,9 @@ class TapSyncDraft:
 
         header = KbpHeader.parse(header_lines)
         if self.title:
-            header.title = self.title
-            self._set_header_field(header.raw_lines, "Title", self.title)
+            header.set_title(self.title)
         if self.artist:
-            header.artist = self.artist
-            self._set_header_field(header.raw_lines, "Artist", self.artist)
+            header.set_artist(self.artist)
         if self.audio_path:
             header.set_audio_path(self.audio_path)
         header.ensure_default_comments()
@@ -681,19 +633,7 @@ def list_saved_projects(registry_path: Optional[Path] = None) -> List[Path]:
 
 def list_archived_drafts(drafts_dir: Optional[Path] = None) -> List[Tuple[Path, TapSyncDraft]]:
     """Return all .mjkp drafts in a folder sorted newest-first."""
-    folder = drafts_dir or default_autosaves_dir()
-    if not folder.exists():
-        return []
-    entries: List[Tuple[float, Path, TapSyncDraft]] = []
-    for p in folder.glob("*.mjkp"):
-        try:
-            d = TapSyncDraft.load_json(p)
-            mtime = p.stat().st_mtime
-            entries.append((mtime, p, d))
-        except Exception:
-            continue
-    entries.sort(key=lambda item: item[0], reverse=True)
-    return [(p, d) for _, p, d in entries]
+    return list_autosave_drafts(autosaves_dir=drafts_dir, include_legacy=False)
 
 
 def list_autosave_drafts(

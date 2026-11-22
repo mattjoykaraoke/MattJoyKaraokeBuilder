@@ -16,15 +16,12 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_AUTHOR, APP_EMAIL, APP_GITHUB_URL, APP_NAME, __version__
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent.parent
+from .common import repo_root
 
 
 def _build_placeholder_logo(size: int = 84) -> QPixmap:
     """Load assets/logo.png if present, otherwise render a clean vector placeholder badge."""
-    logo_path = _repo_root() / "assets" / "logo.png"
+    logo_path = repo_root() / "assets" / "logo.png"
     if logo_path.is_file():
         pm = QPixmap(str(logo_path))
         if not pm.isNull():
@@ -66,12 +63,10 @@ class _LicensesDialog(QDialog):
 
         parts = []
         for fname in ("LICENSE", "THIRD_PARTY_LICENSES.md"):
-            fp = _repo_root() / fname
+            fp = repo_root() / fname
             if fp.is_file():
                 parts.append(fp.read_text(encoding="utf-8", errors="replace"))
-        txt.setPlainText("\n\n" + ("=" * 72) + "\n\n".join(parts) if parts else "License files not found.")
-        if parts:
-            txt.setPlainText(("\n\n" + ("=" * 72) + "\n\n").join(parts))
+        txt.setPlainText(("\n\n" + ("=" * 72) + "\n\n").join(parts) if parts else "License files not found.")
         root.addWidget(txt, 1)
 
         btn_row = QHBoxLayout()

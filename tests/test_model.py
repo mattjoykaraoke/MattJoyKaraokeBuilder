@@ -477,3 +477,41 @@ def test_header_set_audio_path_updates_existing_and_missing(tmp_path):
     hdr2.set_audio_path(r"C:\music\added.wav")
     assert hdr2.audio_path == r"C:\music\added.wav"
     assert KbpHeader.parse(hdr2.raw_lines).audio_path == r"C:\music\added.wav"
+
+
+def test_cross_line_and_cross_page_adjacent_syllable_snapping():
+    proj = _sample_project()
+    # Snap first syllable of Page 0 Line 1 ("➣➣➣" at 1360..1495) back to last syllable of Page 0 Line 0 ("lo" ending at 1300)
+    assert proj.snap_syllable_start(0, 1, 0)
+    assert proj.pages[0].lines[1].syllables[0].start == 1300
+
+    # Snap last syllable of Page 0 Line 1 ("world" at 1496..1600) forward to first syllable of Page 1 Line 0 ("➣➣➣" starting at 1700)
+    assert proj.snap_syllable_end(0, 1, 1)
+    assert proj.pages[0].lines[1].syllables[1].end == 1700
+
+
+def test_bounded_history_manager_trims_oldest_snapshots():
+    proj = _sample_project()
+    hist = HistoryManager(proj, max_entries=5)
+    assert hist.count == 1
+    assert not hist.is_dirty
+
+    for step in range(1, 8):
+        proj.shift_all(10)
+        hist.push(f"Step {step}", proj)
+
+    assert hist.count == 5
+    assert hist.is_dirty
+    assert hist.history_labels() == ["Step 3", "Step 4", "Step 5", "Step 6", "Step 7"]
+    hist.mark_saved()
+    assert not hist.is_dirty
+
+    # Push one more so saved index shifts down by 1 and remains valid
+    proj.shift_all(10)
+    hist.push("Step 8", proj)
+    assert hist.count == 5
+    assert hist.is_dirty
+    undone = hist.undo()
+    assert undone is not None
+    assert not hist.is_dirty
+

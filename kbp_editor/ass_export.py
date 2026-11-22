@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import io
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .model import KbpProject
+from .model import KbpProject, read_kbp_text, suggest_project_filename
 
 OVERFLOW_NO_WRAP = "no_wrap"
 OVERFLOW_EVEN_SPLIT = "even_split"
@@ -68,10 +67,6 @@ def _resolve_overflow(kbputils_mod, overflow_key: str):
     return fallback_ints.get(overflow_key, 2)
 
 
-def _clean_filename_part(text: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]', "", text).strip()
-
-
 def suggest_ass_path(project: KbpProject, fallback_dir: Optional[Path] = None) -> Path:
     """
     Build a sensible default `.ass` output path for `project`.
@@ -80,18 +75,12 @@ def suggest_ass_path(project: KbpProject, fallback_dir: Optional[Path] = None) -
     if project.source_path is not None:
         return project.source_path.with_suffix(".ass")
 
-    artist = _clean_filename_part(project.header.artist)
-    title = _clean_filename_part(project.header.title)
-    if artist and title:
-        stem = f"{artist} - {title}"
-    elif title:
-        stem = title
-    elif artist:
-        stem = artist
-    else:
-        stem = "untitled"
-
-    filename = f"{stem}.ass"
+    filename = suggest_project_filename(
+        project.header.artist,
+        project.header.title,
+        ext=".ass",
+        fallback_stem="untitled",
+    )
     if fallback_dir is not None:
         return fallback_dir / filename
     return Path(filename)
@@ -109,10 +98,7 @@ def _kbp_text_to_kbpfile(content: str, filename_hint: str):
 def load_kbp_for_ass(kbp_path: str | Path):
     """Load a `.kbp` file from disk using UTF-8 with CP1252 fallback."""
     path = Path(kbp_path)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        content = path.read_text(encoding="cp1252", errors="replace")
+    content = read_kbp_text(path)
     return _kbp_text_to_kbpfile(content, str(path))
 
 

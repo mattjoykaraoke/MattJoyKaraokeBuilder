@@ -666,3 +666,58 @@ def test_drag_and_drop_mjkp_loads_project_and_updates_organizer(tmp_path, monkey
         win2.tap_sync_view.mark_clean()
         win2.close()
         app.processEvents()
+
+
+def test_tap_sync_direct_coord_stepping_and_preview_cache_retention(tmp_path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtGui import QImage, QPainter
+    from PySide6.QtWidgets import QApplication
+    from kbp_editor.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    synced_path = _write_synced_kbp(tmp_path / "cache_test.kbp")
+    win = MainWindow()
+    try:
+        win.open_kbp(synced_path)
+        draft = TapSyncDraft.from_lyrics_text("One/ two\nThree\n\nFour/ five")
+        tsv = win.tap_sync_view
+        tsv._apply_draft(draft, load_audio=False)
+
+        # Verify allocation-free _next_coord and _prev_coord across line and page boundaries
+        coords = []
+        cur = (0, 0, 0)
+        while cur is not None:
+            coords.append(cur)
+            cur = tsv._next_coord(cur)
+        assert coords == [(0, 0, 0), (0, 0, 1), (0, 1, 0), (1, 0, 0), (1, 0, 1)]
+
+        rev = []
+        cur = coords[-1]
+        while cur is not None:
+            rev.append(cur)
+            cur = tsv._prev_coord(cur)
+        assert rev == list(reversed(coords))
+
+        # Populate PreviewCanvas line cache and WipingTimelineCanvas sublane cache
+        win.preview_win.canvas.set_time_cs(200.0)
+        img = QImage(512, 288, QImage.Format.Format_ARGB32_Premultiplied)
+        win.preview_win.canvas.render(img)
+        assert len(win.preview_win.canvas._line_cache) > 0
+
+        # Timing-only mutation in MainWindow preserves PreviewCanvas 1080p text pixmap cache
+        win.project.pages[0].lines[0].syllables[0].end += 5
+        win._on_project_mutated("Nudge Syllable")
+        assert len(win.preview_win.canvas._line_cache) > 0
+
+        # WipingTimelineCanvas sublane layout cache builds on demand and invalidates on mutation
+        style_order, sublanes = win.wiping_view.canvas._ensure_sublane_layout()
+        assert "A" in style_order and len(sublanes["A"]) == 1
+        win._on_project_mutated("Second Nudge")
+        assert win.wiping_view.canvas._sublane_cache is None
+    finally:
+        win.tap_sync_view.mark_clean()
+        win.history.mark_saved()
+        win.close()
+        app.processEvents()
+

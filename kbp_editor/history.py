@@ -14,12 +14,13 @@ class HistoryEntry:
 
 
 class HistoryManager:
-    """Unlimited snapshot-based Undo/Redo stack for KbpProject."""
+    """Bounded snapshot-based Undo/Redo stack for KbpProject."""
 
-    def __init__(self, initial: Optional[KbpProject] = None) -> None:
+    def __init__(self, initial: Optional[KbpProject] = None, max_entries: int = 150) -> None:
         self._stack: List[HistoryEntry] = []
         self._index: int = -1
         self._saved_index: int = -1
+        self._max_entries: int = max_entries
         if initial is not None:
             self.reset(initial)
 
@@ -35,6 +36,13 @@ class HistoryManager:
             if self._saved_index > self._index:
                 self._saved_index = -1
         self._stack.append(HistoryEntry(label=label, snapshot=deepcopy(project)))
+        if self._max_entries > 0 and len(self._stack) > self._max_entries:
+            overflow = len(self._stack) - self._max_entries
+            del self._stack[:overflow]
+            if self._saved_index >= 0:
+                self._saved_index -= overflow
+                if self._saved_index < 0:
+                    self._saved_index = -1
         self._index = len(self._stack) - 1
 
     @property

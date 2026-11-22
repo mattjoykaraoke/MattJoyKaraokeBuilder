@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import os
-import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 from PySide6.QtCore import QSettings, QThread, Qt, QLineF, QRectF, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
@@ -17,7 +14,6 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPen,
-    QPixmap,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -42,9 +38,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..audio import AudioEngine, WaveformData
+from ..audio import AudioEngine
 from ..local_lyric_splitter import find_local_lyric_splitter_exe, run_local_lyric_splitter
-from ..model import KbpProject
+from ..model import KbpProject, read_kbp_text, suggest_project_filename
 from ..tap_sync import (
     TapLine,
     TapSyllable,
@@ -53,12 +49,8 @@ from ..tap_sync import (
     default_drafts_dir,
     register_saved_project,
 )
+from .common import WaveformTileCache, format_time_cs, make_ribbon_divider, make_ribbon_section
 from .project_organizer import ProjectOrganizerDialog
-
-
-def _autosave_path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    return Path(base) / "MattJoyKaraokeBuilder" / "tap_sync_autosave.mjkp"
 
 
 class _LocalLyricSplitterWorker(QThread):
@@ -343,7 +335,22 @@ class _RollingTeleprompterWidget(QWidget):
         self.is_locked: bool = False
         self.punch_line: Optional[Tuple[int, int]] = None
         self.preview_flat_idx: Optional[int] = None
+        self._cached_flat_lines: Optional[List[Tuple[int, int, TapLine]]] = None
+        self._cached_counts: Optional[Tuple[int, int]] = None
+        self._cached_draft_id: int = 0
         self.setMinimumHeight(220)
+
+    def invalidate_cache(self) -> None:
+        self._cached_flat_lines = None
+        self._cached_counts = None
+
+    def _ensure_draft_cache(self) -> Tuple[List[Tuple[int, int, TapLine]], int, int]:
+        did = id(self.draft)
+        if self._cached_flat_lines is None or self._cached_counts is None or self._cached_draft_id != did:
+            self._cached_flat_lines = self.draft.flat_lines()
+            self._cached_counts = (self.draft.synced_syllables(), self.draft.total_syllables())
+            self._cached_draft_id = did
+        return self._cached_flat_lines, self._cached_counts[0], self._cached_counts[1]
 
     def reset_scroll(self) -> None:
         if self.preview_flat_idx is not None:
@@ -362,7 +369,7 @@ class _RollingTeleprompterWidget(QWidget):
         if self.is_syncing:
             event.ignore()
             return
-        flat_lines = self.draft.flat_lines()
+        flat_lines, _, _ = self._ensure_draft_cache()
         if not flat_lines:
             event.ignore()
             return
@@ -390,7 +397,7 @@ class _RollingTeleprompterWidget(QWidget):
         h = self.height()
         painter.fillRect(0, 0, w, h, QColor(18, 21, 27))
 
-        flat_lines = self.draft.flat_lines()
+        flat_lines, synced, total = self._ensure_draft_cache()
         if not flat_lines:
             painter.setFont(QFont("Segoe UI", 12))
             painter.setPen(QColor(148, 163, 184))
@@ -416,8 +423,6 @@ class _RollingTeleprompterWidget(QWidget):
 
         # Top status pill (Locked / Syncing / Paused phrase / Punch-in / Previewing / Ready)
         if self.is_locked:
-            synced = self.draft.synced_syllables()
-            total = self.draft.total_syllables()
             badge_txt = f"🔒 LOCKED ({synced}/{total} syllables synced) — Click 'Unfreeze Tap Sync' above to re-tap or modify"
             badge_bg = QColor(71, 56, 30, 225)
         elif self.punch_line is not None and self.is_syncing:
@@ -437,8 +442,6 @@ class _RollingTeleprompterWidget(QWidget):
             )
             badge_bg = QColor(30, 58, 95, 220)
         else:
-            synced = self.draft.synced_syllables()
-            total = self.draft.total_syllables()
             badge_txt = f"READY ({synced}/{total} syllables synced) — Click 'Start Sync' or press Space to begin"
             badge_bg = QColor(38, 46, 60, 210)
 
@@ -544,28 +547,25 @@ class _TapWaveformStrip(QWidget):
         self.px_per_cs: float = 2.4
         self._dragging: bool = False
         self._drag_scroll_left_cs: Optional[float] = None
-        # 3-screen-wide waveform tile cache so 60 fps scrolling is a single fast drawPixmap blit
-        self._tile_pm: Optional[QPixmap] = None
-        self._tile_start_cs: float = 0.0
-        self._tile_span_cs: float = 0.0
-        self._tile_key: Optional[Tuple] = None
+        self._wave_tile = WaveformTileCache(step_px=1)
         self.setMinimumHeight(110)
         self.setMaximumHeight(150)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     def invalidate_cache(self) -> None:
-        self._tile_pm = None
-        self._tile_key = None
+        self._wave_tile.invalidate()
 
     def _max_cs(self) -> float:
         if self.audio.duration_cs > 0:
             return float(self.audio.duration_cs)
         max_syl = 0
-        for _, _, _, syl in self.draft.flat_syllables():
-            if syl.end_cs is not None:
-                max_syl = max(max_syl, syl.end_cs)
-            elif syl.start_cs is not None:
-                max_syl = max(max_syl, syl.start_cs)
+        for page in self.draft.pages:
+            for line in page.lines:
+                for syl in line.syllables:
+                    if syl.end_cs is not None and syl.end_cs > max_syl:
+                        max_syl = syl.end_cs
+                    elif syl.start_cs is not None and syl.start_cs > max_syl:
+                        max_syl = syl.start_cs
         return float(max(max_syl + 200, 6000))
 
     def _clamp_cs(self, cs: float) -> float:
@@ -581,72 +581,6 @@ class _TapWaveformStrip(QWidget):
 
     def _x_to_cs(self, x: float) -> float:
         return self._clamp_cs(self._scroll_left_cs() + x / max(1e-6, self.px_per_cs))
-
-    def _draw_wave_layer_at(
-        self, painter: QPainter, wf: WaveformData, w: int, top: int, height: int, scroll_l: float, color: QColor
-    ) -> None:
-        peaks = wf.peaks
-        n = len(peaks)
-        if n == 0 or w <= 0 or height <= 0:
-            return
-        mid_y = top + height * 0.5
-        half_h = height * 0.45
-        inv_px = 1.0 / max(1e-6, self.px_per_cs)
-        scale_b = wf.buckets_per_sec / 100.0
-
-        px_arr = np.arange(0, w, 1, dtype=np.float64)
-        t_start = scroll_l + px_arr * inv_px
-        t_end = scroll_l + (px_arr + 1.0) * inv_px
-        valid = t_end > 0.0
-        if not np.any(valid):
-            return
-        px_v = px_arr[valid]
-        i0 = np.clip((t_start[valid] * scale_b).astype(np.int64), 0, n - 1)
-        i1 = np.clip((t_end[valid] * scale_b).astype(np.int64) + 1, i0 + 1, n)
-
-        amps = np.maximum.reduceat(peaks, i0)
-        amps[-1] = float(peaks[int(i0[-1]) : int(i1[-1])].max())
-        small = (i1 - i0) <= 1
-        if np.any(small):
-            amps[small] = peaks[i0[small]]
-
-        bars = amps * half_h
-        lines = [
-            QLineF(px, y0, px, y1)
-            for px, y0, y1 in zip(px_v.tolist(), (mid_y - bars).tolist(), (mid_y + bars).tolist())
-        ]
-        painter.setPen(QPen(color, 1))
-        painter.drawLines(lines)
-
-    def _ensure_wave_tile(self, w: int, wave_h: int, scroll_l: float, span_cs: float) -> Optional[QPixmap]:
-        if w <= 0 or wave_h <= 0:
-            return None
-        margin_cs = 8.0 / max(1e-6, self.px_per_cs)
-        key = (wave_h, round(self.px_per_cs, 5), id(self.audio.main_waveform), id(self.audio.vocal_waveform))
-        need_rebuild = (
-            self._tile_pm is None
-            or self._tile_key != key
-            or (scroll_l - margin_cs) < self._tile_start_cs
-            or (scroll_l + span_cs + margin_cs) > (self._tile_start_cs + self._tile_span_cs)
-        )
-        if need_rebuild:
-            tile_w = max(w * 3, 1200)
-            tile_start = scroll_l - span_cs * 0.75
-            pm = QPixmap(tile_w, wave_h)
-            pm.fill(QColor(15, 17, 22))
-            p = QPainter(pm)
-            p.setPen(QColor(45, 50, 60))
-            p.drawLine(0, int(wave_h * 0.5), tile_w, int(wave_h * 0.5))
-            if self.audio.main_waveform is not None:
-                self._draw_wave_layer_at(p, self.audio.main_waveform, tile_w, 0, wave_h, tile_start, QColor(85, 130, 195, 165))
-            if self.audio.vocal_waveform is not None:
-                self._draw_wave_layer_at(p, self.audio.vocal_waveform, tile_w, 0, wave_h, tile_start, QColor(65, 225, 200, 210))
-            p.end()
-            self._tile_pm = pm
-            self._tile_start_cs = tile_start
-            self._tile_span_cs = tile_w / max(1e-6, self.px_per_cs)
-            self._tile_key = key
-        return self._tile_pm
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -674,12 +608,16 @@ class _TapWaveformStrip(QWidget):
         first_t = max(0, int(scroll_l // step_cs) * step_cs)
 
         # Cached waveform tile blit (zero numpy work per frame while scrolling!)
-        if self.audio.main_waveform is not None or self.audio.vocal_waveform is not None:
-            tile = self._ensure_wave_tile(w, wave_h, scroll_l, span_cs)
-            if tile is not None:
-                src_x = max(0, min(tile.width() - w, int(round((scroll_l - self._tile_start_cs) * self.px_per_cs))))
-                painter.drawPixmap(0, wave_top, tile, src_x, 0, w, wave_h)
-        else:
+        if not self._wave_tile.paint(
+            painter,
+            w,
+            wave_top,
+            wave_h,
+            scroll_l,
+            self.px_per_cs,
+            self.audio.main_waveform,
+            self.audio.vocal_waveform,
+        ):
             painter.setPen(QColor(45, 50, 60))
             painter.drawLine(0, wave_top + int(wave_h * 0.5), w, wave_top + int(wave_h * 0.5))
             painter.setPen(QColor(120, 128, 140))
@@ -696,8 +634,7 @@ class _TapWaveformStrip(QWidget):
                 painter.drawLine(x, ruler_h, x, h)
                 painter.setPen(QColor(110, 118, 132))
                 painter.drawLine(x, ruler_h - 6, x, ruler_h - 1)
-                sec = t / 100.0
-                lbl = f"{int(sec // 60)}:{sec % 60:05.2f}"
+                lbl = format_time_cs(t, pad_minutes=False)
                 painter.setPen(QColor(185, 192, 205))
                 painter.drawText(x + 3, 0, 68, ruler_h - 2, Qt.AlignmentFlag.AlignVCenter, lbl)
 
@@ -811,7 +748,6 @@ class TapSyncView(QWidget):
         self._apply_saved_defaults_to_draft(self.draft)
         self._sync_timing_widgets_from_draft()
         self._refresh_template_btn()
-        self._refresh_resume_btn()
 
     def _apply_saved_defaults_to_draft(self, draft: TapSyncDraft) -> None:
         draft.latency_enabled = self._settings.value("tap_latency_enabled", True, type=bool)
@@ -849,29 +785,10 @@ class TapSyncView(QWidget):
         rl.setSpacing(10)
 
         def _div() -> QFrame:
-            f = QFrame(ribbon)
-            f.setFrameShape(QFrame.Shape.VLine)
-            f.setFrameShadow(QFrame.Shadow.Plain)
-            f.setStyleSheet("color: #3a4150;")
-            return f
+            return make_ribbon_divider(ribbon)
 
         def _make_section(title: str) -> Tuple[QVBoxLayout, QHBoxLayout, QHBoxLayout]:
-            sec = QVBoxLayout()
-            sec.setContentsMargins(0, 0, 0, 0)
-            sec.setSpacing(3)
-            lbl = QLabel(title, ribbon)
-            lbl.setStyleSheet("color: #cbd5e1; font-size: 11px; font-weight: bold;")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            r1 = QHBoxLayout()
-            r1.setContentsMargins(0, 0, 0, 0)
-            r1.setSpacing(4)
-            r2 = QHBoxLayout()
-            r2.setContentsMargins(0, 0, 0, 0)
-            r2.setSpacing(4)
-            sec.addWidget(lbl)
-            sec.addLayout(r1)
-            sec.addLayout(r2)
-            return sec, r1, r2
+            return make_ribbon_section(ribbon, title)
 
         # Section 1: Lyrics & Draft
         sec_lyr, lyr_r1, lyr_r2 = _make_section("Lyrics & Draft")
@@ -1293,9 +1210,6 @@ class TapSyncView(QWidget):
         self._set_dirty(False)
         self._update_lock_ui()
 
-    def _refresh_resume_btn(self) -> None:
-        pass
-
     def open_project_organizer(self) -> None:
         self.archive_current_draft()
         parent = self.window() if self.window() is not None else self
@@ -1312,6 +1226,7 @@ class TapSyncView(QWidget):
         self.draft = draft
         self._teleprompter.draft = draft
         self._teleprompter.preview_flat_idx = None
+        self._teleprompter.invalidate_cache()
         self._waveform.draft = draft
 
         self._latency_cb.blockSignals(True)
@@ -1396,9 +1311,7 @@ class TapSyncView(QWidget):
             return False
         p = Path(path)
         try:
-            text = p.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            text = p.read_text(encoding="cp1252", errors="replace")
+            text = read_kbp_text(p, allow_bom=True)
         except Exception as exc:
             QMessageBox.critical(self, "Load Lyrics Failed", f"Could not read lyrics file:\n{exc}")
             return False
@@ -1462,22 +1375,13 @@ class TapSyncView(QWidget):
         return self._save_draft_dialog()
 
     def _suggest_draft_filename(self) -> str:
-        def _clean(s: str) -> str:
-            return re.sub(r'[<>:"/\\|?*]', "", s).strip()
-
-        artist = _clean(self.draft.artist)
-        title = _clean(self.draft.title)
-        if artist and title:
-            return f"{artist} - {title}.mjkp"
-        if title:
-            return f"{title}.mjkp"
-        if artist:
-            return f"{artist}.mjkp"
-        if self.audio.main_path is not None:
-            stem = _clean(self.audio.main_path.stem)
-            if stem:
-                return f"{stem}.mjkp"
-        return ""
+        return suggest_project_filename(
+            self.draft.artist,
+            self.draft.title,
+            ext=".mjkp",
+            audio_path=self.audio.main_path,
+            fallback_stem="",
+        )
 
     def _save_draft_dialog(self) -> bool:
         if not self.draft.pages:
@@ -1637,6 +1541,7 @@ class TapSyncView(QWidget):
         self._teleprompter.is_syncing = self._is_syncing
         self._teleprompter.is_locked = self._locked
         self._teleprompter.punch_line = self._punch_line
+        self._teleprompter.invalidate_cache()
         self._teleprompter.update()
         self._waveform.update()
         self._highlight_cursor_in_tree()
@@ -1664,23 +1569,42 @@ class TapSyncView(QWidget):
         return None
 
     def _next_coord(self, coord: Tuple[int, int, int]) -> Optional[Tuple[int, int, int]]:
-        flat = self.draft.flat_syllables()
-        for i, (p_i, l_i, s_i, _) in enumerate(flat):
-            if (p_i, l_i, s_i) == coord:
-                if i + 1 < len(flat):
-                    np_i, nl_i, ns_i, _ = flat[i + 1]
-                    return (np_i, nl_i, ns_i)
-                return None
+        p_i, l_i, s_i = coord
+        pages = self.draft.pages
+        if not (0 <= p_i < len(pages)):
+            return None
+        lines = pages[p_i].lines
+        if not (0 <= l_i < len(lines)):
+            return None
+        if s_i + 1 < len(lines[l_i].syllables):
+            return (p_i, l_i, s_i + 1)
+        for nl_i in range(l_i + 1, len(lines)):
+            if lines[nl_i].syllables:
+                return (p_i, nl_i, 0)
+        for np_i in range(p_i + 1, len(pages)):
+            for nl_i, nline in enumerate(pages[np_i].lines):
+                if nline.syllables:
+                    return (np_i, nl_i, 0)
         return None
 
     def _prev_coord(self, coord: Tuple[int, int, int]) -> Optional[Tuple[int, int, int]]:
-        flat = self.draft.flat_syllables()
-        for i, (p_i, l_i, s_i, _) in enumerate(flat):
-            if (p_i, l_i, s_i) == coord:
-                if i > 0:
-                    pp_i, pl_i, ps_i, _ = flat[i - 1]
-                    return (pp_i, pl_i, ps_i)
-                return None
+        p_i, l_i, s_i = coord
+        pages = self.draft.pages
+        if not (0 <= p_i < len(pages)):
+            return None
+        lines = pages[p_i].lines
+        if not (0 <= l_i < len(lines)):
+            return None
+        if s_i > 0:
+            return (p_i, l_i, s_i - 1)
+        for pl_i in range(l_i - 1, -1, -1):
+            if lines[pl_i].syllables:
+                return (p_i, pl_i, len(lines[pl_i].syllables) - 1)
+        for pp_i in range(p_i - 1, -1, -1):
+            plines = pages[pp_i].lines
+            for pl_i in range(len(plines) - 1, -1, -1):
+                if plines[pl_i].syllables:
+                    return (pp_i, pl_i, len(plines[pl_i].syllables) - 1)
         return None
 
     def _effective_tap_cs(self) -> int:
@@ -1690,15 +1614,18 @@ class TapSyncView(QWidget):
 
     def _pre_roll_start_for(self, coord: Tuple[int, int, int]) -> Optional[float]:
         """Compute a comfortable pre-roll playback start position before `coord`."""
-        flat = self.draft.flat_syllables()
         prev_time: Optional[int] = None
-        for p_i, l_i, s_i, syl in flat:
-            if (p_i, l_i, s_i) == coord:
-                break
-            if syl.end_cs is not None:
-                prev_time = syl.end_cs
-            elif syl.start_cs is not None:
-                prev_time = syl.start_cs
+        for p_i, page in enumerate(self.draft.pages):
+            for l_i, line in enumerate(page.lines):
+                for s_i, syl in enumerate(line.syllables):
+                    if (p_i, l_i, s_i) == coord:
+                        if prev_time is not None:
+                            return float(max(0, prev_time - self.draft.pre_roll_cs))
+                        return None
+                    if syl.end_cs is not None:
+                        prev_time = syl.end_cs
+                    elif syl.start_cs is not None:
+                        prev_time = syl.start_cs
         if prev_time is not None:
             return float(max(0, prev_time - self.draft.pre_roll_cs))
         return None

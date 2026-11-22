@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 
@@ -17,6 +18,85 @@ DEFAULT_KBP_COMMENTS: Tuple[str, ...] = (
     "Hacked by Matt Joy",
     "github.com/mattjoykaraoke",
 )
+
+
+def parse_line_to_syllables(raw_line: str) -> List[str]:
+    """
+    Parse a single KBS / Local Lyric Splitter line into KBP syllable strings.
+    - Spaces separate words (trailing space attached to the last syllable of each word except the final word).
+    - '/' splits a word into explicit syllables (e.g. 'ev/ery/thing' -> ['ev', 'ery', 'thing'],
+      '➣➣➣/The snow' -> ['➣➣➣', 'The ', 'snow']).
+    """
+    words = [w for w in raw_line.strip().split(" ") if w]
+    out: List[str] = []
+    for w_idx, word in enumerate(words):
+        parts = [p for p in word.split("/") if p]
+        for p_idx, part in enumerate(parts):
+            is_last_of_word = p_idx == len(parts) - 1
+            is_last_word = w_idx == len(words) - 1
+            out.append(part + (" " if (is_last_of_word and not is_last_word) else ""))
+    return out
+
+
+def read_kbp_text(path: str | Path, *, allow_bom: bool = False) -> str:
+    """Read a text/KBP file using UTF-8 (or UTF-8-SIG when allow_bom=True) with CP1252 fallback."""
+    p = Path(path)
+    raw = p.read_bytes()
+    primary_enc = "utf-8-sig" if allow_bom else "utf-8"
+    try:
+        return raw.decode(primary_enc)
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def extract_kbp_header_lines(
+    raw_lines: Sequence[str],
+    section_markers: Sequence[str] = ("PAGEV2", "LYRICSV2"),
+) -> Tuple[Optional[int], List[str]]:
+    """
+    Locate the first section marker (e.g. PAGEV2 or LYRICSV2) and return
+    (marker_index, header_lines_before_preceding_separator).
+    """
+    marker_set = set(section_markers)
+    marker_idx = next((i for i, ln in enumerate(raw_lines) if ln.strip() in marker_set), None)
+    if marker_idx is None:
+        return None, []
+    sep_idx = marker_idx - 1
+    while sep_idx > 0 and not raw_lines[sep_idx].startswith("---"):
+        sep_idx -= 1
+    return marker_idx, list(raw_lines[:sep_idx])
+
+
+def clean_filename_part(text: str) -> str:
+    """Strip characters that are invalid in Windows/POSIX filenames."""
+    return re.sub(r'[<>:"/\\|?*]', "", text).strip()
+
+
+def suggest_project_filename(
+    artist: str = "",
+    title: str = "",
+    *,
+    ext: str = ".kbp",
+    audio_path: Optional[str | Path] = None,
+    fallback_stem: str = "untitled",
+) -> str:
+    """Build a sanitized 'Artist - Title<ext>' filename with audio-stem and default fallbacks."""
+    c_artist = clean_filename_part(artist)
+    c_title = clean_filename_part(title)
+    if c_artist and c_title:
+        stem = f"{c_artist} - {c_title}"
+    elif c_title:
+        stem = c_title
+    elif c_artist:
+        stem = c_artist
+    elif audio_path:
+        stem = clean_filename_part(Path(audio_path).stem) or fallback_stem
+    else:
+        stem = fallback_stem
+    if not stem:
+        return ""
+    suffix = ext if ext.startswith(".") else f".{ext}"
+    return f"{stem}{suffix}"
 
 
 def parse_12bit_rgb(code: str) -> Tuple[int, int, int]:
@@ -215,23 +295,42 @@ class KbpHeader:
             ]
         return header
 
+    def set_field(
+        self,
+        field_name: str,
+        value: str,
+        *,
+        default_pad: str = "     ",
+        insert_after: Sequence[str] = (),
+    ) -> None:
+        """Update or insert a single-line field in `raw_lines` while preserving column padding."""
+        for i, line in enumerate(self.raw_lines):
+            if line.startswith(field_name):
+                rest = line[len(field_name) :]
+                pad_len = len(rest) - len(rest.lstrip(" \t"))
+                pad = rest[:pad_len] if pad_len > 0 else default_pad
+                self.raw_lines[i] = f"{field_name}{pad}{value}"
+                return
+        insert_at = len(self.raw_lines)
+        if insert_after:
+            for i, line in enumerate(self.raw_lines):
+                if any(line.startswith(prefix) for prefix in insert_after):
+                    insert_at = i + 1
+        self.raw_lines.insert(insert_at, f"{field_name}{default_pad}{value}")
+
+    def set_title(self, title: str) -> None:
+        self.title = str(title)
+        self.set_field("Title", self.title, default_pad="     ")
+
+    def set_artist(self, artist: str) -> None:
+        self.artist = str(artist)
+        self.set_field("Artist", self.artist, default_pad="    ", insert_after=("Title",))
+
     def set_audio_path(self, path: str | Path) -> None:
         """Update the project's main audio path in both `audio_path` and `raw_lines`."""
         new_path = str(path)
         self.audio_path = new_path
-        for i, line in enumerate(self.raw_lines):
-            if line.startswith("Audio"):
-                rest = line[5:]
-                pad_len = len(rest) - len(rest.lstrip(" \t"))
-                pad = rest[:pad_len] if pad_len > 0 else "   "
-                self.raw_lines[i] = f"Audio{pad}{new_path}"
-                return
-        # No existing Audio line — insert after Artist/Title if present, else append
-        insert_at = len(self.raw_lines)
-        for i, line in enumerate(self.raw_lines):
-            if line.startswith("Artist") or line.startswith("Title"):
-                insert_at = i + 1
-        self.raw_lines.insert(insert_at, f"Audio   {new_path}")
+        self.set_field("Audio", new_path, default_pad="   ", insert_after=("Artist", "Title"))
 
     def set_comments(self, lines: Sequence[str]) -> None:
         """
@@ -700,21 +799,14 @@ class KbpProject:
     @classmethod
     def load(cls, path: str | Path, auto_repair: bool = True) -> "KbpProject":
         p = Path(path)
-        raw = p.read_bytes()
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = raw.decode("cp1252", errors="replace")
+        text = read_kbp_text(p)
 
         raw_lines = text.splitlines()
         page_indices = [i for i, l in enumerate(raw_lines) if l.strip() == "PAGEV2"]
         if not page_indices:
             raise ValueError("No PAGEV2 sections found (file may still be unsynced LYRICSV2).")
 
-        first_sep = page_indices[0] - 1
-        while first_sep > 0 and not raw_lines[first_sep].startswith("---"):
-            first_sep -= 1
-        header_lines = raw_lines[:first_sep]
+        _, header_lines = extract_kbp_header_lines(raw_lines, section_markers=("PAGEV2",))
         header = KbpHeader.parse(header_lines)
 
         issues: List[KbpIssue] = []
@@ -940,19 +1032,41 @@ class KbpProject:
         self, page_idx: int, line_idx: int, syl_idx: int, direction: int
     ) -> Optional[Syllable]:
         """Return the immediately preceding (direction=-1) or following (direction=+1) syllable across lines/pages."""
-        flat: List[Tuple[int, int, int, Syllable]] = []
-        target_pos = -1
-        for p_i, page in enumerate(self.pages):
-            for l_i, line in enumerate(page.lines):
-                for s_i, syl in enumerate(line.syllables):
-                    if p_i == page_idx and l_i == line_idx and s_i == syl_idx:
-                        target_pos = len(flat)
-                    flat.append((p_i, l_i, s_i, syl))
-        if target_pos < 0:
+        if not (0 <= page_idx < len(self.pages)):
             return None
-        adj_pos = target_pos + direction
-        if 0 <= adj_pos < len(flat):
-            return flat[adj_pos][3]
+        page = self.pages[page_idx]
+        if not (0 <= line_idx < len(page.lines)):
+            return None
+        line = page.lines[line_idx]
+        if not (0 <= syl_idx < len(line.syllables)):
+            return None
+
+        if direction < 0:
+            if syl_idx > 0:
+                return line.syllables[syl_idx - 1]
+            for l_i in range(line_idx - 1, -1, -1):
+                if page.lines[l_i].syllables:
+                    return page.lines[l_i].syllables[-1]
+            for p_i in range(page_idx - 1, -1, -1):
+                prev_page = self.pages[p_i]
+                for l_i in range(len(prev_page.lines) - 1, -1, -1):
+                    if prev_page.lines[l_i].syllables:
+                        return prev_page.lines[l_i].syllables[-1]
+            return None
+
+        if direction > 0:
+            if syl_idx + 1 < len(line.syllables):
+                return line.syllables[syl_idx + 1]
+            for l_i in range(line_idx + 1, len(page.lines)):
+                if page.lines[l_i].syllables:
+                    return page.lines[l_i].syllables[0]
+            for p_i in range(page_idx + 1, len(self.pages)):
+                next_page = self.pages[p_i]
+                for l_i in range(len(next_page.lines)):
+                    if next_page.lines[l_i].syllables:
+                        return next_page.lines[l_i].syllables[0]
+            return None
+
         return None
 
     def snap_syllable_start(self, page_idx: int, line_idx: int, syl_idx: int) -> bool:

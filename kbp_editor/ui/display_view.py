@@ -21,6 +21,7 @@ from ..model import (
     KbpProject,
     Line,
 )
+from .common import format_time_cs, style_label_color
 
 
 LABEL_COL_W = 240
@@ -193,13 +194,8 @@ class _DisplayTimelineCanvas(QWidget):
             tick_h = 8 if is_major else 4
             painter.drawLine(x, RULER_H - tick_h, x, RULER_H - 1)
             if is_major:
-                sec = t / 100.0
-                if major_cs >= 100:
-                    lbl = f"{int(sec // 60)}:{int(sec % 60):02d}"
-                elif major_cs >= 10:
-                    lbl = f"{int(sec // 60)}:{sec % 60:04.1f}"
-                else:
-                    lbl = f"{int(sec // 60)}:{sec % 60:05.2f}"
+                prec = 0 if major_cs >= 100 else (1 if major_cs >= 10 else 2)
+                lbl = format_time_cs(t, pad_minutes=False, precision=prec)
                 painter.setPen(QColor(195, 202, 215))
                 painter.drawText(x + 4, 2, 68, RULER_H - 6, Qt.AlignmentFlag.AlignVCenter, lbl)
         painter.restore()
@@ -225,13 +221,6 @@ class _DisplayTimelineCanvas(QWidget):
         font = QFont("Segoe UI", 9)
         painter.setFont(font)
         fm = painter.fontMetrics()
-        style_fg = {
-            "B": QColor(210, 175, 245),
-            "C": QColor(125, 225, 210),
-            "D": QColor(244, 150, 190),
-            "E": QColor(175, 225, 130),
-            "F": QColor(240, 195, 115),
-        }
 
         for raw_y, p_idx, l_idx, line in self._rows:
             y = raw_y - self.scroll_y_px
@@ -261,7 +250,7 @@ class _DisplayTimelineCanvas(QWidget):
             if is_selected:
                 pen_c = QColor(255, 255, 255)
             elif line.style != "A":
-                pen_c = style_fg.get(line.style.upper(), QColor(210, 175, 245))
+                pen_c = style_label_color(line.style)
             else:
                 pen_c = QColor(210, 216, 226)
             painter.setPen(pen_c)
@@ -662,16 +651,6 @@ class DisplayRemoveView(QWidget):
             ln.display_end = max(cs, ln.last_syl_end)
             self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display End")
         self.canvas.update()
-
-    def _duplicate_selected_page(self) -> None:
-        if not self.project or not self.project.pages:
-            return
-        p_idx = self.canvas.selected_page
-        p_num = p_idx + 1
-        target_style = self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
-        self.project.duplicate_page(page_number=p_num, target_style=target_style, in_place=True)
-        self.canvas.set_project(self.project)
-        self.project_mutated.emit(f"Duplicate Page {p_num} → [{target_style}]")
 
     def _reset_windows(self, all_pages: bool) -> None:
         if not self.project or not self.project.pages:

@@ -18,6 +18,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from ..model import KbpProject, Line
+from .common import FALLBACK_PREVIEW_WIPES, format_time_cs
 
 
 LOGICAL_W = 1920.0
@@ -28,13 +29,6 @@ RESIZE_MARGIN = 10
 
 def _qcolor(rgb: Tuple[int, int, int]) -> QColor:
     return QColor(rgb[0], rgb[1], rgb[2])
-
-
-def _format_time(cs: int) -> str:
-    total_sec = cs / 100.0
-    m = int(total_sec // 60)
-    s = total_sec % 60
-    return f"{m:02d}:{s:05.2f}"
 
 
 class PreviewCanvas(QWidget):
@@ -116,14 +110,7 @@ class PreviewCanvas(QWidget):
             wipe_outline_rgb = header.color(style.wipe_outline_color_idx, (120, 40, 0))
         else:
             # Distinct fallback preview colors only for styles not defined in the KBP header
-            fallback_wipes = {
-                "B": ((255, 255, 255), (0, 0, 0), (195, 130, 255), (75, 35, 120)),
-                "C": ((255, 255, 255), (0, 0, 0), (70, 230, 210), (20, 95, 90)),
-                "D": ((255, 255, 255), (0, 0, 0), (255, 120, 175), (115, 30, 65)),
-                "E": ((255, 255, 255), (0, 0, 0), (150, 235, 95), (45, 95, 20)),
-                "F": ((255, 255, 255), (0, 0, 0), (255, 205, 80), (120, 75, 15)),
-            }
-            text_rgb, outline_rgb, wipe_rgb, wipe_outline_rgb = fallback_wipes.get(
+            text_rgb, outline_rgb, wipe_rgb, wipe_outline_rgb = FALLBACK_PREVIEW_WIPES.get(
                 st_letter,
                 (
                     header.color(style.text_color_idx, (255, 255, 255)),
@@ -288,7 +275,7 @@ class PreviewCanvas(QWidget):
             painter.scale(scale, scale)
             painter.setFont(self._hud_font)
             page_str = f"P{page_num}" if page_num else "Idle"
-            hud_text = f"{_format_time(int(round(self._time_cs)))}  |  {page_str}"
+            hud_text = f"{format_time_cs(int(round(self._time_cs)))}  |  {page_str}"
             painter.fillRect(QRectF(20, 18, 410, 46), QColor(0, 0, 0, 135))
             painter.setPen(QColor(225, 232, 245))
             painter.drawText(QRectF(34, 18, 390, 46), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, hud_text)

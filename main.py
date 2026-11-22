@@ -2,24 +2,13 @@ from __future__ import annotations
 
 import ctypes
 import sys
-from pathlib import Path
 
-from PySide6.QtGui import QColor, QIcon, QPalette
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 from kbp_editor import APP_NAME
+from kbp_editor.ui.common import load_app_icon
 from kbp_editor.ui.main_window import MainWindow
-
-
-def _app_icon() -> QIcon:
-    root = Path(__file__).resolve().parent
-    for rel in ("assets/app_icon.ico", "assets/logo.png"):
-        p = root / rel
-        if p.is_file():
-            ico = QIcon(str(p))
-            if not ico.isNull():
-                return ico
-    return QIcon()
 
 
 def apply_dark_theme(app: QApplication) -> None:
@@ -45,7 +34,7 @@ def main() -> int:
             pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    icon = _app_icon()
+    icon = load_app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
     apply_dark_theme(app)

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Set, Tuple
 
-import numpy as np
 from PySide6.QtCore import QSettings, Qt, QLineF, QPoint, QRectF, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,8 +27,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..audio import AudioEngine, WaveformData
-from ..model import KbpProject, Line, Syllable
+from ..audio import AudioEngine
+from ..model import KbpProject, Line, Syllable, parse_line_to_syllables
+from .common import (
+    WaveformTileCache,
+    format_time_cs,
+    make_ribbon_divider,
+    make_ribbon_section,
+    style_palette,
+)
 
 
 RULER_H = 26
@@ -37,39 +43,6 @@ HANDLE_PX = 7
 SNAP_PLAYHEAD_PX = 10.0
 DEFAULT_WIPING_PX_PER_CS = 2.4
 MAX_WIPING_PX_PER_CS = 24.0
-
-# Distinct per-style color palette (for [A], [B], [C], ... lanes & ChromaLyric style coding)
-_STYLE_COLORS: Dict[str, Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int, int]]] = {
-    # style: (fill_rgb, border_rgb, label_rgb)
-    "A": ((42, 86, 134), (95, 138, 185), (155, 185, 225)),
-    "B": ((115, 76, 155), (180, 145, 220), (210, 175, 245)),
-    "C": ((42, 126, 118), (115, 210, 200), (125, 225, 210)),
-    "D": ((156, 66, 102), (235, 140, 180), (244, 150, 190)),
-    "E": ((88, 128, 52), (165, 215, 115), (175, 225, 130)),
-    "F": ((145, 102, 42), (230, 180, 95), (240, 195, 115)),
-}
-
-
-def _style_palette(letter: str) -> Tuple[QColor, QColor, QColor]:
-    fill_rgb, border_rgb, lbl_rgb = _STYLE_COLORS.get(letter.upper(), _STYLE_COLORS["B"])
-    return QColor(*fill_rgb), QColor(*border_rgb), QColor(*lbl_rgb)
-
-
-def _parse_words_to_syllables(raw: str) -> List[str]:
-    """
-    Parse user-entered text into KBP syllable chunks.
-    - Spaces separate words (trailing space attached to the last syllable of each word).
-    - '/' splits a word into explicit syllables (e.g. 'to/mor/row land' -> ['to', 'mor', 'row ', 'land']).
-    """
-    words = [w for w in raw.strip().split(" ") if w]
-    out: List[str] = []
-    for w_idx, word in enumerate(words):
-        parts = [p for p in word.split("/") if p]
-        for p_idx, part in enumerate(parts):
-            is_last_of_word = (p_idx == len(parts) - 1)
-            is_last_word = (w_idx == len(words) - 1)
-            out.append(part + (" " if (is_last_of_word and not is_last_word) else ""))
-    return out
 
 
 class AddWordDialog(QDialog):
@@ -115,7 +88,7 @@ class AddWordDialog(QDialog):
 
     @property
     def syllables_to_insert(self) -> List[str]:
-        return _parse_words_to_syllables(self._text_edit.text())
+        return parse_line_to_syllables(self._text_edit.text())
 
     @property
     def position_mode(self) -> int:
@@ -203,7 +176,7 @@ class AddLineDialog(QDialog):
 
     @property
     def syllables(self) -> List[str]:
-        return _parse_words_to_syllables(self._text_edit.text())
+        return parse_line_to_syllables(self._text_edit.text())
 
     @property
     def use_playhead(self) -> bool:
@@ -265,7 +238,7 @@ class AddPageDialog(QDialog):
     def lines_syllables(self) -> List[List[str]]:
         out: List[List[str]] = []
         for raw_line in self._lines_edit.toPlainText().splitlines():
-            syls = _parse_words_to_syllables(raw_line)
+            syls = parse_line_to_syllables(raw_line)
             if syls:
                 out.append(syls)
         return out
@@ -427,8 +400,9 @@ class _WipingTimelineCanvas(QWidget):
         self._rendered_line_headers: List[Tuple[QRectF, int, int]] = []
         self._rendered_page_badges: List[Tuple[QRectF, int]] = []
         self._rendered_style_bands: List[Tuple[float, float, str]] = []  # (y_top, y_bot, style_letter)
-        self._wave_cache: Optional[QPixmap] = None
-        self._wave_cache_key: Optional[Tuple] = None
+        self._wave_tile = WaveformTileCache(step_px=2)
+        self._sublane_cache: Optional[Tuple[List[str], Dict[str, List[Tuple[int, int, int, Line]]]]] = None
+        self._sublane_cache_proj_id: int = 0
 
         self._drag_mode: Optional[str] = None  # "scrub", "left", "right", "move", "group_move", "pan"
         self._drag_page_idx: int = 0
@@ -458,8 +432,59 @@ class _WipingTimelineCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def invalidate_wave_cache(self) -> None:
-        self._wave_cache = None
-        self._wave_cache_key = None
+        self._wave_tile.invalidate()
+
+    def invalidate_layout_cache(self) -> None:
+        self._sublane_cache = None
+
+    def _ensure_sublane_layout(self) -> Tuple[List[str], Dict[str, List[Tuple[int, int, int, Line]]]]:
+        """
+        Compute and cache the global scroll-invariant sublane assignments per style track.
+        Recomputed only when syllable timings, line styles, or the project change.
+        """
+        if not self.project:
+            return [], {}
+        pid = id(self.project)
+        if self._sublane_cache is not None and self._sublane_cache_proj_id == pid:
+            return self._sublane_cache
+
+        all_lines: List[Tuple[int, int, Line]] = []
+        used_styles: Set[str] = {"A", "B", "C"}
+        for p_idx, page in enumerate(self.project.pages):
+            for l_idx, line in enumerate(page.lines):
+                if not line.syllables:
+                    continue
+                if line.style:
+                    used_styles.add(line.style.upper())
+                all_lines.append((p_idx, l_idx, line))
+
+        highest = max(used_styles)
+        if "A" <= highest < "F":
+            used_styles.add(chr(ord(highest) + 1))
+        style_order = sorted(used_styles)
+
+        global_sublanes: Dict[str, List[Tuple[int, int, int, Line]]] = {st: [] for st in style_order}
+        for st in style_order:
+            st_lines = sorted(
+                ((p, l, ln) for p, l, ln in all_lines if (ln.style or "A").upper() == st),
+                key=lambda item: (item[2].first_syl_start, item[0], item[1]),
+            )
+            sub_ends: List[int] = []
+            for p_idx, l_idx, line in st_lines:
+                assigned = -1
+                for sub_i, end_cs in enumerate(sub_ends):
+                    if line.first_syl_start >= end_cs - 1:
+                        assigned = sub_i
+                        sub_ends[sub_i] = line.last_syl_end
+                        break
+                if assigned == -1:
+                    assigned = len(sub_ends)
+                    sub_ends.append(line.last_syl_end)
+                global_sublanes[st].append((assigned, p_idx, l_idx, line))
+
+        self._sublane_cache = (style_order, global_sublanes)
+        self._sublane_cache_proj_id = pid
+        return self._sublane_cache
 
     def _flat_syllable_coords(self) -> List[Tuple[int, int, int]]:
         if not self.project:
@@ -731,67 +756,32 @@ class _WipingTimelineCanvas(QWidget):
             x = int(self.cs_to_x(t))
             painter.setPen(QColor(100, 108, 120))
             painter.drawLine(x, RULER_H - 7, x, RULER_H - 1)
-            sec = t / 100.0
-            lbl = f"{int(sec // 60)}:{sec % 60:05.2f}"
+            lbl = format_time_cs(t, pad_minutes=False)
             painter.setPen(QColor(190, 198, 210))
             painter.drawText(x + 3, 0, 70, RULER_H - 4, Qt.AlignmentFlag.AlignVCenter, lbl)
-
-    def _draw_wave_layer(self, painter: QPainter, wf: WaveformData, w: int, top: int, height: int, color: QColor) -> None:
-        peaks = wf.peaks
-        n = len(peaks)
-        if n == 0 or w <= 0 or height <= 0:
-            return
-        mid_y = top + height * 0.5
-        half_h = height * 0.45
-        inv_px = 1.0 / max(1e-6, self.px_per_cs)
-        scale_b = wf.buckets_per_sec / 100.0
-
-        px_arr = np.arange(0, w, 2, dtype=np.float64)
-        i0 = np.clip(((self.scroll_x_cs + px_arr * inv_px) * scale_b).astype(np.int64), 0, n - 1)
-        i1 = np.clip(((self.scroll_x_cs + (px_arr + 2.0) * inv_px) * scale_b).astype(np.int64) + 1, i0 + 1, n)
-
-        amps = np.maximum.reduceat(peaks, i0)
-        amps[-1] = float(peaks[int(i0[-1]):int(i1[-1])].max())
-        small = (i1 - i0) <= 1
-        if np.any(small):
-            amps[small] = peaks[i0[small]]
-
-        bars = amps * half_h
-        y0s = (mid_y - bars).tolist()
-        y1s = (mid_y + bars).tolist()
-        lines = [QLineF(px, y0, px, y1) for px, y0, y1 in zip(px_arr.tolist(), y0s, y1s)]
-        painter.setPen(QPen(color, 1))
-        painter.drawLines(lines)
 
     def _paint_waveform(self, painter: QPainter, w: int, top: int, height: int) -> None:
         if w <= 0 or height <= 0:
             return
-        cache_key = (
+        if not self._wave_tile.paint(
+            painter,
             w,
+            top,
             height,
-            round(self.scroll_x_cs, 3),
-            round(self.px_per_cs, 5),
-            id(self.audio.main_waveform),
-            id(self.audio.vocal_waveform),
-        )
-        if self._wave_cache is None or self._wave_cache_key != cache_key:
-            pm = QPixmap(w, height)
-            pm.fill(QColor(15, 17, 22))
-            p = QPainter(pm)
-            p.setPen(QColor(45, 50, 60))
-            p.drawLine(0, int(height * 0.5), w, int(height * 0.5))
-            if self.audio.main_waveform is not None:
-                self._draw_wave_layer(p, self.audio.main_waveform, w, 0, height, QColor(85, 130, 195, 165))
-            if self.audio.vocal_waveform is not None:
-                self._draw_wave_layer(p, self.audio.vocal_waveform, w, 0, height, QColor(65, 225, 200, 210))
-            if self.audio.main_waveform is None and self.audio.vocal_waveform is None:
-                p.setPen(QColor(120, 128, 140))
-                p.drawText(QRectF(0, 0, w, height), Qt.AlignmentFlag.AlignCenter, "No audio waveform loaded (click 'Load Main Audio…' or 'Load Vocal Stem…' below)")
-            p.end()
-            self._wave_cache = pm
-            self._wave_cache_key = cache_key
-
-        painter.drawPixmap(0, top, self._wave_cache)
+            self.scroll_x_cs,
+            self.px_per_cs,
+            self.audio.main_waveform,
+            self.audio.vocal_waveform,
+        ):
+            painter.fillRect(0, top, w, height, QColor(15, 17, 22))
+            painter.setPen(QColor(45, 50, 60))
+            painter.drawLine(0, top + int(height * 0.5), w, top + int(height * 0.5))
+            painter.setPen(QColor(120, 128, 140))
+            painter.drawText(
+                QRectF(0, top, w, height),
+                Qt.AlignmentFlag.AlignCenter,
+                "No audio waveform loaded (click 'Load Main Audio…' or 'Load Vocal Stem…' below)",
+            )
 
     def _paint_all_visible_syllables(self, painter: QPainter, w: int, top: int, height: int) -> None:
         self._rendered_syls.clear()
@@ -804,19 +794,15 @@ class _WipingTimelineCanvas(QWidget):
         vis_start = self.scroll_x_cs - 60.0
         vis_end = self.scroll_x_cs + self.view_span_cs() + 60.0
 
-        # Collect all non-empty lines globally (for scroll-invariant sublane layout) and mark visible ones
-        all_lines: List[Tuple[int, int, Line]] = []
-        visible_coords: Set[Tuple[int, int]] = set()
-        used_styles: Set[str] = {"A", "B", "C"}
+        # Subtle vertical page marker + draggable Page badge (P1, P2, ...) at visible page starts
         for p_idx, page in enumerate(self.project.pages):
-            # Subtle vertical page marker + draggable Page badge (P1, P2, ...) at page start
             if page.lines:
                 px = self.cs_to_x(page.first_syl_start)
                 if -40 <= px <= w + 40:
                     painter.setPen(QPen(QColor(75, 135, 110, 160), 1, Qt.PenStyle.DashLine))
                     painter.drawLine(int(px), top - 6, int(px), top + height)
                     badge_rect = QRectF(max(2.0, px - 2.0), top - 16.0, 34.0, 15.0)
-                    page_all_sel = all(
+                    page_all_sel = bool(self.selected_syls) and all(
                         (p_idx, li, si) in self.selected_syls
                         for li, ln in enumerate(page.lines)
                         for si in range(len(ln.syllables))
@@ -831,44 +817,17 @@ class _WipingTimelineCanvas(QWidget):
                     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"P{p_idx + 1}")
                     self._rendered_page_badges.append((badge_rect, p_idx))
 
-            for l_idx, line in enumerate(page.lines):
-                if not line.syllables:
-                    continue
-                if line.style:
-                    used_styles.add(line.style.upper())
-                all_lines.append((p_idx, l_idx, line))
-                if line.last_syl_end >= vis_start and line.first_syl_start <= vis_end:
-                    visible_coords.add((p_idx, l_idx))
-
-        # Always keep one extra drop track below the highest used style (up to [F]) so lines can be dragged down further
-        highest = max(used_styles)
-        if "A" <= highest < "F":
-            used_styles.add(chr(ord(highest) + 1))
-
-        style_order = sorted(used_styles)
-
-        # Assign sublanes globally across the whole song per style track so scrolling never shifts lines vertically
-        track_sublanes: Dict[str, List[Tuple[int, int, int, Line]]] = {st: [] for st in style_order}
+        style_order, global_sublanes = self._ensure_sublane_layout()
+        track_sublanes: Dict[str, List[Tuple[int, int, int, Line]]] = {}
         track_sublane_counts: Dict[str, int] = {}
         for st in style_order:
-            st_lines = sorted(
-                ((p, l, ln) for p, l, ln in all_lines if (ln.style or "A").upper() == st),
-                key=lambda item: (item[2].first_syl_start, item[0], item[1]),
-            )
-            sub_ends: List[int] = []
-            for p_idx, l_idx, line in st_lines:
-                assigned = -1
-                for sub_i, end_cs in enumerate(sub_ends):
-                    if line.first_syl_start >= end_cs - 1:
-                        assigned = sub_i
-                        sub_ends[sub_i] = line.last_syl_end
-                        break
-                if assigned == -1:
-                    assigned = len(sub_ends)
-                    sub_ends.append(line.last_syl_end)
-                if (p_idx, l_idx) in visible_coords:
-                    track_sublanes[st].append((assigned, p_idx, l_idx, line))
-            track_sublane_counts[st] = max((sub_i + 1 for sub_i, _, _, _ in track_sublanes[st]), default=1)
+            vis_list = [
+                (sub_i, p_idx, l_idx, line)
+                for sub_i, p_idx, l_idx, line in global_sublanes.get(st, ())
+                if line.last_syl_end >= vis_start and line.first_syl_start <= vis_end
+            ]
+            track_sublanes[st] = vis_list
+            track_sublane_counts[st] = max((sub_i + 1 for sub_i, _, _, _ in vis_list), default=1)
 
         total_sublanes = sum(track_sublane_counts.values())
         base_lane_h = min(82.0, max(54.0, (height - 8.0) / max(1, len(style_order))))
@@ -887,7 +846,7 @@ class _WipingTimelineCanvas(QWidget):
             y_bot = cur_y + band_h
             self._rendered_style_bands.append((y_top, y_bot, st))
 
-            fill_c, border_c, lbl_c = _style_palette(st)
+            fill_c, border_c, lbl_c = style_palette(st)
             is_hover = (self._drag_mode == "group_move" and self._drag_hover_style == st)
             band_bg = QColor(fill_c.red(), fill_c.green(), fill_c.blue(), 42 if is_hover else (14 if idx_st % 2 == 1 else 6))
             painter.fillRect(QRectF(0.0, y_top, float(w), band_h), band_bg)
@@ -952,7 +911,7 @@ class _WipingTimelineCanvas(QWidget):
                         fill = QColor(58, 126, 192)
                         border = QColor(150, 200, 245)
                     else:
-                        fill, border, _ = _style_palette(st)
+                        fill, border, _ = style_palette(st)
 
                     rect = QRectF(x0, block_y, bw, block_h)
                     self._rendered_syls.append((rect, p_idx, l_idx, s_idx))
@@ -1303,6 +1262,7 @@ class _WipingTimelineCanvas(QWidget):
                         line.display_start = max(0, orig_ds + delta)
                         line.display_end = max(line.display_start, orig_de + delta)
                 self._drag_changed = (delta != 0)
+                self.invalidate_layout_cache()
                 self.update()
             return
 
@@ -1439,6 +1399,7 @@ class _WipingTimelineCanvas(QWidget):
                 self._drag_changed = True
 
         if self._drag_changed:
+            self.invalidate_layout_cache()
             self.syllable_timing_changed.emit()
         self.update()
 
@@ -1608,30 +1569,10 @@ class LyricsWipingView(QWidget):
         ribbon_layout.setSpacing(10)
 
         def _make_divider() -> QFrame:
-            line = QFrame(ribbon)
-            line.setFrameShape(QFrame.Shape.VLine)
-            line.setFrameShadow(QFrame.Shadow.Plain)
-            line.setStyleSheet("color: #3a4150;")
-            return line
+            return make_ribbon_divider(ribbon)
 
         def _make_section(title: str) -> Tuple[QVBoxLayout, QHBoxLayout, QHBoxLayout]:
-            sec = QVBoxLayout()
-            sec.setContentsMargins(0, 0, 0, 0)
-            sec.setSpacing(3)
-            lbl = QLabel(title, ribbon)
-            lbl.setProperty("class", "secTitle")
-            lbl.setStyleSheet("color: #cbd5e1; font-size: 11px; font-weight: bold;")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            row1 = QHBoxLayout()
-            row1.setContentsMargins(0, 0, 0, 0)
-            row1.setSpacing(4)
-            row2 = QHBoxLayout()
-            row2.setContentsMargins(0, 0, 0, 0)
-            row2.setSpacing(4)
-            sec.addWidget(lbl)
-            sec.addLayout(row1)
-            sec.addLayout(row2)
-            return sec, row1, row2
+            return make_ribbon_section(ribbon, title)
 
         def _add_btn(target: QHBoxLayout, label: str, tip: str, fn) -> QPushButton:
             btn = QPushButton(label, ribbon)
@@ -1824,6 +1765,7 @@ class LyricsWipingView(QWidget):
 
         self.project = project
         self.canvas.project = project
+        self.canvas.invalidate_layout_cache()
         self._rebuild_tree(preserve_view=preserve_view, target_page=old_page, target_line=old_line)
         self._refresh_style_combo_items()
 
@@ -1866,13 +1808,9 @@ class LyricsWipingView(QWidget):
                 self._line_tree.addTopLevelItem(page_item)
 
                 for l_idx, line in enumerate(page.lines):
-                    raw_text = line.full_text.strip() or "(empty)"
-                    text = f"[{line.style}] {raw_text}" if line.style != "A" else raw_text
-                    child = QTreeWidgetItem([text])
+                    child = QTreeWidgetItem([self._format_line_item_text(line)])
                     child.setData(0, Qt.ItemDataRole.UserRole, (p_idx, l_idx))
-                    if line.style != "A":
-                        _, _, lbl_c = _style_palette(line.style)
-                        child.setForeground(0, QBrush(lbl_c))
+                    self._style_line_item(child, line)
                     page_item.addChild(child)
                     self._item_by_coord[(p_idx, l_idx)] = child
 
@@ -1894,6 +1832,43 @@ class LyricsWipingView(QWidget):
             self.canvas.set_line(coord[0], coord[1], center=False)
         else:
             self.set_selection(0, 0)
+
+    @staticmethod
+    def _format_line_item_text(line: Line) -> str:
+        raw_text = line.full_text.strip() or "(empty)"
+        return f"[{line.style}] {raw_text}" if line.style != "A" else raw_text
+
+    @staticmethod
+    def _style_line_item(item: QTreeWidgetItem, line: Line) -> None:
+        if line.style != "A":
+            _, _, lbl_c = style_palette(line.style)
+            item.setForeground(0, QBrush(lbl_c))
+        else:
+            item.setForeground(0, QBrush(QColor(232, 236, 244)))
+
+    def _update_tree_line(self, p_idx: int, l_idx: int) -> None:
+        """Update a single line item in the left tree without destroying/recreating all tree nodes."""
+        if not self.project or not (0 <= p_idx < len(self.project.pages)):
+            return
+        page = self.project.pages[p_idx]
+        if not (0 <= l_idx < len(page.lines)):
+            return
+        item = self._item_by_coord.get((p_idx, l_idx))
+        if item is None:
+            self._rebuild_tree(preserve_view=True, target_page=p_idx, target_line=l_idx)
+            return
+        line = page.lines[l_idx]
+        item.setText(0, self._format_line_item_text(line))
+        self._style_line_item(item, line)
+        parent = item.parent()
+        if parent is not None and l_idx == 0:
+            is_opt = self.project.is_optimized_lead_in_page(p_idx)
+            parent.setBackground(0, QBrush(QColor(34, 58, 48) if is_opt else QColor(34, 40, 52)))
+            parent.setForeground(0, QBrush(QColor(135, 225, 175) if is_opt else QColor(155, 185, 225)))
+            parent.setToolTip(
+                0,
+                "Lead-in page (starts with a lead-in glyph after ≥3.0s instrumental gap)" if is_opt else "",
+            )
 
     def _refresh_style_combo_items(self) -> None:
         self._style_combo.blockSignals(True)
@@ -1945,8 +1920,10 @@ class LyricsWipingView(QWidget):
                 ln.style = letter
                 changed = True
         if changed:
-            self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+            for p_i, l_i in target_lines:
+                self._update_tree_line(p_i, l_i)
             self._sync_style_combo()
+            self.canvas.invalidate_layout_cache()
             self.canvas.update()
             lbl = (
                 f"Set {len(target_lines)} Lines to Style [{letter}]"
@@ -1956,7 +1933,8 @@ class LyricsWipingView(QWidget):
             self.project_mutated.emit(lbl)
 
     def _on_canvas_styles_changed(self) -> None:
-        self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+        for p_i, l_i in list(self._item_by_coord.keys()):
+            self._update_tree_line(p_i, l_i)
         self._sync_style_combo()
 
     def _on_canvas_line_clicked(self, page_idx: int, line_idx: int) -> None:
@@ -2042,6 +2020,28 @@ class LyricsWipingView(QWidget):
         if data and data[1] >= 0:
             self._play_current_line()
 
+    def _add_style_submenu(self, menu: QMenu, cur_ln: Optional[Line]) -> None:
+        style_menu = menu.addMenu("Set Line Style")
+        cur_st = cur_ln.style.upper() if cur_ln else "A"
+        for i in range(self._style_combo.count()):
+            st_letter = str(self._style_combo.itemData(i))
+            st_label = self._style_combo.itemText(i)
+            act_st = QAction(st_label, self)
+            act_st.setCheckable(True)
+            act_st.setChecked(st_letter == cur_st)
+            act_st.triggered.connect(lambda _chk=False, lt=st_letter: self._set_selected_lines_style(lt))
+            style_menu.addAction(act_st)
+
+    def _next_page_duplicate_style(self, p_idx: int) -> str:
+        if self.project and 0 <= p_idx < len(self.project.pages):
+            return self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
+        return "B"
+
+    def _next_line_duplicate_style(self, cur_ln: Optional[Line]) -> str:
+        if self.project and cur_ln is not None:
+            return self.project.pick_duplicate_style([cur_ln])
+        return "B"
+
     def _on_canvas_context_menu(self, kind: str, p_idx: int, l_idx: int, s_idx: int, global_pos: QPoint) -> None:
         if not self.project:
             return
@@ -2101,11 +2101,7 @@ class LyricsWipingView(QWidget):
             menu.addAction(act_sel)
 
             cur_ln = self.canvas.get_line(p_idx, l_idx)
-            next_l_st = (
-                self.project.pick_duplicate_style([cur_ln])
-                if (self.project and cur_ln is not None)
-                else "B"
-            )
+            next_l_st = self._next_line_duplicate_style(cur_ln)
             menu.addSeparator()
             for label, fn in [
                 ("Add Line…", self._add_line),
@@ -2118,27 +2114,14 @@ class LyricsWipingView(QWidget):
                 act.triggered.connect(fn)
                 menu.addAction(act)
 
-            style_menu = menu.addMenu("Set Line Style")
-            cur_st = cur_ln.style.upper() if cur_ln else "A"
-            for i in range(self._style_combo.count()):
-                st_letter = str(self._style_combo.itemData(i))
-                st_label = self._style_combo.itemText(i)
-                act_st = QAction(st_label, self)
-                act_st.setCheckable(True)
-                act_st.setChecked(st_letter == cur_st)
-                act_st.triggered.connect(lambda _chk=False, lt=st_letter: self._set_selected_lines_style(lt))
-                style_menu.addAction(act_st)
+            self._add_style_submenu(menu, cur_ln)
 
         elif kind == "page":
             act_sel = QAction(f"Select Whole Page {p_idx + 1}", self)
             act_sel.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=False))
             menu.addAction(act_sel)
 
-            next_p_st = (
-                self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
-                if (self.project and 0 <= p_idx < len(self.project.pages))
-                else "B"
-            )
+            next_p_st = self._next_page_duplicate_style(p_idx)
             menu.addSeparator()
             for label, fn in [
                 ("Add Page…", self._add_page),
@@ -2169,12 +2152,7 @@ class LyricsWipingView(QWidget):
             return
         p_idx, l_idx = data
         menu = QMenu(self)
-
-        next_p_st = (
-            self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
-            if (self.project and 0 <= p_idx < len(self.project.pages))
-            else "B"
-        )
+        next_p_st = self._next_page_duplicate_style(p_idx)
 
         if l_idx < 0:
             act_sel_page = QAction(f"Select Whole Page {p_idx + 1} (for sliding)", self)
@@ -2203,39 +2181,20 @@ class LyricsWipingView(QWidget):
         act_sel_line.triggered.connect(lambda: self.canvas.select_whole_line(p_idx, l_idx, center=False))
         menu.addAction(act_sel_line)
 
-        menu.addSeparator()
-        act_add_w = QAction("Add Word / Syllable…", self)
-        act_add_w.triggered.connect(self._add_word)
-        menu.addAction(act_add_w)
-
-        act_split = QAction("Split Line at Selected Syllable", self)
-        act_split.triggered.connect(self._split_line)
-        menu.addAction(act_split)
-
-        act_join = QAction("Join with Next Line", self)
-        act_join.triggered.connect(self._join_line)
-        menu.addAction(act_join)
-
         cur_ln = self.canvas.get_line(p_idx, l_idx)
-        next_l_st = (
-            self.project.pick_duplicate_style([cur_ln])
-            if (self.project and cur_ln is not None)
-            else "B"
-        )
-        act_dup_l = QAction(f"Duplicate Line → Style [{next_l_st}]", self)
-        act_dup_l.triggered.connect(self._duplicate_selected_line)
-        menu.addAction(act_dup_l)
+        next_l_st = self._next_line_duplicate_style(cur_ln)
+        menu.addSeparator()
+        for label, fn in [
+            ("Add Word / Syllable…", self._add_word),
+            ("Split Line at Selected Syllable", self._split_line),
+            ("Join with Next Line", self._join_line),
+            (f"Duplicate Line → Style [{next_l_st}]", self._duplicate_selected_line),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(fn)
+            menu.addAction(act)
 
-        style_menu = menu.addMenu("Set Line Style")
-        cur_st = cur_ln.style.upper() if cur_ln else "A"
-        for i in range(self._style_combo.count()):
-            st_letter = str(self._style_combo.itemData(i))
-            st_label = self._style_combo.itemText(i)
-            act_st = QAction(st_label, self)
-            act_st.setCheckable(True)
-            act_st.setChecked(st_letter == cur_st)
-            act_st.triggered.connect(lambda _chk=False, lt=st_letter: self._set_selected_lines_style(lt))
-            style_menu.addAction(act_st)
+        self._add_style_submenu(menu, cur_ln)
 
         act_dup_p = QAction(f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", self)
         act_dup_p.triggered.connect(lambda: self._duplicate_page_idx(p_idx))
@@ -2297,7 +2256,7 @@ class LyricsWipingView(QWidget):
             if updated and updated != syl.text:
                 old = syl.text.strip()
                 syl.text = updated
-                self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+                self._update_tree_line(self.canvas.page_idx, self.canvas.line_idx)
                 self.canvas.update()
                 self.project_mutated.emit(f"Edit Syllable '{old}' → '{updated.strip()}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
         if self._word_adjust_active:
@@ -2321,7 +2280,7 @@ class LyricsWipingView(QWidget):
                 left_text=dlg.left_text,
                 right_text=dlg.right_text,
             ):
-                self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+                self._update_tree_line(self.canvas.page_idx, self.canvas.line_idx)
                 self.canvas.update()
                 self.project_mutated.emit(f"Split Syllable '{syl.text.strip()}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
 
@@ -2330,7 +2289,7 @@ class LyricsWipingView(QWidget):
         if not line:
             return
         if line.join_syllables(self.canvas.selected_syl):
-            self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+            self._update_tree_line(self.canvas.page_idx, self.canvas.line_idx)
             self.canvas.update()
             self.project_mutated.emit(f"Join Syllables (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
 
@@ -2343,7 +2302,8 @@ class LyricsWipingView(QWidget):
             idx = 0
         if line.prepend_glyph(idx, glyph_str, duration_cs):
             self.canvas.select_single(self.canvas.page_idx, self.canvas.line_idx, idx)
-            self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+            self._update_tree_line(self.canvas.page_idx, self.canvas.line_idx)
+            self.canvas.invalidate_layout_cache()
             self.canvas.update()
             self.project_mutated.emit(f"Append Glyph '{glyph_str}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
 
@@ -2377,7 +2337,8 @@ class LyricsWipingView(QWidget):
 
         if line.insert_syllables(ins_idx, syls, start_cs=start_cs, duration_cs=dlg.duration_cs):
             self.canvas.select_single(self.canvas.page_idx, self.canvas.line_idx, ins_idx)
-            self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+            self._update_tree_line(self.canvas.page_idx, self.canvas.line_idx)
+            self.canvas.invalidate_layout_cache()
             self.canvas.update()
             self.project_mutated.emit(f"Add Word '{''.join(syls).strip()}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")
 
@@ -2407,7 +2368,9 @@ class LyricsWipingView(QWidget):
             cur_line = self.canvas.current_line()
             new_s = max(0, min(self.canvas.selected_syl, len(cur_line.syllables) - 1)) if cur_line else 0
             self.canvas.select_single(self.canvas.page_idx, self.canvas.line_idx, new_s)
-            self._rebuild_tree(preserve_view=True, target_page=self.canvas.page_idx, target_line=self.canvas.line_idx)
+            for p_i, l_i in by_line:
+                self._update_tree_line(p_i, l_i)
+            self.canvas.invalidate_layout_cache()
             self.canvas.update()
             lbl = f"Delete {total_deleted} Syllables" if total_deleted > 1 else f"Delete Syllable (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})"
             self.project_mutated.emit(lbl)

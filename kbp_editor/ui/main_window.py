@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QProcess, QSettings, Qt
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,9 +27,10 @@ from PySide6.QtWidgets import (
 from .. import APP_NAME
 from ..audio import AudioEngine
 from ..history import HistoryManager
-from ..model import KbpProject
+from ..model import KbpProject, suggest_project_filename
 from ..tap_sync import register_saved_project
 from .about_dialog import AboutDialog
+from .common import format_time_cs, load_app_icon, make_ribbon_divider
 from .display_view import DisplayRemoveView
 from .finishing_view import FinishingView
 from .minimap_widget import SongMinimapWidget
@@ -39,23 +39,13 @@ from .tap_sync_view import TapSyncView
 from .wiping_view import LyricsWipingView
 
 
-def _fmt_time(cs: float) -> str:
-    sec = cs / 100.0
-    return f"{int(sec // 60):02d}:{sec % 60:05.2f} ({int(round(cs))} cs)"
-
-
 class MainWindow(QMainWindow):
     def __init__(self, initial_file: Optional[str] = None) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        _root = Path(__file__).resolve().parent.parent.parent
-        for _rel in ("assets/app_icon.ico", "assets/logo.png"):
-            _p = _root / _rel
-            if _p.is_file():
-                _ico = QIcon(str(_p))
-                if not _ico.isNull():
-                    self.setWindowIcon(_ico)
-                    break
+        _ico = load_app_icon()
+        if not _ico.isNull():
+            self.setWindowIcon(_ico)
         self.resize(1440, 880)
 
         self.project: Optional[KbpProject] = None
@@ -275,11 +265,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         def _div() -> QFrame:
-            f = QFrame(bar)
-            f.setFrameShape(QFrame.Shape.VLine)
-            f.setFrameShadow(QFrame.Shadow.Plain)
-            f.setStyleSheet("color: #3a4150;")
-            return f
+            return make_ribbon_divider(bar)
 
         def _make_section(title: str) -> Tuple[QVBoxLayout, QHBoxLayout]:
             sec = QVBoxLayout()
@@ -566,7 +552,7 @@ class MainWindow(QMainWindow):
 
     def _on_playhead_moved(self, cs: float) -> None:
         playing = self.audio.is_playing
-        self._time_lbl.setText(_fmt_time(cs))
+        self._time_lbl.setText(format_time_cs(cs, include_cs_suffix=True))
         if self._tabs.currentWidget() is self.display_view:
             self.display_view.set_playhead_cs(cs, follow_if_playing=playing)
         elif self._tabs.currentWidget() is self.tap_sync_view:
@@ -681,20 +667,13 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _suggest_kbp_filename(proj: KbpProject, audio_path: Optional[Path] = None) -> str:
-        def _clean(s: str) -> str:
-            return re.sub(r'[<>:"/\\|?*]', "", s).strip()
-
-        artist = _clean(proj.header.artist)
-        title = _clean(proj.header.title)
-        if artist and title:
-            return f"{artist} - {title}.kbp"
-        if title:
-            return f"{title}.kbp"
-        if artist:
-            return f"{artist}.kbp"
-        if audio_path is not None:
-            return f"{_clean(audio_path.stem) or 'untitled'}.kbp"
-        return "untitled.kbp"
+        return suggest_project_filename(
+            proj.header.artist,
+            proj.header.title,
+            ext=".kbp",
+            audio_path=audio_path,
+            fallback_stem="untitled",
+        )
 
     def _sync_tap_view_from_project(self, locked: bool = True, reason: str = "") -> None:
         if self.project is None:
@@ -1108,14 +1087,20 @@ class MainWindow(QMainWindow):
         if self.wiping_view.auto_reset_display_enabled and not label.startswith("Reset ") and not label.startswith("Apply Optimized"):
             self.project.optimize_windows()
         self.history.push(label, self.project)
+        self.wiping_view.canvas.invalidate_layout_cache()
         if len(self._page_buttons) != len(self.project.pages):
             self._rebuild_page_buttons()
             self._highlight_page_button(min(self.display_view.canvas.selected_page, max(0, len(self.project.pages) - 1)))
             self.wiping_view.set_project(self.project, preserve_view=True)
-        self.display_view.set_project(self.project, preserve_view=True)
+        total_lines = sum(len(p.lines) for p in self.project.pages)
+        if len(self.display_view.canvas._page_headers) != len(self.project.pages) or len(self.display_view.canvas._rows) != total_lines:
+            self.display_view.set_project(self.project, preserve_view=True)
+        else:
+            self.display_view.canvas.update()
         self.finishing_view.set_project(self.project)
         self.wiping_view.canvas.update()
-        self.preview_win.canvas.invalidate_cache()
+        if self.preview_win.isVisible():
+            self.preview_win.canvas.update()
         self.minimap.invalidate_cache()
         self._refresh_actions()
         self.statusBar().showMessage(f"{label}  (Undo stack: {self.history.current_index})", 3000)
