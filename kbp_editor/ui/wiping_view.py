@@ -945,6 +945,9 @@ class _WipingTimelineCanvas(QWidget):
                     if is_sel:
                         fill = QColor(245, 152, 42) if is_primary else QColor(222, 132, 34)
                         border = QColor(255, 255, 255)
+                    elif syl.is_glyph:
+                        fill = QColor(56, 132, 98) if is_sel_line else QColor(45, 106, 79)
+                        border = QColor(135, 225, 175) if is_sel_line else QColor(95, 175, 135)
                     elif is_sel_line and st == "A":
                         fill = QColor(58, 126, 192)
                         border = QColor(150, 200, 245)
@@ -1858,7 +1861,7 @@ class LyricsWipingView(QWidget):
                 page_item.setBackground(0, QBrush(QColor(34, 58, 48) if is_opt else QColor(34, 40, 52)))
                 page_item.setForeground(0, QBrush(QColor(135, 225, 175) if is_opt else QColor(155, 185, 225)))
                 if is_opt:
-                    page_item.setToolTip(0, "Lead-in page (starts with ➣➣➣ after ≥3.0s instrumental gap)")
+                    page_item.setToolTip(0, "Lead-in page (starts with a lead-in glyph after ≥3.0s instrumental gap)")
                 page_item.setData(0, Qt.ItemDataRole.UserRole, (p_idx, -1))
                 self._line_tree.addTopLevelItem(page_item)
 

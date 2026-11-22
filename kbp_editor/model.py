@@ -12,6 +12,7 @@ DEFAULT_CLEAR_HOLD_CS = 50
 DEFAULT_OPTIMIZED_LEAD_IN_CS = 25
 DEFAULT_GAP_THRESHOLD_CS = 300
 DEFAULT_LEAD_IN_MARKER = "➣➣➣"
+KNOWN_GLYPHS: Tuple[str, ...] = (DEFAULT_LEAD_IN_MARKER, "••")
 DEFAULT_KBP_COMMENTS: Tuple[str, ...] = (
     "Hacked by Matt Joy",
     "github.com/mattjoykaraoke",
@@ -277,6 +278,13 @@ class Syllable:
     end: int           # centiseconds
     flag: str = "0"    # KBS syllable flag (usually "0")
     pad: int = 0       # spaces after "/" to preserve original column alignment
+    is_glyph: bool = False  # True for appended lead-in glyphs (preserved if glyph text is edited)
+
+    def __post_init__(self) -> None:
+        if not self.is_glyph:
+            stripped = self.text.strip()
+            if stripped in KNOWN_GLYPHS or stripped.startswith(DEFAULT_LEAD_IN_MARKER):
+                self.is_glyph = True
 
     @property
     def duration(self) -> int:
@@ -347,8 +355,8 @@ class Line:
                 left_text = stripped
                 right_text = trailing_spaces or stripped
 
-        left = Syllable(text=left_text, start=syl.start, end=mid_cs, flag=syl.flag)
-        right = Syllable(text=right_text, start=mid_cs, end=syl.end, flag=syl.flag)
+        left = Syllable(text=left_text, start=syl.start, end=mid_cs, flag=syl.flag, is_glyph=syl.is_glyph)
+        right = Syllable(text=right_text, start=mid_cs, end=syl.end, flag=syl.flag, is_glyph=syl.is_glyph)
         self.syllables[syl_idx : syl_idx + 1] = [left, right]
         return True
 
@@ -363,6 +371,7 @@ class Line:
             start=min(a.start, b.start),
             end=max(a.end, b.end),
             flag=a.flag,
+            is_glyph=(a.is_glyph and b.is_glyph),
         )
         self.syllables[syl_idx : syl_idx + 2] = [merged]
         return True
@@ -528,6 +537,7 @@ class Line:
             end=glyph_end,
             flag=word.flag,
             pad=word.pad,
+            is_glyph=True,
         )
         self.syllables.insert(syl_idx, glyph_syl)
         if glyph_start < self.display_start:
@@ -634,10 +644,13 @@ class Page:
         return max((line.display_end for line in self.lines), default=0)
 
     def starts_with_marker(self, marker: str = DEFAULT_LEAD_IN_MARKER) -> bool:
-        """True if Line 1's first syllable begins with the lead-in marker (e.g. ➣➣➣)."""
+        """True if Line 1's first syllable is a lead-in glyph or begins with `marker` (e.g. ➣➣➣)."""
         if not self.lines or not self.lines[0].syllables:
             return False
-        first_text = self.lines[0].syllables[0].text.strip()
+        first_syl = self.lines[0].syllables[0]
+        if first_syl.is_glyph:
+            return True
+        first_text = first_syl.text.strip()
         return first_text.startswith(marker)
 
     def shift(self, delta_cs: int) -> None:

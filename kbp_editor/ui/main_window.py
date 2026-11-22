@@ -522,6 +522,7 @@ class MainWindow(QMainWindow):
 
         self.display_view.project_mutated.connect(self._on_project_mutated)
         self.wiping_view.project_mutated.connect(self._on_project_mutated)
+        self.finishing_view.status_message.connect(self.statusBar().showMessage)
 
         self.display_view.auto_reset_display_changed.connect(self._on_auto_reset_display_changed)
         self.wiping_view.auto_reset_display_changed.connect(self._on_auto_reset_display_changed)
@@ -1112,6 +1113,7 @@ class MainWindow(QMainWindow):
             self._highlight_page_button(min(self.display_view.canvas.selected_page, max(0, len(self.project.pages) - 1)))
             self.wiping_view.set_project(self.project, preserve_view=True)
         self.display_view.set_project(self.project, preserve_view=True)
+        self.finishing_view.set_project(self.project)
         self.wiping_view.canvas.update()
         self.preview_win.canvas.invalidate_cache()
         self.minimap.invalidate_cache()
@@ -1259,6 +1261,7 @@ class MainWindow(QMainWindow):
             self._save_vocal_stem_for_project(self.project.source_path, self.audio.vocal_path, audio_path=self.audio.main_path)
         self.history.mark_saved()
         self._sync_tap_view_from_project(locked=True, reason="Sync saved")
+        self.finishing_view.set_project(self.project)
         self._refresh_actions()
         self.statusBar().showMessage(f"Saved {self.project.source_path.name}", 3500)
         return True
@@ -1286,6 +1289,7 @@ class MainWindow(QMainWindow):
                 self._save_vocal_stem_for_project(Path(path), self.audio.vocal_path, audio_path=self.audio.main_path)
             self.history.mark_saved()
             self._sync_tap_view_from_project(locked=True, reason="Sync saved")
+            self.finishing_view.set_project(self.project)
             self._refresh_actions()
             self.statusBar().showMessage(f"Saved {Path(path).name}", 3500)
             return True

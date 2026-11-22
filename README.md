@@ -49,7 +49,7 @@
 - **Unsaved Change Protection:** Tracks edits across both Tap Sync and Lyrics Wiping / Display and prompts **Save / Discard / Cancel** before closing.
 
 ### 5. Finishing (`Finishing` Tab)
-- Dedicated workspace for upcoming post-sync polish and finalization tools *(in development for alpha)*.
+- **One-Click `.kbp` → `.ass` Conversion:** Converts the active synced project directly to an Advanced SubStation Alpha (`.ass`) subtitle file via `kbputils` (automatically saved beside the `.kbp` file with the same name).
 
 ---
 
@@ -57,7 +57,7 @@
 
 ### Requirements
 - **Python 3.11+** (tested on Python 3.13, Windows)
-- Dependencies listed in [`requirements.txt`](requirements.txt): `PySide6`, `numpy`, `soundfile`
+- Dependencies listed in [`requirements.txt`](requirements.txt): `PySide6`, `numpy`, `soundfile`, `kbputils`
 
 ### Installation & Running from Source
 ```powershell
@@ -80,5 +80,5 @@ On Windows, you can also launch directly using [`run.bat`](run.bat) (or drop a `
 ## Licensing & Attribution
 
 - **Matt Joy Karaoke Builder** is **Proprietary — All Rights Reserved** (`Copyright © 2026 Matt Joy`). You may not copy, reuse, modify, redistribute, or sell the source code without prior written permission — see [`LICENSE`](LICENSE).
-- All runtime dependencies (`PySide6` / Qt 6, Qt Multimedia's LGPL FFmpeg libraries, `soundfile` / `libsndfile`, `NumPy`, `cffi`) are **MIT / BSD / LGPL** (dynamically linked), allowing proprietary distribution with attribution. No GPL-only libraries are bundled or required.
+- All runtime dependencies (`PySide6` / Qt 6, Qt Multimedia's LGPL FFmpeg libraries, `soundfile` / `libsndfile`, `NumPy`, `cffi`, `kbputils` by ItMightBeKaraoke, `ass_imbk`, `charset-normalizer`) are **MIT / BSD / LGPL** (dynamically linked), allowing proprietary distribution with attribution. No GPL-only libraries are bundled or required.
 - Full third-party notices and LGPL binary packaging compliance notes are in [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) (also viewable in-app via **About → View Licenses & Attribution…**).

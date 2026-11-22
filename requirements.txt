@@ -1,4 +1,5 @@
 PySide6>=6.7
 numpy>=1.26
 soundfile>=0.12
+kbputils>=0.2.11
 pytest>=8.0

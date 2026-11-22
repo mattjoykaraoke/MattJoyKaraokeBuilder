@@ -397,7 +397,7 @@ class _RollingTeleprompterWidget(QWidget):
             painter.drawText(
                 self.rect().adjusted(24, 24, -24, -24),
                 Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
-                "Click 'Obtain / Enter Lyrics…', 'Load .txt / .kbp…', or drag & drop a .kbp / .mjkp file to begin Tap Sync.",
+                "Click 'Obtain / Enter Lyrics' or load a .txt / .kbp / .mjkp file (drag and drop supported).",
             )
             return
 
@@ -887,8 +887,8 @@ class TapSyncView(QWidget):
         self._btn_paste.clicked.connect(self._open_lyrics_editor)
         lyr_r1.addWidget(self._btn_paste)
 
-        self._btn_load_lyr = QPushButton("Load .txt / .kbp…", ribbon)
-        self._btn_load_lyr.setToolTip("Load a lyric .txt file or an unsynced LYRICSV2 .kbp file")
+        self._btn_load_lyr = QPushButton("Load File", ribbon)
+        self._btn_load_lyr.setToolTip("Load a .txt, .kbp, or .mjkp file")
         self._btn_load_lyr.clicked.connect(self._load_lyrics_or_kbp_dialog)
         lyr_r1.addWidget(self._btn_load_lyr)
 
@@ -1132,7 +1132,7 @@ class TapSyncView(QWidget):
         self._btn_new.setToolTip(blocked_tip if has_synced else "Start a fresh blank Tap Sync draft")
         self._btn_load_lyr.setEnabled(allow_new_draft)
         self._btn_load_lyr.setToolTip(
-            blocked_tip if has_synced else "Load a lyric .txt file or an unsynced LYRICSV2 .kbp file"
+            blocked_tip if has_synced else "Load a .txt, .kbp, or .mjkp file"
         )
         # Project Organizer is always accessible (opens selected project in a new window if this one is busy)
         self._resume_btn.setEnabled(True)
@@ -1424,14 +1424,17 @@ class TapSyncView(QWidget):
             return
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Load Lyrics or Unsynced KBP",
+            "Load File",
             "",
-            "Lyrics & KBP (*.txt *.kbp);;Text Files (*.txt);;KBP Files (*.kbp);;All Files (*.*)",
+            "Supported Files (*.txt *.kbp *.mjkp);;Text Files (*.txt);;KBP Files (*.kbp);;Matt Joy Karaoke Project (*.mjkp);;All Files (*.*)",
         )
         if not path:
             return
         p = Path(path)
-        if p.suffix.lower() == ".kbp":
+        suf = p.suffix.lower()
+        if suf == ".mjkp":
+            self.load_draft_file(p)
+        elif suf == ".kbp":
             self.load_unsynced_kbp(p)
             self._autosave()
             self.setFocus()

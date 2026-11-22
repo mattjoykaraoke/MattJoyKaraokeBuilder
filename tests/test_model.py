@@ -307,6 +307,7 @@ def test_prepend_glyphs_matches_mjkcs():
     assert line.prepend_glyph(1, "➣➣➣", 135)
     g1 = line.syllables[1]
     assert g1.text == "➣➣➣"
+    assert g1.is_glyph is True
     assert g1.end == 1135
     assert g1.start == 1000  # 1135 - 135
 
@@ -315,9 +316,30 @@ def test_prepend_glyphs_matches_mjkcs():
     assert line.prepend_glyph(0, "••", 68)
     g2 = line.syllables[0]
     assert g2.text == "••"
+    assert g2.is_glyph is True
     assert g2.end == 999
     assert g2.start == 931
     assert line.display_start == 931
+
+
+def test_edited_appended_glyph_preserves_optimized_windows():
+    proj = _sample_project()
+    # Replace the lead-in glyph character on Page 1 and Page 3 with custom user characters
+    p0_glyph = proj.pages[0].lines[0].syllables[0]
+    assert p0_glyph.is_glyph is True
+    p0_glyph.text = ">>>"
+
+    p2_glyph = proj.pages[2].lines[0].syllables[0]
+    assert p2_glyph.is_glyph is True
+    p2_glyph.text = "★"
+
+    # Both pages must still be recognized as lead-in pages and optimized cleanly
+    assert proj.pages[0].starts_with_marker() is True
+    assert proj.pages[2].starts_with_marker() is True
+    opt_indices = proj.optimize_windows(optimized_lead_in_cs=25, gap_threshold_cs=300)
+    assert opt_indices == [0, 2]
+    assert proj.pages[0].lines[0].display_start == 975
+    assert proj.pages[2].lines[0].display_start == 2975
 
 
 def test_insert_syllable_between_adjacent_and_short_neighbors():
