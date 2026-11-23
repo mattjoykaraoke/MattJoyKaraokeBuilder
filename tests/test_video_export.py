@@ -329,3 +329,64 @@ def test_build_title_card_clip_and_prepend_stream_copy(tmp_path: Path, monkeypat
     assert len(calls) == 2
     assert "-c" in calls[1] and "copy" in calls[1]
 
+
+def test_finishing_view_detects_existing_video_in_ass_directory(tmp_path: Path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+    from kbp_editor.ui import finishing_view as fv_mod
+
+    app = QApplication.instance() or QApplication([])
+    settings = QSettings(str(tmp_path / "detect_vid_settings.ini"), QSettings.Format.IniFormat)
+
+    # Unsaved project (source_path is None), but all files already exist in a folder
+    song_dir = tmp_path / "my_song"
+    song_dir.mkdir()
+    ass_path = song_dir / "Test Artist - Test Song.ass"
+    ass_path.write_text("; kbputils_background_1.0 color: #FF112233\n", encoding="utf-8-sig")
+    existing_mp4 = song_dir / "Test Artist - Test Song.mp4"
+    existing_mp4.write_bytes(b"EXISTING_MP4")
+    existing_tc = song_dir / "Test Artist - Test Song (with Title Card).mp4"
+    existing_tc.write_bytes(b"EXISTING_TC_MP4")
+
+    unsaved_proj = _make_sample_project()
+    assert unsaved_proj.source_path is None
+
+    view = fv_mod.FinishingView(settings=settings)
+    try:
+        view.set_project(unsaved_proj)
+        assert view._last_video_path is None
+        assert view._open_video_folder_btn.isHidden()
+
+        # Selecting the .ass file in Make Video detects the completed video in its directory
+        view._set_video_ass_path(ass_path)
+        assert view._last_video_path == existing_mp4
+        assert not view._open_video_folder_btn.isHidden()
+        assert not view._vid_status_lbl.isHidden()
+        assert existing_mp4.name in view._vid_status_lbl.text()
+        assert Path(view._tc_video_edit.text()) == existing_mp4
+        assert Path(view._tc_out_edit.text()) == existing_tc
+        assert view._open_cl_btn.isEnabled() is True
+
+        # Styled .ass variant in the same folder also finds the base video (and skips title-card video)
+        styled_ass = song_dir / "Test Artist - Test Song_styled.ass"
+        styled_ass.write_text("; kbputils_background_1.0 color: #FF112233\n", encoding="utf-8-sig")
+        view._set_video_ass_path(styled_ass)
+        assert view._last_video_path == existing_mp4
+        assert Path(view._tc_video_edit.text()) == existing_mp4
+
+        # Shared folder with another song's video must NOT falsely match an unrelated .ass
+        shared_dir = tmp_path / "shared"
+        shared_dir.mkdir()
+        (shared_dir / "Other Song.mp4").write_bytes(b"OTHER")
+        unrendered_ass = shared_dir / "Brand New Song.ass"
+        unrendered_ass.write_text("; kbputils_background_1.0 color: #FF000000\n", encoding="utf-8-sig")
+        view._set_video_ass_path(unrendered_ass)
+        assert view._last_video_path is None
+        assert view._open_video_folder_btn.isHidden()
+        assert view._vid_status_lbl.isHidden()
+    finally:
+        view.close()
+        app.processEvents()
+
+

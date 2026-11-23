@@ -43,7 +43,7 @@ from ..chromalyric import (
     find_chromalyric_exe,
     launch_chromalyric,
 )
-from ..model import KbpProject
+from ..model import KbpProject, suggest_project_filename
 from ..video_export import (
     FFMPEG_DOWNLOAD_URL,
     check_ass_should_be_transparent,
@@ -927,6 +927,11 @@ class FinishingView(QWidget):
     def _active_ass_path(self) -> Optional[Path]:
         if self._last_ass_path is not None and self._last_ass_path.is_file():
             return self._last_ass_path
+        vid_ass_txt = self._vid_ass_edit.text().strip()
+        if vid_ass_txt:
+            cand_vid = Path(vid_ass_txt)
+            if cand_vid.is_file():
+                return cand_vid
         if self.project is not None and self.project.source_path is not None:
             cand = self.project.source_path.with_suffix(".ass")
             if cand.is_file():
@@ -1235,14 +1240,129 @@ class FinishingView(QWidget):
         if sig != self._last_ass_stat:
             self._last_ass_stat = sig
             self._sync_video_metadata_from_ass(ass_path, preserve_custom_out=True)
+            self._sync_existing_video_for_ass(ass_path, overwrite_tc_video=False)
             self._update_video_buttons()
+        elif self._last_video_path is None or not self._last_video_path.is_file():
+            self._sync_existing_video_for_ass(ass_path, overwrite_tc_video=False)
+
+    def _find_existing_video_for_ass(self, ass_path: Path) -> Optional[Path]:
+        """Look for an already-completed karaoke video (.mp4 / .mov) in the .ass file's directory."""
+        ass_dir = ass_path.parent
+        if not ass_dir.is_dir():
+            return None
+
+        is_trans = self._vid_transparent_cb.isChecked()
+        preferred_ext = ".mov" if is_trans else ".mp4"
+        other_ext = ".mp4" if is_trans else ".mov"
+
+        candidates: List[Path] = []
+        cur_out = self._vid_out_edit.text().strip()
+        if cur_out:
+            p_out = Path(cur_out)
+            if p_out.suffix.lower() in (".mp4", ".mov"):
+                candidates.append(p_out)
+
+        candidates.append(ass_path.with_suffix(preferred_ext))
+        candidates.append(ass_path.with_suffix(other_ext))
+
+        if self.project is not None and (self.project.header.artist or self.project.header.title):
+            for ext in (preferred_ext, other_ext):
+                proj_name = suggest_project_filename(
+                    self.project.header.artist,
+                    self.project.header.title,
+                    ext=ext,
+                    fallback_stem="",
+                )
+                if proj_name and proj_name != ext:
+                    candidates.append(ass_dir / proj_name)
+
+        seen: set[str] = set()
+        for cand in candidates:
+            key = str(cand).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if cand.is_file():
+                return cand
+
+        # Fallback: stem-prefix match in the .ass directory (skipping already-prepended title card videos)
+        ass_stem = ass_path.stem.strip().lower()
+        prefix_matches: List[Path] = []
+        try:
+            for entry in ass_dir.iterdir():
+                if not entry.is_file() or entry.suffix.lower() not in (".mp4", ".mov"):
+                    continue
+                cand_stem = entry.stem.strip().lower()
+                if cand_stem.endswith("(with title card)"):
+                    continue
+                if min(len(ass_stem), len(cand_stem)) >= 3 and (
+                    cand_stem.startswith(ass_stem) or ass_stem.startswith(cand_stem)
+                ):
+                    prefix_matches.append(entry)
+        except OSError:
+            return None
+
+        if prefix_matches:
+            def _sort_key(p: Path) -> tuple[int, float]:
+                try:
+                    mtime = p.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                return (0 if p.suffix.lower() == preferred_ext else 1, -mtime)
+
+            prefix_matches.sort(key=_sort_key)
+            return prefix_matches[0]
+        return None
+
+    def _sync_existing_video_for_ass(
+        self,
+        ass_path: Optional[Path],
+        *,
+        overwrite_tc_video: bool = False,
+    ) -> Optional[Path]:
+        """Detect a completed video in the .ass directory and reflect it in Make Video & Prepend Title Card."""
+        if self._video_worker is not None and self._video_worker.isRunning():
+            return None
+
+        found = (
+            self._find_existing_video_for_ass(ass_path)
+            if (ass_path is not None and ass_path.is_file())
+            else None
+        )
+        if found is not None:
+            same_as_last = self._last_video_path is not None and self._last_video_path == found
+            self._last_video_path = found
+            self._open_video_folder_btn.setVisible(True)
+            if not (same_as_last and self._vid_status_lbl.isVisible()):
+                self._vid_status_lbl.setStyleSheet(
+                    "QLabel { font-size: 12px; color: #bbf7d0; padding: 8px 10px; "
+                    "border-radius: 5px; background-color: #052e16; border: 1px solid #166534; }"
+                )
+                self._vid_status_lbl.setText(f"✓ Existing video found: {found.name}\n{found}")
+                self._vid_status_lbl.show()
+
+            cur_tc_txt = self._tc_video_edit.text().strip()
+            cur_tc_valid = bool(cur_tc_txt and Path(cur_tc_txt).is_file())
+            if overwrite_tc_video or not cur_tc_valid:
+                if not cur_tc_txt or Path(cur_tc_txt) != found:
+                    self._custom_tc_out = False
+                self._set_tc_video_path(found)
+            return found
+
+        self._last_video_path = None
+        self._open_video_folder_btn.setVisible(False)
+        if self._vid_status_lbl.text().startswith("✓ Existing video found:"):
+            self._vid_status_lbl.hide()
+        return None
 
     def _set_video_ass_path(self, ass_path: Path) -> None:
         self._vid_ass_edit.blockSignals(True)
         self._vid_ass_edit.setText(str(ass_path))
         self._vid_ass_edit.blockSignals(False)
         self._sync_video_metadata_from_ass(ass_path)
+        self._sync_existing_video_for_ass(ass_path, overwrite_tc_video=True)
         self._watch_video_ass(ass_path)
+        self._update_chromalyric_buttons()
         self._update_video_buttons()
 
     def _sync_video_metadata_from_ass(self, ass_path: Path, *, preserve_custom_out: bool = False) -> None:
@@ -1271,13 +1391,19 @@ class FinishingView(QWidget):
         p = Path(text.strip()) if text.strip() else None
         if p is not None and p.is_file():
             self._sync_video_metadata_from_ass(p)
+            self._sync_existing_video_for_ass(p, overwrite_tc_video=True)
             self._watch_video_ass(p)
         else:
+            self._sync_existing_video_for_ass(None)
             self._watch_video_ass(None)
+        self._update_chromalyric_buttons()
         self._update_video_buttons()
 
     def _on_video_out_edited(self, _text: str) -> None:
         self._custom_video_out = True
+        ass_txt = self._vid_ass_edit.text().strip()
+        if ass_txt and Path(ass_txt).is_file():
+            self._sync_existing_video_for_ass(Path(ass_txt), overwrite_tc_video=False)
 
     def _on_video_transparent_toggled(self, checked: bool) -> None:
         expected_ext = ".mov" if checked else ".mp4"
@@ -1288,6 +1414,9 @@ class FinishingView(QWidget):
                 self._vid_out_edit.blockSignals(True)
                 self._vid_out_edit.setText(str(p.with_suffix(expected_ext)))
                 self._vid_out_edit.blockSignals(False)
+        ass_txt = self._vid_ass_edit.text().strip()
+        if ass_txt and Path(ass_txt).is_file():
+            self._sync_existing_video_for_ass(Path(ass_txt), overwrite_tc_video=False)
         self._update_video_buttons()
 
     def _video_default_dir(self) -> str:
