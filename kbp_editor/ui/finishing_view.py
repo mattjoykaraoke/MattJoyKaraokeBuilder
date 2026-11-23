@@ -91,7 +91,13 @@ class FinishingView(QWidget):
         al.setContentsMargins(18, 16, 18, 16)
         al.setSpacing(12)
 
-        sec_title = QLabel("Convert .kbp to .ass", ass_box)
+        sec_title = QLabel(
+            "Convert .kbp to .ass "
+            "<span style='font-size: 12px; font-weight: normal; color: #94a3b8;'>"
+            "(leave default if not sure)</span>",
+            ass_box,
+        )
+        sec_title.setTextFormat(Qt.TextFormat.RichText)
         sec_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #f1f5f9;")
         al.addWidget(sec_title)
 
