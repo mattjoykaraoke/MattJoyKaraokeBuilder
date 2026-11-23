@@ -14,6 +14,14 @@ DEFAULT_OPTIMIZED_LEAD_IN_CS = 25
 DEFAULT_GAP_THRESHOLD_CS = 300
 DEFAULT_LEAD_IN_MARKER = "➣➣➣"
 KNOWN_GLYPHS: Tuple[str, ...] = (DEFAULT_LEAD_IN_MARKER, "••")
+
+
+def is_non_alnum_glyph_text(text: str) -> bool:
+    """True when `text` has visible characters and none of them are alphanumeric (e.g. ➣➣➣, ••, ▅▅▅▅▅▅▅, ➤)."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return not any(ch.isalnum() for ch in stripped)
 DEFAULT_KBP_COMMENTS: Tuple[str, ...] = (
     "Hacked by Matt Joy",
     "github.com/mattjoykaraoke",
@@ -408,6 +416,56 @@ class Line:
     extra_fields: List[str] = field(default_factory=lambda: ["0", "0", "0"])
     syllables: List[Syllable] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self.refresh_leading_glyph()
+
+    @property
+    def is_spacer(self) -> bool:
+        """True for blank layout-spacer lines (no syllables, or only empty 0/0 placeholder syllables)."""
+        if not self.syllables:
+            return True
+        return all(not s.text.strip() and s.start == 0 and s.end == 0 for s in self.syllables)
+
+    @property
+    def is_fixed(self) -> bool:
+        """True when the line uses KBP fixed-text mode (lowercase style letter, no wiping)."""
+        return bool(self.style) and self.style.islower()
+
+    def set_fixed(self, fixed: bool) -> None:
+        """Toggle KBP fixed-text mode by lowercasing/uppercasing the style letter."""
+        if not self.style:
+            self.style = "a" if fixed else "A"
+        else:
+            self.style = self.style.lower() if fixed else self.style.upper()
+
+    @property
+    def offset_x(self) -> int:
+        """KBP horizontal pixel offset (`right`, extra_fields[0]) in CD+G units."""
+        if len(self.extra_fields) >= 1:
+            try:
+                return int(self.extra_fields[0])
+            except ValueError:
+                return 0
+        return 0
+
+    @property
+    def offset_y(self) -> int:
+        """KBP vertical pixel offset (`down`, extra_fields[1]) in CD+G units."""
+        if len(self.extra_fields) >= 2:
+            try:
+                return int(self.extra_fields[1])
+            except ValueError:
+                return 0
+        return 0
+
+    def refresh_leading_glyph(self) -> None:
+        """Mark a leading non-alphanumeric syllable on a timed line as a lead-in glyph."""
+        if self.is_spacer or self.is_fixed or not self.syllables:
+            return
+        first = self.syllables[0]
+        if is_non_alnum_glyph_text(first.text):
+            first.is_glyph = True
+
     @property
     def first_syl_start(self) -> int:
         return min((s.start for s in self.syllables), default=self.display_start)
@@ -725,32 +783,55 @@ class Page:
     lines: List[Line] = field(default_factory=list)
 
     @property
+    def non_spacer_lines(self) -> List[Line]:
+        """All lines excluding blank 0/0 layout spacers."""
+        return [line for line in self.lines if not line.is_spacer]
+
+    @property
+    def timed_lines(self) -> List[Line]:
+        """Lines with real singing/wipe timing (excludes blank spacers and fixed-text labels)."""
+        return [line for line in self.lines if not line.is_spacer and not line.is_fixed]
+
+    @property
+    def first_timed_line_index(self) -> Optional[int]:
+        """0-based index of the first non-spacer, non-fixed line on this page, or None."""
+        for idx, line in enumerate(self.lines):
+            if not line.is_spacer and not line.is_fixed:
+                return idx
+        return None
+
+    @property
     def first_syl_start(self) -> int:
-        starts = [line.first_syl_start for line in self.lines if line.syllables]
+        candidates = self.timed_lines or self.non_spacer_lines
+        starts = [line.first_syl_start for line in candidates if line.syllables]
         return min(starts) if starts else 0
 
     @property
     def last_syl_end(self) -> int:
-        ends = [line.last_syl_end for line in self.lines if line.syllables]
+        candidates = self.timed_lines or self.non_spacer_lines
+        ends = [line.last_syl_end for line in candidates if line.syllables]
         return max(ends) if ends else 0
 
     @property
     def display_start(self) -> int:
-        return min((line.display_start for line in self.lines), default=0)
+        candidates = self.non_spacer_lines
+        return min((line.display_start for line in candidates), default=0)
 
     @property
     def display_end(self) -> int:
-        return max((line.display_end for line in self.lines), default=0)
+        candidates = self.non_spacer_lines
+        return max((line.display_end for line in candidates), default=0)
 
     def starts_with_marker(self, marker: str = DEFAULT_LEAD_IN_MARKER) -> bool:
-        """True if Line 1's first syllable is a lead-in glyph or begins with `marker` (e.g. ➣➣➣)."""
-        if not self.lines or not self.lines[0].syllables:
+        """True if the first timed line's leading syllable is a lead-in glyph or begins with `marker`."""
+        candidates = self.timed_lines
+        if not candidates or not candidates[0].syllables:
             return False
-        first_syl = self.lines[0].syllables[0]
+        first_syl = candidates[0].syllables[0]
         if first_syl.is_glyph:
             return True
         first_text = first_syl.text.strip()
-        return first_text.startswith(marker)
+        return first_text.startswith(marker) or is_non_alnum_glyph_text(first_text)
 
     def shift(self, delta_cs: int) -> None:
         for line in self.lines:
@@ -872,6 +953,8 @@ class KbpProject:
                             pad=pad,
                         )
                     )
+            for ln in page_lines:
+                ln.refresh_leading_glyph()
             pages.append(Page(lines=page_lines))
 
         trailing_blanks = 0
@@ -1392,29 +1475,33 @@ class KbpProject:
     def _row_clear_constraint(self, prev_page: Page, cur_page: Page, cur_row_idx: int) -> int:
         """
         Compute the earliest centisecond cur_row_idx on cur_page can appear without
-        visually overlapping an uncleared row from prev_page.
+        visually overlapping an uncleared row from prev_page in KBS/ASS top-anchored coordinates.
         """
-        if not prev_page.lines:
+        if not prev_page.lines or not (0 <= cur_row_idx < len(cur_page.lines)):
             return 0
-        n_prev = len(prev_page.lines)
-        n_cur = len(cur_page.lines)
+        line_h = 19
+        spacing = self.header.margins[3] if len(self.header.margins) >= 4 else 12
+        pitch = max(line_h, spacing + line_h)
+        cur_y = cur_row_idx * pitch + cur_page.lines[cur_row_idx].offset_y
 
-        # Direct row match when line counts are equal or prev has at least this row.
-        # When cur_page has more rows than prev_page (e.g. 4 -> 6), rows shift vertically
-        # in centered layout so we check adjacent overlapping slots too.
-        if n_prev == n_cur:
-            return prev_page.lines[cur_row_idx].display_end + 1
-
-        # Map each row to normalized vertical band [0, 1]
-        cur_top = cur_row_idx / max(1, n_cur)
-        cur_bot = (cur_row_idx + 1) / max(1, n_cur)
         earliest = 0
         for p_idx, p_line in enumerate(prev_page.lines):
-            p_top = p_idx / max(1, n_prev)
-            p_bot = (p_idx + 1) / max(1, n_prev)
-            if p_top < cur_bot and p_bot > cur_top:
+            if p_line.is_spacer:
+                continue
+            p_y = p_idx * pitch + p_line.offset_y
+            if abs(p_y - cur_y) < line_h:
                 earliest = max(earliest, p_line.display_end + 1)
         return earliest
+
+    @staticmethod
+    def _fixed_line_start_cap(page: Page, l_idx: int) -> int:
+        """Latest allowed display_start for a fixed-text line on `page`."""
+        for candidate in page.lines[l_idx + 1 :]:
+            if not candidate.is_spacer and not candidate.is_fixed and candidate.syllables:
+                return candidate.first_syl_start
+        if page.timed_lines:
+            return page.first_syl_start
+        return page.lines[l_idx].display_end
 
     def reset_windows(
         self,
@@ -1424,16 +1511,37 @@ class KbpProject:
     ) -> None:
         """
         Reset Display/Remove windows to standard KBS defaults:
-        - display_end = line.last_syl_end + clear_hold_cs (default +50 cs)
-        - display_start = max(page.first_syl_start - lead_in_cs, prev_overlapping_row_end + 1, prev_line_start)
+        - Blank spacer lines stay at 0–0 and do not affect page timing or row clears.
+        - Fixed-text lines (lowercase style) stay visible until the page finishes.
+        - Timed lines get display_end = line.last_syl_end + clear_hold_cs (default +50 cs)
+          and display_start = max(page.first_syl_start - lead_in_cs, prev_overlapping_row_end + 1, prev_line_start).
         """
         target_set = set(range(len(self.pages))) if page_indices is None else set(page_indices)
 
         # First pass: reset display_end on targeted pages
         for p_idx in sorted(target_set):
             if 0 <= p_idx < len(self.pages):
-                for line in self.pages[p_idx].lines:
-                    line.display_end = line.last_syl_end + clear_hold_cs
+                page = self.pages[p_idx]
+                page_end_cs = (page.last_syl_end + clear_hold_cs) if page.timed_lines else None
+                next_ideal_start: Optional[int] = None
+                if p_idx + 1 < len(self.pages) and self.pages[p_idx + 1].timed_lines:
+                    next_ideal_start = max(0, self.pages[p_idx + 1].first_syl_start - lead_in_cs)
+                for line in page.lines:
+                    if line.is_spacer:
+                        line.display_start = 0
+                        line.display_end = 0
+                    elif line.is_fixed:
+                        if page_end_cs is not None:
+                            end_cs = page_end_cs
+                            # Clear fixed headers right before the next page wants to appear
+                            # so they never overlap the next page or choke its lead-in time.
+                            if next_ideal_start is not None and next_ideal_start - 1 > page.first_syl_start:
+                                end_cs = min(end_cs, next_ideal_start - 1)
+                            line.display_end = end_cs
+                        else:
+                            line.display_end = max(line.display_end, line.last_syl_end + clear_hold_cs)
+                    else:
+                        line.display_end = line.last_syl_end + clear_hold_cs
 
         # Second pass: compute display_start respecting previous page row clears
         for p_idx in sorted(target_set):
@@ -1444,11 +1552,18 @@ class KbpProject:
             ideal_start = max(0, page.first_syl_start - lead_in_cs)
             prev_line_start = 0
             for l_idx, line in enumerate(page.lines):
+                if line.is_spacer:
+                    line.display_start = 0
+                    line.display_end = 0
+                    continue
                 row_clear = self._row_clear_constraint(prev_page, page, l_idx) if prev_page else 0
                 start = max(ideal_start, row_clear, prev_line_start)
-                # Never appear after the line's own first syllable
-                start = min(start, line.first_syl_start)
+                # Never appear after the line's own first syllable (or the next timed line for fixed labels)
+                cap = self._fixed_line_start_cap(page, l_idx) if line.is_fixed else line.first_syl_start
+                start = min(start, cap)
                 line.display_start = max(0, start)
+                if line.display_end < line.display_start:
+                    line.display_end = line.display_start
                 prev_line_start = line.display_start
 
     def is_optimized_lead_in_page(
@@ -1458,7 +1573,7 @@ class KbpProject:
         gap_threshold_cs: int = DEFAULT_GAP_THRESHOLD_CS,
     ) -> bool:
         """
-        True when page_idx starts with the lead-in marker (e.g. ➣➣➣) on Line 1
+        True when page_idx starts with a lead-in glyph (e.g. ➣➣➣, ••, ▅▅▅▅▅▅▅, ➤) on its first timed line
         AND follows an instrumental gap (first page, or gap >= gap_threshold_cs).
         Mid-page markers never trigger this.
         """
@@ -1486,7 +1601,7 @@ class KbpProject:
         """
         Apply 'Optimized Windows':
         - Optionally resets targeted pages to standard defaults first.
-        - On pages where Line 1 starts with `marker` (➣➣➣) AND there is an instrumental
+        - On pages where the first timed line starts with a lead-in glyph AND there is an instrumental
           gap before the page (>= gap_threshold_cs, or Page 1), shrinks the page's
           display_start to `page.first_syl_start - optimized_lead_in_cs` (~25 cs).
         Returns the 0-based indices of pages that received the shrunk lead-in window.
@@ -1509,9 +1624,14 @@ class KbpProject:
             ideal_start = max(0, page.first_syl_start - optimized_lead_in_cs)
             prev_line_start = 0
             for l_idx, line in enumerate(page.lines):
+                if line.is_spacer:
+                    line.display_start = 0
+                    line.display_end = 0
+                    continue
                 row_clear = self._row_clear_constraint(prev_page, page, l_idx) if prev_page else 0
                 start = max(ideal_start, row_clear, prev_line_start)
-                start = min(start, line.first_syl_start)
+                cap = self._fixed_line_start_cap(page, l_idx) if line.is_fixed else line.first_syl_start
+                start = min(start, cap)
                 line.display_start = max(0, start)
                 prev_line_start = line.display_start
             optimized_pages.append(p_idx)

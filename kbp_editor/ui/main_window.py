@@ -1101,7 +1101,9 @@ class MainWindow(QMainWindow):
         if len(self.display_view.canvas._page_headers) != len(self.project.pages) or len(self.display_view.canvas._rows) != total_lines:
             self.display_view.set_project(self.project, preserve_view=True)
         else:
+            self.display_view._sync_fixed_checkbox()
             self.display_view.canvas.update()
+        self.wiping_view._sync_style_combo()
         self.finishing_view.set_project(self.project)
         self.wiping_view.canvas.update()
         if self.preview_win.isVisible():

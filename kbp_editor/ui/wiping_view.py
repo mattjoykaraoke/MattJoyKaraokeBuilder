@@ -155,7 +155,9 @@ class AddLineDialog(QDialog):
             f"At Playhead ({self._playhead_cs} cs)",
         ])
         self._style_combo = QComboBox()
-        self._style_combo.addItems(["A", "B", "C"])
+        self._style_combo.addItems(["A", "B", "C", "D", "E", "F"])
+        self._fixed_cb = QCheckBox("Fixed Text (No Wipe)")
+        self._fixed_cb.setToolTip("Creates a KBP Fixed Text line (lowercase style letter) that stays on screen without wiping")
         self._dur_spin = QSpinBox()
         self._dur_spin.setRange(5, 300)
         self._dur_spin.setValue(30)
@@ -165,6 +167,7 @@ class AddLineDialog(QDialog):
         form.addRow("Line Lyrics:", self._text_edit)
         form.addRow("Start Time:", self._where_combo)
         form.addRow("Track Style:", self._style_combo)
+        form.addRow("", self._fixed_cb)
         form.addRow("Syllable Duration:", self._dur_spin)
         layout.addLayout(form)
 
@@ -176,6 +179,9 @@ class AddLineDialog(QDialog):
 
     @property
     def syllables(self) -> List[str]:
+        if self._fixed_cb.isChecked():
+            txt = self._text_edit.text().strip()
+            return [txt] if txt else []
         return parse_line_to_syllables(self._text_edit.text())
 
     @property
@@ -184,7 +190,8 @@ class AddLineDialog(QDialog):
 
     @property
     def style_letter(self) -> str:
-        return self._style_combo.currentText()
+        letter = self._style_combo.currentText()
+        return letter.lower() if self._fixed_cb.isChecked() else letter.upper()
 
     @property
     def duration_cs(self) -> int:
@@ -1646,6 +1653,15 @@ class LyricsWipingView(QWidget):
             self._style_combo.addItem(f"Style [{letter}]", letter)
         self._style_combo.currentIndexChanged.connect(self._on_style_combo_changed)
         l_r2.addWidget(self._style_combo)
+        self._fixed_btn = QPushButton("Fixed", ribbon)
+        self._fixed_btn.setCheckable(True)
+        self._fixed_btn.setFixedWidth(48)
+        self._fixed_btn.setToolTip("Toggle KBP Fixed Text mode (no wipe, lowercase style letter) for selected line(s)")
+        self._fixed_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #2b6cb0; color: #ffffff; font-weight: bold; }"
+        )
+        self._fixed_btn.toggled.connect(self._on_fixed_btn_toggled)
+        l_r2.addWidget(self._fixed_btn)
         _add_btn(l_r2, "▶ Play Line", "Play the selected line and stop right at its end", self._play_current_line)
         ribbon_layout.addLayout(sec_lines)
         ribbon_layout.addWidget(_make_divider())
@@ -1835,12 +1851,20 @@ class LyricsWipingView(QWidget):
 
     @staticmethod
     def _format_line_item_text(line: Line) -> str:
+        if line.is_spacer:
+            return "(blank spacer)"
         raw_text = line.full_text.strip() or "(empty)"
+        if line.is_fixed:
+            return f"[{line.style}·Fixed] {raw_text}"
         return f"[{line.style}] {raw_text}" if line.style != "A" else raw_text
 
     @staticmethod
     def _style_line_item(item: QTreeWidgetItem, line: Line) -> None:
-        if line.style != "A":
+        if line.is_spacer:
+            item.setForeground(0, QBrush(QColor(105, 112, 126)))
+        elif line.is_fixed:
+            item.setForeground(0, QBrush(QColor(140, 200, 225)))
+        elif line.style != "A":
             _, _, lbl_c = style_palette(line.style)
             item.setForeground(0, QBrush(lbl_c))
         else:
@@ -1861,7 +1885,7 @@ class LyricsWipingView(QWidget):
         item.setText(0, self._format_line_item_text(line))
         self._style_line_item(item, line)
         parent = item.parent()
-        if parent is not None and l_idx == 0:
+        if parent is not None and l_idx == page.first_timed_line_index:
             is_opt = self.project.is_optimized_lead_in_page(p_idx)
             parent.setBackground(0, QBrush(QColor(34, 58, 48) if is_opt else QColor(34, 40, 52)))
             parent.setForeground(0, QBrush(QColor(135, 225, 175) if is_opt else QColor(155, 185, 225)))
@@ -1890,12 +1914,46 @@ class LyricsWipingView(QWidget):
     def _sync_style_combo(self) -> None:
         line = self.canvas.current_line()
         if not line:
+            self._fixed_btn.blockSignals(True)
+            self._fixed_btn.setEnabled(False)
+            self._fixed_btn.setChecked(False)
+            self._fixed_btn.blockSignals(False)
             return
         idx = self._style_combo.findData(line.style.upper())
         if idx >= 0:
             self._style_combo.blockSignals(True)
             self._style_combo.setCurrentIndex(idx)
             self._style_combo.blockSignals(False)
+        self._fixed_btn.blockSignals(True)
+        self._fixed_btn.setEnabled(not line.is_spacer)
+        self._fixed_btn.setChecked(line.is_fixed)
+        self._fixed_btn.blockSignals(False)
+
+    def _on_fixed_btn_toggled(self, checked: bool) -> None:
+        if not self.project:
+            return
+        target_lines: Set[Tuple[int, int]] = {(p, l) for p, l, _ in self.canvas.selected_syls}
+        if not target_lines:
+            target_lines = {(self.canvas.page_idx, self.canvas.line_idx)}
+        changed = False
+        for p_i, l_i in target_lines:
+            ln = self.canvas.get_line(p_i, l_i)
+            if ln and not ln.is_spacer and ln.is_fixed != checked:
+                ln.set_fixed(checked)
+                changed = True
+        if changed:
+            for p_i, l_i in target_lines:
+                self._update_tree_line(p_i, l_i)
+            self._sync_style_combo()
+            self.canvas.invalidate_layout_cache()
+            self.canvas.update()
+            state = "ON" if checked else "OFF"
+            lbl = (
+                f"Fixed Text {state} ({len(target_lines)} lines)"
+                if len(target_lines) > 1
+                else f"Fixed Text {state} (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})"
+            )
+            self.project_mutated.emit(lbl)
 
     def _on_style_combo_changed(self, idx: int) -> None:
         if not self.project or idx < 0:
@@ -1916,8 +1974,11 @@ class LyricsWipingView(QWidget):
         changed = False
         for p_i, l_i in target_lines:
             ln = self.canvas.get_line(p_i, l_i)
-            if ln and ln.style != letter:
-                ln.style = letter
+            if not ln:
+                continue
+            target_style = letter.lower() if ln.is_fixed else letter
+            if ln.style != target_style:
+                ln.style = target_style
                 changed = True
         if changed:
             for p_i, l_i in target_lines:
@@ -2032,6 +2093,13 @@ class LyricsWipingView(QWidget):
             act_st.triggered.connect(lambda _chk=False, lt=st_letter: self._set_selected_lines_style(lt))
             style_menu.addAction(act_st)
 
+        act_fixed = QAction("Fixed Text (No Wipe)", self)
+        act_fixed.setCheckable(True)
+        act_fixed.setEnabled(cur_ln is not None and not cur_ln.is_spacer)
+        act_fixed.setChecked(bool(cur_ln and cur_ln.is_fixed))
+        act_fixed.triggered.connect(lambda chk=False: self._on_fixed_btn_toggled(bool(chk)))
+        menu.addAction(act_fixed)
+
     def _next_page_duplicate_style(self, p_idx: int) -> str:
         if self.project and 0 <= p_idx < len(self.project.pages):
             return self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
@@ -2090,6 +2158,9 @@ class LyricsWipingView(QWidget):
             act_dot = QAction("Append •• (68 cs)", self)
             act_dot.triggered.connect(lambda: self._prepend_glyph("••", 68))
             menu.addAction(act_dot)
+
+            menu.addSeparator()
+            self._add_style_submenu(menu, self.canvas.get_line(p_idx, l_idx))
 
         elif kind == "line":
             act_play = QAction("▶ Play Line", self)
@@ -2256,6 +2327,8 @@ class LyricsWipingView(QWidget):
             if updated and updated != syl.text:
                 old = syl.text.strip()
                 syl.text = updated
+                if idx == 0:
+                    line.refresh_leading_glyph()
                 self._update_tree_line(self.canvas.page_idx, self.canvas.line_idx)
                 self.canvas.update()
                 self.project_mutated.emit(f"Edit Syllable '{old}' → '{updated.strip()}' (P{self.canvas.page_idx + 1} L{self.canvas.line_idx + 1})")

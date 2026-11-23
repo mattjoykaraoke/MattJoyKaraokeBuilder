@@ -81,6 +81,8 @@ class PreviewCanvas(QWidget):
         for p_idx, page in enumerate(self._project.pages):
             n_rows = len(page.lines)
             for r_idx, line in enumerate(page.lines):
+                if line.is_spacer:
+                    continue
                 if line.display_start <= cs <= line.display_end:
                     active.append((r_idx, n_rows, line))
                     primary_page = p_idx + 1
@@ -124,8 +126,9 @@ class PreviewCanvas(QWidget):
         key = (
             syl_texts,
             line.align,
+            line.offset_x,
+            line.offset_y,
             row_idx,
-            total_rows,
             header.margins,
             style.font_name,
             style.font_size,
@@ -148,9 +151,11 @@ class PreviewCanvas(QWidget):
         if len(self._line_cache) >= 64:
             self._line_cache.clear()
 
-        margin_l, margin_r, _margin_t, line_spacing = header.margins
-        safe_x_left = 110.0 + margin_l * 10.0
-        safe_x_right = LOGICAL_W - (110.0 + margin_r * 10.0)
+        margin_l, margin_r, margin_t, line_spacing = header.margins
+        cdg_scale_x = LOGICAL_W / 300.0
+        cdg_scale_y = LOGICAL_H / 216.0
+        safe_x_left = (6.0 + margin_l) * cdg_scale_x
+        safe_x_right = LOGICAL_W - (6.0 + margin_r) * cdg_scale_x
         usable_w = max(200.0, safe_x_right - safe_x_left)
 
         px_size = max(28, int(round(style.font_size * 5.2)))
@@ -175,11 +180,13 @@ class PreviewCanvas(QWidget):
             x_start = safe_x_right - total_text_w
         else:
             x_start = (LOGICAL_W - total_text_w) * 0.5
+        x_start += line.offset_x * cdg_scale_x
 
-        row_pitch = max(px_size * 1.45, 92.0 + line_spacing * 3.0)
-        block_h = total_rows * row_pitch
-        top_y = (LOGICAL_H - block_h) * 0.5
-        baseline_y = top_y + row_idx * row_pitch + fm.ascent() + (row_pitch - fm.height()) * 0.5
+        # Match KBS / kbputils top-anchored row grid so pages with different line counts
+        # never shift vertically into each other during cross-page transitions.
+        row_pitch = max(px_size * 1.25, (line_spacing + 19.0) * cdg_scale_y)
+        top_y = (margin_t + 12.0 + line.offset_y) * cdg_scale_y
+        baseline_y = top_y + row_idx * row_pitch + fm.ascent()
 
         text_path = QPainterPath()
         text_path.addText(x_start, baseline_y, font, full_text)
@@ -250,6 +257,10 @@ class PreviewCanvas(QWidget):
                     line, row_idx, total_rows, w, h, scale, offset_x, offset_y, dpr
                 )
                 painter.drawPixmap(0, 0, unwiped_pm)
+
+                # Fixed-text lines (lowercase style in KBP) never wipe
+                if line.is_fixed:
+                    continue
 
                 # Compute wipe pixel X in widget space using cached syllable widths
                 wipe_x_w = x_start_w

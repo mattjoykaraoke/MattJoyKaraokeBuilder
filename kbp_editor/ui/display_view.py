@@ -244,11 +244,23 @@ class _DisplayTimelineCanvas(QWidget):
 
             painter.save()
             painter.setClipRect(0, y, LABEL_COL_W - 2, ROW_H)
-            raw_text = line.full_text.strip() or "(empty)"
-            txt = f"[{line.style}] {raw_text}" if line.style != "A" else raw_text
+            if line.is_spacer:
+                txt = "(blank spacer)"
+            else:
+                raw_text = line.full_text.strip() or "(empty)"
+                if line.is_fixed:
+                    txt = f"[{line.style}·Fixed] {raw_text}"
+                elif line.style != "A":
+                    txt = f"[{line.style}] {raw_text}"
+                else:
+                    txt = raw_text
             elided = fm.elidedText(txt, Qt.TextElideMode.ElideRight, LABEL_COL_W - 22)
             if is_selected:
                 pen_c = QColor(255, 255, 255)
+            elif line.is_spacer:
+                pen_c = QColor(105, 112, 126)
+            elif line.is_fixed:
+                pen_c = QColor(140, 200, 225)
             elif line.style != "A":
                 pen_c = style_label_color(line.style)
             else:
@@ -256,6 +268,9 @@ class _DisplayTimelineCanvas(QWidget):
             painter.setPen(pen_c)
             painter.drawText(16, y, LABEL_COL_W - 20, ROW_H - 1, Qt.AlignmentFlag.AlignVCenter, elided)
             painter.restore()
+
+            if line.is_spacer:
+                continue
 
             painter.save()
             painter.setClipRect(LABEL_COL_W + 1, y, w - LABEL_COL_W, ROW_H)
@@ -268,14 +283,23 @@ class _DisplayTimelineCanvas(QWidget):
             bar_y = y + 4
             bar_h = ROW_H - 10
 
-            if x_syl_start > x_disp_start:
-                lead_color = QColor(85, 130, 105) if (l_idx == 0 and self.project and self.project.is_optimized_lead_in_page(p_idx)) else QColor(108, 114, 126)
-                painter.fillRect(QRectF(x_disp_start, bar_y, x_syl_start - x_disp_start, bar_h), lead_color)
+            if line.is_fixed:
+                # Fixed-text lines don't wipe; render a solid calm blue-teal window bar
+                painter.fillRect(QRectF(x_disp_start, bar_y, max(2.0, x_disp_end - x_disp_start), bar_h), QColor(68, 122, 148))
+            else:
+                first_timed_idx = self.project.pages[p_idx].first_timed_line_index if self.project else 0
+                if x_syl_start > x_disp_start:
+                    lead_color = (
+                        QColor(85, 130, 105)
+                        if (l_idx == first_timed_idx and self.project and self.project.is_optimized_lead_in_page(p_idx))
+                        else QColor(108, 114, 126)
+                    )
+                    painter.fillRect(QRectF(x_disp_start, bar_y, x_syl_start - x_disp_start, bar_h), lead_color)
 
-            painter.fillRect(QRectF(x_syl_start, bar_y, max(2.0, x_syl_end - x_syl_start), bar_h), QColor(235, 132, 34))
+                painter.fillRect(QRectF(x_syl_start, bar_y, max(2.0, x_syl_end - x_syl_start), bar_h), QColor(235, 132, 34))
 
-            if x_disp_end > x_syl_end:
-                painter.fillRect(QRectF(x_syl_end, bar_y, x_disp_end - x_syl_end, bar_h), QColor(108, 114, 126))
+                if x_disp_end > x_syl_end:
+                    painter.fillRect(QRectF(x_syl_end, bar_y, x_disp_end - x_syl_end, bar_h), QColor(108, 114, 126))
 
             border_c = QColor(255, 255, 255) if is_selected else QColor(55, 60, 70)
             painter.setPen(QPen(border_c, 1))
@@ -307,6 +331,8 @@ class _DisplayTimelineCanvas(QWidget):
             if ry <= y <= ry + ROW_H:
                 if x < LABEL_COL_W:
                     return ("select", p_idx, l_idx)
+                if line.is_spacer:
+                    return ("select_scrub", p_idx, l_idx)
                 x_s = self.cs_to_x(line.display_start)
                 x_e = self.cs_to_x(line.display_end)
                 if abs(x - x_s) <= HANDLE_HIT_PX:
@@ -390,18 +416,26 @@ class _DisplayTimelineCanvas(QWidget):
             if self.page_display_mode:
                 clamped = min(cs, page.first_syl_start)
                 for ln in page.lines:
-                    ln.display_start = max(0, min(clamped, ln.first_syl_start))
-            else:
-                line.display_start = max(0, min(cs, line.first_syl_start))
+                    if ln.is_spacer:
+                        continue
+                    cap = ln.display_end if ln.is_fixed else ln.first_syl_start
+                    ln.display_start = max(0, min(clamped, cap))
+            elif not line.is_spacer:
+                cap = line.display_end if line.is_fixed else line.first_syl_start
+                line.display_start = max(0, min(cs, cap))
             self._drag_changed = True
             self.update()
         elif self._drag_mode == "end":
             if self.page_removal_mode:
                 clamped = max(cs, page.last_syl_end)
                 for ln in page.lines:
-                    ln.display_end = max(clamped, ln.last_syl_end)
-            else:
-                line.display_end = max(cs, line.last_syl_end)
+                    if ln.is_spacer:
+                        continue
+                    floor_cs = ln.display_start if ln.is_fixed else ln.last_syl_end
+                    ln.display_end = max(clamped, floor_cs)
+            elif not line.is_spacer:
+                floor_cs = line.display_start if line.is_fixed else line.last_syl_end
+                line.display_end = max(cs, floor_cs)
             self._drag_changed = True
             self.update()
 
@@ -486,6 +520,15 @@ class DisplayRemoveView(QWidget):
         btn_snap_e = QPushButton("Snap End → Playhead")
         btn_snap_e.clicked.connect(self._snap_end_to_playhead)
         bar1.addWidget(btn_snap_e)
+
+        bar1.addSpacing(12)
+        self._fixed_cb = QCheckBox("Fixed Text (No Wipe)")
+        self._fixed_cb.setToolTip(
+            "Toggle KBP Fixed Text mode (lowercase style letter) for the selected line.\n"
+            "Fixed text stays visible across the page without wiping (e.g. singer labels)."
+        )
+        self._fixed_cb.toggled.connect(self._on_fixed_toggled)
+        bar1.addWidget(self._fixed_cb)
         bar1.addStretch()
 
         bar2 = QHBoxLayout()
@@ -529,7 +572,7 @@ class DisplayRemoveView(QWidget):
         self.canvas.page_display_mode = self._page_disp_cb.isChecked()
         self.canvas.page_removal_mode = self._page_rem_cb.isChecked()
         self.canvas.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
-        self.canvas.selection_changed.connect(self.selection_changed.emit)
+        self.canvas.selection_changed.connect(self._on_canvas_selection_changed)
         self.canvas.project_mutated.connect(self.project_mutated.emit)
         self.canvas.viewport_changed.connect(self._on_canvas_viewport)
 
@@ -568,6 +611,7 @@ class DisplayRemoveView(QWidget):
                 self.canvas.set_scroll_x_cs(old_sx)
                 self._hscroll.setValue(int(old_sx))
             self._hscroll.blockSignals(False)
+        self._sync_fixed_checkbox()
 
     def set_playhead_cs(self, cs: float, follow_if_playing: bool = False) -> None:
         self.canvas.playhead_cs = cs
@@ -581,10 +625,47 @@ class DisplayRemoveView(QWidget):
     def set_selection(self, page_idx: int, line_idx: int, scroll_to: bool = False) -> None:
         self.canvas.selected_page = page_idx
         self.canvas.selected_line = line_idx
+        self._sync_fixed_checkbox()
         if scroll_to:
             self.canvas.scroll_to_row(page_idx, line_idx)
         else:
             self.canvas.update()
+
+    def _on_canvas_selection_changed(self, page_idx: int, line_idx: int) -> None:
+        self._sync_fixed_checkbox()
+        self.selection_changed.emit(page_idx, line_idx)
+
+    def _sync_fixed_checkbox(self) -> None:
+        self._fixed_cb.blockSignals(True)
+        if (
+            self.project
+            and 0 <= self.canvas.selected_page < len(self.project.pages)
+            and 0 <= self.canvas.selected_line < len(self.project.pages[self.canvas.selected_page].lines)
+        ):
+            ln = self.project.pages[self.canvas.selected_page].lines[self.canvas.selected_line]
+            self._fixed_cb.setEnabled(not ln.is_spacer)
+            self._fixed_cb.setChecked(ln.is_fixed)
+        else:
+            self._fixed_cb.setEnabled(False)
+            self._fixed_cb.setChecked(False)
+        self._fixed_cb.blockSignals(False)
+
+    def _on_fixed_toggled(self, checked: bool) -> None:
+        if (
+            not self.project
+            or not (0 <= self.canvas.selected_page < len(self.project.pages))
+            or not (0 <= self.canvas.selected_line < len(self.project.pages[self.canvas.selected_page].lines))
+        ):
+            return
+        ln = self.project.pages[self.canvas.selected_page].lines[self.canvas.selected_line]
+        if ln.is_spacer or ln.is_fixed == checked:
+            return
+        ln.set_fixed(checked)
+        self.canvas.update()
+        state = "ON" if checked else "OFF"
+        self.project_mutated.emit(
+            f"Fixed Text {state} (P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1})"
+        )
 
     def jump_to_cs(self, cs: float) -> None:
         self.canvas.center_on_cs(cs)
@@ -629,12 +710,17 @@ class DisplayRemoveView(QWidget):
         cs = int(round(self.canvas.playhead_cs))
         if self._page_disp_cb.isChecked():
             for ln in page.lines:
-                ln.display_start = max(0, min(cs, ln.first_syl_start))
+                if ln.is_spacer:
+                    continue
+                cap = ln.display_end if ln.is_fixed else ln.first_syl_start
+                ln.display_start = max(0, min(cs, cap))
             self.project_mutated.emit(f"Snap Page {self.canvas.selected_page + 1} Display Start")
         else:
             ln = page.lines[self.canvas.selected_line]
-            ln.display_start = max(0, min(cs, ln.first_syl_start))
-            self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display Start")
+            if not ln.is_spacer:
+                cap = ln.display_end if ln.is_fixed else ln.first_syl_start
+                ln.display_start = max(0, min(cs, cap))
+                self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display Start")
         self.canvas.update()
 
     def _snap_end_to_playhead(self) -> None:
@@ -644,12 +730,17 @@ class DisplayRemoveView(QWidget):
         cs = int(round(self.canvas.playhead_cs))
         if self._page_rem_cb.isChecked():
             for ln in page.lines:
-                ln.display_end = max(cs, ln.last_syl_end)
+                if ln.is_spacer:
+                    continue
+                floor_cs = ln.display_start if ln.is_fixed else ln.last_syl_end
+                ln.display_end = max(cs, floor_cs)
             self.project_mutated.emit(f"Snap Page {self.canvas.selected_page + 1} Display End")
         else:
             ln = page.lines[self.canvas.selected_line]
-            ln.display_end = max(cs, ln.last_syl_end)
-            self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display End")
+            if not ln.is_spacer:
+                floor_cs = ln.display_start if ln.is_fixed else ln.last_syl_end
+                ln.display_end = max(cs, floor_cs)
+                self.project_mutated.emit(f"Snap P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1} Display End")
         self.canvas.update()
 
     def _reset_windows(self, all_pages: bool) -> None:

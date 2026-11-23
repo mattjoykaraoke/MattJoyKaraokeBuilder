@@ -92,13 +92,13 @@ def test_reset_and_optimize_windows_rules():
     assert proj.pages[2].lines[0].display_start == 2700
 
     # Optimize windows: shrinks Page 0 (first page) and Page 2 (gap 1100 >= 300),
-    # leaves Page 1 (gap 100 < 300) at default lead-in clamped by Page 0 row clear (1650 + 1 = 1651),
+    # leaves Page 1 (gap 100 < 300) at default 300 cs lead-in (Row 0 cleared at 1350 < 1400),
     # and never shrinks mid-page ➣➣➣
     opt_indices = proj.optimize_windows(optimized_lead_in_cs=25, gap_threshold_cs=300)
     assert opt_indices == [0, 2]
     assert proj.pages[0].lines[0].display_start == 975
     assert proj.pages[0].lines[1].display_start == 975  # mid-page ➣➣➣ stays aligned with page
-    assert proj.pages[1].lines[0].display_start == 1651  # not shrunk; clamped after Page 0 Line 2 clears
+    assert proj.pages[1].lines[0].display_start == 1400  # Row 0 of Page 0 cleared at 1350, so full 300 cs lead-in
     assert proj.pages[2].lines[0].display_start == 2975  # 3000 - 25 (instrumental gap)
 
 
@@ -514,4 +514,161 @@ def test_bounded_history_manager_trims_oldest_snapshots():
     undone = hist.undo()
     assert undone is not None
     assert not hist.is_dirty
+
+
+def test_spacer_lines_do_not_poison_display_windows():
+    """Blank 0/0 spacer lines (top, middle, or bottom) stay at 0–0 and do not corrupt optimize_windows."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    p1 = Page(
+        lines=[
+            Line("C", "A", 0, 0, syllables=[Syllable("", 0, 0)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("▅▅▅▅▅▅▅", 133, 338)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("Ro", 338, 362), Syllable("bin", 363, 400)]),
+        ]
+    )
+    p2 = Page(
+        lines=[
+            Line("C", "A", 0, 0, syllables=[Syllable("", 0, 0)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("", 0, 0)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("➤", 1031, 1172), Syllable("Re", 1173, 1250)]),
+        ]
+    )
+    p3 = Page(
+        lines=[
+            Line("C", "A", 0, 0, syllables=[Syllable("", 0, 0)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("▅▅▅▅▅▅▅", 1892, 2058)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("Ne", 2058, 2100), Syllable("ver", 2101, 2150)]),
+        ]
+    )
+    proj = KbpProject(header=header, pages=[p1, p2, p3])
+
+    assert p1.lines[0].is_spacer
+    assert not p1.lines[1].is_spacer
+    assert p1.first_syl_start == 133
+    assert p2.first_syl_start == 1031
+    assert p3.first_syl_start == 1892
+    assert p1.lines[1].syllables[0].is_glyph
+    assert p2.lines[2].syllables[0].is_glyph
+    assert p1.starts_with_marker()
+    assert p2.starts_with_marker()
+    assert p3.starts_with_marker()
+
+    opt = proj.optimize_windows(optimized_lead_in_cs=25, gap_threshold_cs=300)
+    # Page 1 (first page), Page 2 (gap 1031 - 400 = 631 >= 300), Page 3 (gap 1892 - 1250 = 642 >= 300)
+    assert opt == [0, 1, 2]
+
+    # Blank spacer lines stay pinned at 0-0
+    assert (p1.lines[0].display_start, p1.lines[0].display_end) == (0, 0)
+    assert (p2.lines[0].display_start, p2.lines[0].display_end) == (0, 0)
+    assert (p2.lines[1].display_start, p2.lines[1].display_end) == (0, 0)
+    assert (p3.lines[0].display_start, p3.lines[0].display_end) == (0, 0)
+
+    # Real lines get clean optimized lead-ins (never jumping back to 51 cs!)
+    assert p1.lines[1].display_start == 108
+    assert p2.lines[2].display_start == 1006
+    assert p3.lines[1].display_start == 1867
+
+
+def test_middle_spacer_between_duet_singers():
+    """A blank spacer line in the middle between Singer A and Singer B stays at 0–0 without breaking row timing."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    p1 = Page(
+        lines=[
+            Line("C", "A", 0, 0, syllables=[Syllable("Top", 500, 700)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("", 0, 0)]),
+            Line("C", "B", 0, 0, syllables=[Syllable("Bot", 750, 950)]),
+        ]
+    )
+    proj = KbpProject(header=header, pages=[p1])
+    proj.reset_windows()
+
+    assert (p1.lines[1].display_start, p1.lines[1].display_end) == (0, 0)
+    assert p1.lines[0].display_start == 200
+    assert p1.lines[2].display_start == 200
+    assert p1.lines[2].display_end == 1000
+
+
+def test_fixed_text_lines_preserved_across_page_and_glyph_on_line_2():
+    """Lowercase style lines are fixed text: no wipe, stay visible across the page, and don't hide a Line 2 glyph."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    p1 = Page(
+        lines=[
+            Line("C", "d", 1443, 2079, syllables=[Syllable("[John Dragonetti]", 1446, 1471)]),
+            Line("C", "C", 1443, 1650, syllables=[Syllable("▅▅▅▅▅▅▅", 1446, 1546)]),
+            Line("C", "A", 1443, 2429, syllables=[Syllable("You're ", 1546, 1700), Syllable("gone", 1701, 2364)]),
+        ]
+    )
+    proj = KbpProject(header=header, pages=[p1])
+
+    assert p1.lines[0].is_fixed
+    assert not p1.lines[1].is_fixed
+    assert not p1.lines[0].syllables[0].is_glyph
+    assert p1.lines[1].syllables[0].is_glyph
+    assert p1.first_timed_line_index == 1
+    assert p1.starts_with_marker()
+
+    opt = proj.optimize_windows(optimized_lead_in_cs=25, gap_threshold_cs=300)
+    assert opt == [0]
+    # Fixed header appears with the page (1446 - 25 = 1421) and stays visible until the page finishes (2364 + 50 = 2414)
+    assert p1.lines[0].display_start == 1421
+    assert p1.lines[0].display_end == 2414
+    assert p1.lines[1].display_start == 1421
+
+    # Toggle fixed text off/on
+    p1.lines[0].set_fixed(False)
+    assert p1.lines[0].style == "D"
+    assert not p1.lines[0].is_fixed
+    p1.lines[0].set_fixed(True)
+    assert p1.lines[0].style == "d"
+    assert p1.lines[0].is_fixed
+
+
+def test_fixed_header_clears_before_next_page_preventing_overlap_and_zero_lead_in():
+    """Back-to-back pages with fixed headers must clear Page 1's header before Page 2's lead-in starts."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    p1 = Page(
+        lines=[
+            Line("C", "d", 0, 0, syllables=[Syllable("[John]", 1446, 1471)]),
+            Line("C", "C", 0, 0, syllables=[Syllable("▅▅▅▅▅▅▅", 1446, 1546)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("Line1", 1546, 1800)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("Line2", 2169, 2364)]),
+        ]
+    )
+    p2 = Page(
+        lines=[
+            Line("C", "d", 0, 0, syllables=[Syllable("[John]", 2380, 2409)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("Everyone", 2407, 2600)]),
+            Line("C", "A", 0, 0, syllables=[Syllable("Second", 2600, 2900)]),
+        ]
+    )
+    proj = KbpProject(header=header, pages=[p1, p2])
+    proj.optimize_windows(optimized_lead_in_cs=25, gap_threshold_cs=300)
+
+    # Page 1's fixed header clears at 2106 (1 cs before Page 2's 300 cs lead-in at 2107)
+    assert p1.lines[0].display_end == 2106
+    # Page 2's fixed header appears at 2107 (ZERO overlap with Page 1's header!)
+    assert p2.lines[0].display_start == 2107
+    assert p1.lines[0].display_end < p2.lines[0].display_start
+    # Page 2's first sung line gets a full 300 cs lead-in instead of popping in at 2407!
+    assert p2.lines[1].display_start == 2107
+    assert p2.lines[1].first_syl_start - p2.lines[1].display_start == 300
+
+
+def test_universal_glyph_detection_ignores_mid_line_punctuation():
+    """Only leading non-alphanumeric syllables (or KNOWN_GLYPHS) are auto-flagged as glyphs."""
+    ln = Line(
+        "C",
+        "A",
+        0,
+        0,
+        syllables=[
+            Syllable("▶", 100, 200),
+            Syllable("Hel", 201, 250),
+            Syllable("...", 251, 280),
+        ],
+    )
+    assert ln.syllables[0].is_glyph
+    assert not ln.syllables[1].is_glyph
+    assert not ln.syllables[2].is_glyph
+
 
