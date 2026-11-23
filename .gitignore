@@ -12,8 +12,10 @@ __pycache__/
 # Packaging / build artifacts
 build/
 dist/
+release/
 *.egg-info/
 *.spec
+!packaging/*.spec
 
 # Testing & linters
 .pytest_cache/

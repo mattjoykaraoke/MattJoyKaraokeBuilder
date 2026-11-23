@@ -688,11 +688,16 @@ class MainWindow(QMainWindow):
 
     def _launch_new_window(self, file_path: Optional[str | Path] = None) -> bool:
         """Spawn a separate instance of Matt Joy Karaoke Builder (optionally opening a file)."""
-        script = str(Path(sys.argv[0]).resolve())
-        args = [script]
-        if file_path is not None:
-            args.append(str(Path(file_path)))
-        ok = QProcess.startDetached(sys.executable, args, str(Path(script).parent))
+        if getattr(sys, "frozen", False):
+            args = [str(Path(file_path))] if file_path is not None else []
+            workdir = str(Path(sys.executable).resolve().parent)
+        else:
+            script = str(Path(sys.argv[0]).resolve())
+            args = [script]
+            if file_path is not None:
+                args.append(str(Path(file_path)))
+            workdir = str(Path(script).parent)
+        ok = QProcess.startDetached(sys.executable, args, workdir)
         if not ok:
             QMessageBox.warning(
                 self,

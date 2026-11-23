@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__version__ = "0.1.0-alpha"
+__version__ = "1.0.0"
 APP_NAME = "Matt Joy Karaoke Builder"
 APP_AUTHOR = "Matt Joy"
 APP_EMAIL = "mattjoykaraoke@gmail.com"

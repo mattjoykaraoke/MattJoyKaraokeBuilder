@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -12,6 +13,8 @@ from ..audio import WaveformData
 
 
 def repo_root() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
     return Path(__file__).resolve().parent.parent.parent
 
 
