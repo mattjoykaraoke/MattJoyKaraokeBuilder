@@ -419,6 +419,7 @@ class TapSyncDraft:
             audio_path=resolved_audio,
             vocal_path=vocal_path,
             raw_header_lines=list(proj.header.raw_lines),
+            duet_mode=bool(proj.duet_mode),
         )
 
     @classmethod
@@ -693,8 +694,11 @@ class TapSyncDraft:
             if built_lines:
                 built_pages.append(Page(lines=built_lines))
 
-        proj = KbpProject(header=header, pages=built_pages)
-        proj.optimize_windows()
+        proj = KbpProject(header=header, pages=built_pages, duet_mode=bool(self.duet_mode))
+        if self.duet_mode:
+            proj.apply_duet_layout(split_overflow_pages=True)
+        else:
+            proj.optimize_windows()
         return proj
 
 

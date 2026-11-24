@@ -248,10 +248,13 @@ class _DisplayTimelineCanvas(QWidget):
                 txt = "(blank spacer)"
             else:
                 raw_text = line.full_text.strip() or "(empty)"
+                zone_arrow = ""
+                if self.project and self.project.duet_mode:
+                    zone_arrow = "↓" if self.project.line_duet_zone(l_idx, line) == "bottom" else "↑"
                 if line.is_fixed:
-                    txt = f"[{line.style}·Fixed] {raw_text}"
-                elif line.style != "A":
-                    txt = f"[{line.style}] {raw_text}"
+                    txt = f"[{line.style}{zone_arrow}·Fixed] {raw_text}"
+                elif line.style != "A" or zone_arrow:
+                    txt = f"[{line.style}{zone_arrow}] {raw_text}"
                 else:
                     txt = raw_text
             elided = fm.elidedText(txt, Qt.TextElideMode.ElideRight, LABEL_COL_W - 22)
@@ -530,6 +533,26 @@ class DisplayRemoveView(QWidget):
         )
         self._fixed_cb.toggled.connect(self._on_fixed_toggled)
         bar1.addWidget(self._fixed_cb)
+
+        bar1.addSpacing(12)
+        self._duet_mode_cb = QCheckBox("🎭 Duet Zones")
+        self._duet_mode_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._duet_mode_cb.setToolTip(
+            "Enable Split-Screen Duet Layout & Call-and-Response Windows:\n"
+            "• Reserves Top Half (Rows 1–3) for [A] Singer 1 and Bottom Half (Rows 4–6) for [B] Singer 2\n"
+            "• Places [C] Together in whichever zone is free (or full page when alone)\n"
+            "• Auto-splits overloaded >3-line blocks and syncs Call & Response lead-ins together."
+        )
+        self._duet_mode_cb.toggled.connect(self._on_duet_mode_toggled)
+        bar1.addWidget(self._duet_mode_cb)
+
+        self._btn_duet_resplit = QPushButton("Re-Split && Align Zones")
+        self._btn_duet_resplit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_duet_resplit.setToolTip("Split any >3-line singer blocks across pages and re-apply Top/Bottom Duet zones")
+        self._btn_duet_resplit.setStyleSheet("background-color: #5b21b6; color: #ffffff; font-weight: bold; padding: 2px 8px;")
+        self._btn_duet_resplit.clicked.connect(self._reapply_duet_zones)
+        self._btn_duet_resplit.setVisible(False)
+        bar1.addWidget(self._btn_duet_resplit)
         bar1.addStretch()
 
         bar2 = QHBoxLayout()
@@ -613,6 +636,7 @@ class DisplayRemoveView(QWidget):
                 self._hscroll.setValue(int(old_sx))
             self._hscroll.blockSignals(False)
         self._sync_fixed_checkbox()
+        self._sync_duet_controls()
 
     def set_playhead_cs(self, cs: float, follow_if_playing: bool = False) -> None:
         self.canvas.playhead_cs = cs
@@ -627,6 +651,7 @@ class DisplayRemoveView(QWidget):
         self.canvas.selected_page = page_idx
         self.canvas.selected_line = line_idx
         self._sync_fixed_checkbox()
+        self._sync_duet_controls()
         if scroll_to:
             self.canvas.scroll_to_row(page_idx, line_idx)
         else:
@@ -634,6 +659,7 @@ class DisplayRemoveView(QWidget):
 
     def _on_canvas_selection_changed(self, page_idx: int, line_idx: int) -> None:
         self._sync_fixed_checkbox()
+        self._sync_duet_controls()
         self.selection_changed.emit(page_idx, line_idx)
 
     def _sync_fixed_checkbox(self) -> None:
@@ -667,6 +693,33 @@ class DisplayRemoveView(QWidget):
         self.project_mutated.emit(
             f"Fixed Text {state} (P{self.canvas.selected_page + 1} L{self.canvas.selected_line + 1})"
         )
+
+    def _sync_duet_controls(self) -> None:
+        is_duet = bool(self.project and self.project.duet_mode)
+        self._duet_mode_cb.blockSignals(True)
+        self._duet_mode_cb.setEnabled(self.project is not None)
+        self._duet_mode_cb.setChecked(is_duet)
+        self._duet_mode_cb.blockSignals(False)
+        self._btn_duet_resplit.setVisible(is_duet)
+
+    def _on_duet_mode_toggled(self, checked: bool) -> None:
+        if not self.project or not self.project.pages:
+            return
+        if checked:
+            self.project.apply_duet_layout(split_overflow_pages=True)
+            self.set_project(self.project, preserve_view=True)
+            self.project_mutated.emit("Enable Duet Split-Zone Layout")
+        else:
+            self.project.clear_duet_layout()
+            self.set_project(self.project, preserve_view=True)
+            self.project_mutated.emit("Disable Duet Split-Zone Layout")
+
+    def _reapply_duet_zones(self) -> None:
+        if not self.project or not self.project.pages:
+            return
+        self.project.apply_duet_layout(split_overflow_pages=True)
+        self.set_project(self.project, preserve_view=True)
+        self.project_mutated.emit("Re-Split & Align Duet Zones")
 
     def jump_to_cs(self, cs: float) -> None:
         self.canvas.center_on_cs(cs)

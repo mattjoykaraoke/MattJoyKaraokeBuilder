@@ -458,6 +458,12 @@ class Line:
                 return 0
         return 0
 
+    def set_offset_y(self, val: int) -> None:
+        """Set KBP vertical pixel offset (`down`, extra_fields[1]) in CD+G units."""
+        while len(self.extra_fields) < 3:
+            self.extra_fields.append("0")
+        self.extra_fields[1] = str(int(val))
+
     def refresh_leading_glyph(self) -> None:
         """Mark a leading non-alphanumeric syllable on a timed line as a lead-in glyph."""
         if self.is_spacer or self.is_fixed or not self.syllables:
@@ -862,6 +868,7 @@ class KbpProject:
     pages: List[Page]
     source_path: Optional[Path] = None
     trailing_blank_lines: int = 0
+    duet_mode: bool = False
     load_issues: List[KbpIssue] = field(default_factory=list)
 
     @property
@@ -964,11 +971,23 @@ class KbpProject:
             else:
                 break
 
+        st_a = header.styles.get("A")
+        st_b = header.styles.get("B")
+        detected_duet = bool(
+            (st_a and st_b and st_a.name == "Singer 1" and st_b.name == "Singer 2")
+            or any(
+                (ln.style or "").upper() == "B" and ln.offset_y >= 19
+                for pg in pages
+                for ln in pg.lines
+            )
+        )
+
         proj = cls(
             header=header,
             pages=pages,
             source_path=p,
             trailing_blank_lines=trailing_blanks,
+            duet_mode=detected_duet,
             load_issues=issues,
         )
         if auto_repair:
@@ -1489,6 +1508,224 @@ class KbpProject:
         del self.pages[page_idx]
         return True
 
+    def _row_pitch(self) -> int:
+        line_h = 19
+        spacing = self.header.margins[3] if len(self.header.margins) >= 4 else 12
+        return max(line_h, spacing + line_h)
+
+    def line_visual_y(self, line_idx: int, line: Line) -> int:
+        return line_idx * self._row_pitch() + line.offset_y
+
+    def line_duet_zone(self, line_idx: int, line: Line) -> str:
+        """Return 'bottom' if `line` renders in the Bottom Half (Rows 4–6), else 'top'."""
+        return "bottom" if self.line_visual_y(line_idx, line) >= 3 * self._row_pitch() else "top"
+
+    @staticmethod
+    def _line_duet_group(line: Line) -> str:
+        st = (line.style or "A").upper()
+        if st in ("A", "D"):
+            return "A"
+        if st in ("B", "E"):
+            return "B"
+        return "C"
+
+    def _duet_page_fits(self, page: Page) -> bool:
+        non_spacers = page.non_spacer_lines
+        if len(non_spacers) > 6:
+            return False
+        n_a = sum(1 for ln in non_spacers if self._line_duet_group(ln) == "A")
+        n_b = sum(1 for ln in non_spacers if self._line_duet_group(ln) == "B")
+        if n_a == 0 and n_b == 0:
+            return True
+        return n_a <= 3 and n_b <= 3 and len(non_spacers) <= 6
+
+    @staticmethod
+    def _chunk_time_span(lines: Sequence[Line]) -> Tuple[int, int]:
+        timed = [ln for ln in lines if not ln.is_spacer and ln.syllables]
+        if not timed:
+            return (0, 0)
+        return (min(ln.first_syl_start for ln in timed), max(ln.last_syl_end for ln in timed))
+
+    @classmethod
+    def _pick_best_bucket(
+        cls,
+        avail: List[Dict[str, List[Line]]],
+        anchor_keys: Tuple[str, ...],
+        target_span: Tuple[int, int],
+    ) -> Dict[str, List[Line]]:
+        """
+        Pair `target_span` with the earliest bucket during which `target_span` begins singing
+        (so a response starting at 13.0s lands on the 10.0s–15.8s page, while one starting at
+        17.0s lands on the 16.0s–21.8s page).
+        """
+        t_start, _ = target_span
+        containing = []
+        for bk in avail:
+            lines: List[Line] = []
+            for k in anchor_keys:
+                lines.extend(bk[k])
+            b_start, b_end = cls._chunk_time_span(lines)
+            if t_start <= b_end:
+                containing.append((b_start, bk))
+        if containing:
+            containing.sort(key=lambda item: item[0])
+            return containing[0][1]
+        return min(
+            avail,
+            key=lambda bk: abs(
+                cls._chunk_time_span([ln for k in anchor_keys for ln in bk[k]])[0] - t_start
+            ),
+        )
+
+    def _split_duet_page(self, page: Page) -> List[Page]:
+        non_spacers = page.non_spacer_lines
+        if not non_spacers:
+            return [page]
+        a_lines = [ln for ln in non_spacers if self._line_duet_group(ln) == "A"]
+        b_lines = [ln for ln in non_spacers if self._line_duet_group(ln) == "B"]
+        c_lines = [ln for ln in non_spacers if self._line_duet_group(ln) == "C"]
+
+        if not a_lines and not b_lines:
+            return [Page(lines=non_spacers[i : i + 6]) for i in range(0, len(non_spacers), 6)]
+
+        a_chunks = [a_lines[i : i + 3] for i in range(0, len(a_lines), 3)]
+        b_chunks = [b_lines[i : i + 3] for i in range(0, len(b_lines), 3)]
+        c_chunks = [c_lines[i : i + 3] for i in range(0, len(c_lines), 3)]
+
+        buckets: List[Dict[str, List[Line]]] = []
+        if len(a_chunks) >= len(b_chunks) and a_chunks:
+            buckets = [{"A": list(ch), "B": [], "C": []} for ch in a_chunks]
+            for b_ch in b_chunks:
+                b_span = self._chunk_time_span(b_ch)
+                avail = [bk for bk in buckets if not bk["B"]]
+                target = self._pick_best_bucket(avail, ("A",), b_span)
+                target["B"] = list(b_ch)
+        elif b_chunks:
+            buckets = [{"A": [], "B": list(ch), "C": []} for ch in b_chunks]
+            for a_ch in a_chunks:
+                a_span = self._chunk_time_span(a_ch)
+                avail = [bk for bk in buckets if not bk["A"]]
+                target = self._pick_best_bucket(avail, ("B",), a_span)
+                target["A"] = list(a_ch)
+
+        for c_ch in c_chunks:
+            c_span = self._chunk_time_span(c_ch)
+            avail_c = [
+                bk
+                for bk in buckets
+                if not bk["C"]
+                and (len(bk["A"]) + len(bk["B"]) + len(c_ch) <= 6)
+                and (len(bk["A"]) + len(c_ch) <= 3 or len(bk["B"]) + len(c_ch) <= 3)
+            ]
+            if avail_c:
+                target = self._pick_best_bucket(avail_c, ("A", "B"), c_span)
+                target["C"] = list(c_ch)
+            else:
+                buckets.append({"A": [], "B": [], "C": list(c_ch)})
+
+        buckets.sort(key=lambda bk: self._chunk_time_span(bk["A"] + bk["B"] + bk["C"])[0])
+        orig_pos = {id(ln): idx for idx, ln in enumerate(non_spacers)}
+        out_pages: List[Page] = []
+        for bk in buckets:
+            combined = bk["A"] + bk["B"] + bk["C"]
+            combined.sort(key=lambda ln: orig_pos.get(id(ln), 0))
+            if combined:
+                out_pages.append(Page(lines=combined))
+        return out_pages or [page]
+
+    def apply_duet_zone_offsets(self) -> None:
+        """
+        Assign native KBP `down` (`offset_y`) positions on every page for Split-Screen Duet Mode:
+        - Top Zone (Rows 1–3, slots 0..2): reserved for [A] Singer 1
+        - Bottom Zone (Rows 4–6, slots 3..5): reserved for [B] Singer 2
+        - [C] Together: uses full screen (slots 0..5) when alone, or fills whichever zone is free!
+        """
+        pitch = self._row_pitch()
+        for page in self.pages:
+            a_idx: List[int] = []
+            b_idx: List[int] = []
+            c_idx: List[int] = []
+            for i, ln in enumerate(page.lines):
+                if ln.is_spacer:
+                    ln.set_offset_y(0)
+                    continue
+                grp = self._line_duet_group(ln)
+                if grp == "A":
+                    a_idx.append(i)
+                elif grp == "B":
+                    b_idx.append(i)
+                else:
+                    c_idx.append(i)
+
+            slot_for: Dict[int, int] = {}
+            if not a_idx and not b_idx:
+                for k, i in enumerate(c_idx):
+                    slot_for[i] = k
+            elif not c_idx:
+                for k, i in enumerate(a_idx):
+                    slot_for[i] = k
+                for k, i in enumerate(b_idx):
+                    slot_for[i] = 3 + k
+            elif a_idx and not b_idx:
+                for k, i in enumerate(a_idx):
+                    slot_for[i] = k
+                c_start = 3 if len(c_idx) <= 3 else max(len(a_idx), 6 - len(c_idx))
+                for k, i in enumerate(c_idx):
+                    slot_for[i] = c_start + k
+            elif b_idx and not a_idx:
+                for k, i in enumerate(c_idx):
+                    slot_for[i] = k
+                b_start = max(3, len(c_idx))
+                for k, i in enumerate(b_idx):
+                    slot_for[i] = b_start + k
+            else:
+                # A, B, and C all present on the same page
+                for k, i in enumerate(a_idx):
+                    slot_for[i] = k
+                top_free = max(0, 3 - len(a_idx))
+                if c_idx[0] < b_idx[0] and top_free > 0:
+                    c_top = c_idx[:top_free]
+                    c_bot = c_idx[top_free:]
+                else:
+                    bot_free = max(0, 3 - len(b_idx))
+                    c_bot = c_idx[:bot_free]
+                    c_top = c_idx[bot_free:]
+                for k, i in enumerate(c_top):
+                    slot_for[i] = len(a_idx) + k
+                bot_combined = sorted(b_idx + c_bot)
+                for k, i in enumerate(bot_combined):
+                    slot_for[i] = 3 + k
+
+            for i, slot in slot_for.items():
+                page.lines[i].set_offset_y((slot - i) * pitch)
+
+    def apply_duet_layout(self, split_overflow_pages: bool = True) -> None:
+        """
+        Enable Duet Mode layout:
+        1) Splits any overflowing page (>3 [A] or >3 [B] or >6 total lines) into balanced subpages.
+        2) Assigns Top ([A]) / Bottom ([B]) / free-zone ([C]) vertical `offset_y` coordinates.
+        3) Runs Duet-aware Call-and-Response window optimization.
+        """
+        self.duet_mode = True
+        if split_overflow_pages:
+            new_pages: List[Page] = []
+            for pg in self.pages:
+                if self._duet_page_fits(pg):
+                    new_pages.append(pg)
+                else:
+                    new_pages.extend(self._split_duet_page(pg))
+            self.pages = new_pages
+        self.apply_duet_zone_offsets()
+        self.optimize_windows()
+
+    def clear_duet_layout(self) -> None:
+        """Disable Duet Mode layout, reset all line `offset_y` values to 0, and re-optimize windows."""
+        self.duet_mode = False
+        for pg in self.pages:
+            for ln in pg.lines:
+                ln.set_offset_y(0)
+        self.optimize_windows()
+
     def _row_clear_constraint(self, prev_page: Page, cur_page: Page, cur_row_idx: int) -> int:
         """
         Compute the earliest centisecond cur_row_idx on cur_page can appear without
@@ -1497,8 +1734,7 @@ class KbpProject:
         if not prev_page.lines or not (0 <= cur_row_idx < len(cur_page.lines)):
             return 0
         line_h = 19
-        spacing = self.header.margins[3] if len(self.header.margins) >= 4 else 12
-        pitch = max(line_h, spacing + line_h)
+        pitch = self._row_pitch()
         cur_y = cur_row_idx * pitch + cur_page.lines[cur_row_idx].offset_y
 
         earliest = 0
@@ -1509,6 +1745,42 @@ class KbpProject:
             if abs(p_y - cur_y) < line_h:
                 earliest = max(earliest, p_line.display_end + 1)
         return earliest
+
+    def _prior_pages_row_clear_constraint(self, page_idx: int, cur_row_idx: int) -> int:
+        """Check row-clear constraint across prev_page (solo) or all earlier pages (duet overlapping zones)."""
+        cur_page = self.pages[page_idx]
+        if page_idx <= 0:
+            return 0
+        if not self.duet_mode:
+            return self._row_clear_constraint(self.pages[page_idx - 1], cur_page, cur_row_idx)
+        earliest = 0
+        for prev_i in range(page_idx):
+            earliest = max(earliest, self._row_clear_constraint(self.pages[prev_i], cur_page, cur_row_idx))
+        return earliest
+
+    def _next_overlapping_page_ideal_start(
+        self,
+        page_idx: int,
+        row_idx: int,
+        lead_in_cs: int,
+        lead_in_by_page: Optional[Dict[int, int]] = None,
+    ) -> Optional[int]:
+        """Find the ideal_start of the next page that visually overlaps `row_idx` on `page_idx`."""
+        line_h = 19
+        pitch = self._row_pitch()
+        cur_y = row_idx * pitch + self.pages[page_idx].lines[row_idx].offset_y
+        for nxt_i in range(page_idx + 1, len(self.pages)):
+            nxt_pg = self.pages[nxt_i]
+            if not nxt_pg.timed_lines:
+                continue
+            overlaps = any(
+                not ln.is_spacer and abs((li * pitch + ln.offset_y) - cur_y) < line_h
+                for li, ln in enumerate(nxt_pg.lines)
+            )
+            if overlaps or not self.duet_mode:
+                nxt_lead = lead_in_by_page.get(nxt_i, lead_in_cs) if lead_in_by_page else lead_in_cs
+                return max(0, nxt_pg.first_syl_start - nxt_lead)
+        return None
 
     @staticmethod
     def _fixed_line_start_cap(page: Page, l_idx: int) -> int:
@@ -1525,6 +1797,7 @@ class KbpProject:
         page_indices: Optional[Sequence[int]] = None,
         lead_in_cs: int = DEFAULT_LEAD_IN_CS,
         clear_hold_cs: int = DEFAULT_CLEAR_HOLD_CS,
+        lead_in_by_page: Optional[Dict[int, int]] = None,
     ) -> None:
         """
         Reset Display/Remove windows to standard KBS defaults:
@@ -1532,6 +1805,8 @@ class KbpProject:
         - Fixed-text lines (lowercase style) stay visible until the page finishes.
         - Timed lines get display_end = line.last_syl_end + clear_hold_cs (default +50 cs)
           and display_start = max(page.first_syl_start - lead_in_cs, prev_overlapping_row_end + 1, prev_line_start).
+        - In Duet Mode, tracks Top and Bottom zones independently and pulls Call-and-Response lines into
+          unused screen halves so both singers see the exchange appear together.
         """
         target_set = set(range(len(self.pages))) if page_indices is None else set(page_indices)
 
@@ -1540,18 +1815,18 @@ class KbpProject:
             if 0 <= p_idx < len(self.pages):
                 page = self.pages[p_idx]
                 page_end_cs = (page.last_syl_end + clear_hold_cs) if page.timed_lines else None
-                next_ideal_start: Optional[int] = None
-                if p_idx + 1 < len(self.pages) and self.pages[p_idx + 1].timed_lines:
-                    next_ideal_start = max(0, self.pages[p_idx + 1].first_syl_start - lead_in_cs)
-                for line in page.lines:
+                for l_idx, line in enumerate(page.lines):
                     if line.is_spacer:
                         line.display_start = 0
                         line.display_end = 0
                     elif line.is_fixed:
                         if page_end_cs is not None:
                             end_cs = page_end_cs
-                            # Clear fixed headers right before the next page wants to appear
+                            # Clear fixed headers right before the next overlapping page wants to appear
                             # so they never overlap the next page or choke its lead-in time.
+                            next_ideal_start = self._next_overlapping_page_ideal_start(
+                                p_idx, l_idx, lead_in_cs, lead_in_by_page=lead_in_by_page
+                            )
                             if next_ideal_start is not None and next_ideal_start - 1 > page.first_syl_start:
                                 end_cs = min(end_cs, next_ideal_start - 1)
                             line.display_end = end_cs
@@ -1560,28 +1835,54 @@ class KbpProject:
                     else:
                         line.display_end = line.last_syl_end + clear_hold_cs
 
-        # Second pass: compute display_start respecting previous page row clears
+        # Second pass: compute display_start respecting previous page row clears (and Duet call-and-response)
         for p_idx in sorted(target_set):
             if not (0 <= p_idx < len(self.pages)):
                 continue
             page = self.pages[p_idx]
             prev_page = self.pages[p_idx - 1] if p_idx > 0 else None
-            ideal_start = max(0, page.first_syl_start - lead_in_cs)
+            p_lead = lead_in_by_page.get(p_idx, lead_in_cs) if lead_in_by_page else lead_in_cs
+            ideal_start = max(0, page.first_syl_start - p_lead)
+
+            prev_zones = (
+                {self.line_duet_zone(i, ln) for i, ln in enumerate(prev_page.lines) if not ln.is_spacer}
+                if (self.duet_mode and prev_page is not None)
+                else set()
+            )
+            allow_call_response_pull = bool(
+                self.duet_mode
+                and prev_page is not None
+                and prev_page.timed_lines
+                and page.timed_lines
+                and page.first_syl_start <= prev_page.last_syl_end + 250
+            )
+
             prev_line_start = 0
+            prev_zone_start: Dict[str, int] = {"top": 0, "bottom": 0}
             for l_idx, line in enumerate(page.lines):
                 if line.is_spacer:
                     line.display_start = 0
                     line.display_end = 0
                     continue
-                row_clear = self._row_clear_constraint(prev_page, page, l_idx) if prev_page else 0
-                start = max(ideal_start, row_clear, prev_line_start)
+                row_clear = self._prior_pages_row_clear_constraint(p_idx, l_idx)
+                if self.duet_mode:
+                    z = self.line_duet_zone(l_idx, line)
+                    line_ideal = ideal_start
+                    if allow_call_response_pull and z not in prev_zones and prev_page is not None:
+                        line_ideal = min(line_ideal, prev_page.display_start)
+                    start = max(line_ideal, row_clear, prev_zone_start[z])
+                else:
+                    start = max(ideal_start, row_clear, prev_line_start)
                 # Never appear after the line's own first syllable (or the next timed line for fixed labels)
                 cap = self._fixed_line_start_cap(page, l_idx) if line.is_fixed else line.first_syl_start
                 start = min(start, cap)
                 line.display_start = max(0, start)
                 if line.display_end < line.display_start:
                     line.display_end = line.display_start
-                prev_line_start = line.display_start
+                if self.duet_mode:
+                    prev_zone_start[self.line_duet_zone(l_idx, line)] = line.display_start
+                else:
+                    prev_line_start = line.display_start
 
     def is_optimized_lead_in_page(
         self,
@@ -1591,7 +1892,7 @@ class KbpProject:
     ) -> bool:
         """
         True when page_idx starts with a lead-in glyph (e.g. ➣➣➣, ••, ▅▅▅▅▅▅▅, ➤) on its first timed line
-        AND follows an instrumental gap (first page, or gap >= gap_threshold_cs).
+        AND follows a full-song instrumental gap (first page, or silence >= gap_threshold_cs since all prior pages).
         Mid-page markers never trigger this.
         """
         if not (0 <= page_idx < len(self.pages)):
@@ -1601,8 +1902,10 @@ class KbpProject:
             return False
         if page_idx == 0:
             return True
-        prev_page = self.pages[page_idx - 1]
-        gap = page.first_syl_start - prev_page.last_syl_end
+        prev_ends = [p.last_syl_end for p in self.pages[:page_idx] if p.timed_lines]
+        if not prev_ends:
+            return True
+        gap = page.first_syl_start - max(prev_ends)
         return gap >= gap_threshold_cs
 
     def optimize_windows(
@@ -1617,40 +1920,48 @@ class KbpProject:
     ) -> List[int]:
         """
         Apply 'Optimized Windows':
-        - Optionally resets targeted pages to standard defaults first.
-        - On pages where the first timed line starts with a lead-in glyph AND there is an instrumental
-          gap before the page (>= gap_threshold_cs, or Page 1), shrinks the page's
+        - Optionally resets targeted pages to standard defaults (including Duet Call-and-Response rules) first.
+        - On pages where the first timed line starts with a lead-in glyph AND there is a full
+          instrumental gap before the page (>= gap_threshold_cs, or Page 1), shrinks the page's
           display_start to `page.first_syl_start - optimized_lead_in_cs` (~25 cs).
         Returns the 0-based indices of pages that received the shrunk lead-in window.
         """
         target_list = list(range(len(self.pages))) if page_indices is None else sorted(set(page_indices))
+        optimized_pages = [
+            p_idx
+            for p_idx in target_list
+            if self.is_optimized_lead_in_page(p_idx, marker=marker, gap_threshold_cs=gap_threshold_cs)
+        ]
+        lead_map = {p_idx: optimized_lead_in_cs for p_idx in optimized_pages}
 
         if reset_non_marker_pages:
             self.reset_windows(
                 page_indices=target_list,
                 lead_in_cs=default_lead_in_cs,
                 clear_hold_cs=clear_hold_cs,
+                lead_in_by_page=lead_map,
             )
+            return optimized_pages
 
-        optimized_pages: List[int] = []
-        for p_idx in target_list:
-            if not self.is_optimized_lead_in_page(p_idx, marker=marker, gap_threshold_cs=gap_threshold_cs):
-                continue
+        for p_idx in optimized_pages:
             page = self.pages[p_idx]
-            prev_page = self.pages[p_idx - 1] if p_idx > 0 else None
             ideal_start = max(0, page.first_syl_start - optimized_lead_in_cs)
             prev_line_start = 0
+            prev_zone_start: Dict[str, int] = {"top": 0, "bottom": 0}
             for l_idx, line in enumerate(page.lines):
                 if line.is_spacer:
                     line.display_start = 0
                     line.display_end = 0
                     continue
-                row_clear = self._row_clear_constraint(prev_page, page, l_idx) if prev_page else 0
-                start = max(ideal_start, row_clear, prev_line_start)
+                row_clear = self._prior_pages_row_clear_constraint(p_idx, l_idx)
+                z_prev = prev_zone_start[self.line_duet_zone(l_idx, line)] if self.duet_mode else prev_line_start
+                start = max(ideal_start, row_clear, z_prev)
                 cap = self._fixed_line_start_cap(page, l_idx) if line.is_fixed else line.first_syl_start
                 start = min(start, cap)
                 line.display_start = max(0, start)
-                prev_line_start = line.display_start
-            optimized_pages.append(p_idx)
+                if self.duet_mode:
+                    prev_zone_start[self.line_duet_zone(l_idx, line)] = line.display_start
+                else:
+                    prev_line_start = line.display_start
 
         return optimized_pages

@@ -1092,11 +1092,18 @@ class MainWindow(QMainWindow):
     def _on_project_mutated(self, label: str) -> None:
         if self.project is None:
             return
+        if self.project.duet_mode and not label.startswith("Reset ") and not label.startswith("Disable Duet"):
+            self.project.apply_duet_zone_offsets()
         if self.wiping_view.auto_reset_display_enabled and not label.startswith("Reset ") and not label.startswith("Apply Optimized"):
             self.project.optimize_windows()
         self.history.push(label, self.project)
         self.wiping_view.canvas.invalidate_layout_cache()
-        if len(self._page_buttons) != len(self.project.pages):
+        if any(k in label for k in ("Duet", "Style", "Fixed", "Add ", "Delete ", "Split", "Join", "Duplicate")):
+            self.preview_win.canvas.invalidate_cache()
+            self.wiping_view.set_project(self.project, preserve_view=True)
+            self._rebuild_page_buttons()
+            self._highlight_page_button(min(self.display_view.canvas.selected_page, max(0, len(self.project.pages) - 1)))
+        elif len(self._page_buttons) != len(self.project.pages):
             self._rebuild_page_buttons()
             self._highlight_page_button(min(self.display_view.canvas.selected_page, max(0, len(self.project.pages) - 1)))
             self.wiping_view.set_project(self.project, preserve_view=True)
@@ -1105,6 +1112,7 @@ class MainWindow(QMainWindow):
             self.display_view.set_project(self.project, preserve_view=True)
         else:
             self.display_view._sync_fixed_checkbox()
+            self.display_view._sync_duet_controls()
             self.display_view.canvas.update()
         self.wiping_view._sync_style_combo()
         self.finishing_view.set_project(self.project)

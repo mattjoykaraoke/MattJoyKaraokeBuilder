@@ -694,4 +694,111 @@ def test_add_blank_line_creates_valid_spacer_at_top_or_middle():
     assert proj.pages[0].lines[1].display_start == 975
 
 
+def test_duet_zone_layout_anchors_singer2_bottom_and_places_c_in_free_zone(tmp_path):
+    header = KbpHeader.parse([
+        "HEADERV2",
+        "'Margins : L,R,T,Line Spacing",
+        "  2,2,7,12",
+        "Status    1",
+    ])
+    pitch = 31  # 12 + 19
+
+    # Page 1: [B] solo -> must STILL anchor at Row 4 (slot 3 = 3 * pitch), never Row 1!
+    p1 = Page(lines=[
+        Line("C", "B", 0, 0, syllables=[Syllable("Solo B1", 200, 350)]),
+        Line("C", "B", 0, 0, syllables=[Syllable("Solo B2", 351, 500)]),
+    ])
+    # Page 2: [A] + [C] -> [A] in Top (slot 0), [C] in free Bottom Zone (slot 3)
+    p2 = Page(lines=[
+        Line("C", "A", 0, 0, syllables=[Syllable("A1", 900, 1050)]),
+        Line("C", "C", 0, 0, syllables=[Syllable("Together", 1051, 1200)]),
+    ])
+    # Page 3: [B] + [C] -> [C] in free Top Zone (slot 0), [B] in Bottom Zone (slot 3)
+    p3 = Page(lines=[
+        Line("C", "B", 0, 0, syllables=[Syllable("B1", 1600, 1750)]),
+        Line("C", "C", 0, 0, syllables=[Syllable("TogetherTop", 1600, 1750)]),
+    ])
+    # Page 4: Pure [C] chorus -> full screen starting at Row 1 (slots 0, 1)
+    p4 = Page(lines=[
+        Line("C", "C", 0, 0, syllables=[Syllable("Chorus1", 2200, 2350)]),
+        Line("C", "C", 0, 0, syllables=[Syllable("Chorus2", 2351, 2500)]),
+    ])
+
+    proj = KbpProject(header=header, pages=[p1, p2, p3, p4])
+    proj.apply_duet_layout(split_overflow_pages=True)
+
+    assert proj.line_visual_y(0, proj.pages[0].lines[0]) == 3 * pitch
+    assert proj.line_visual_y(1, proj.pages[0].lines[1]) == 4 * pitch
+
+    assert proj.line_visual_y(0, proj.pages[1].lines[0]) == 0 * pitch
+    assert proj.line_visual_y(1, proj.pages[1].lines[1]) == 3 * pitch
+
+    assert proj.line_visual_y(0, proj.pages[2].lines[0]) == 3 * pitch
+    assert proj.line_visual_y(1, proj.pages[2].lines[1]) == 0 * pitch
+
+    assert proj.line_visual_y(0, proj.pages[3].lines[0]) == 0 * pitch
+    assert proj.line_visual_y(1, proj.pages[3].lines[1]) == 1 * pitch
+
+    # Roundtrip save/load auto-detects duet_mode from [B]'s Bottom-zone offset_y
+    out = tmp_path / "duet_zones.kbp"
+    proj.save(out)
+    reloaded = KbpProject.load(out)
+    assert reloaded.duet_mode is True
+    assert reloaded.line_visual_y(0, reloaded.pages[0].lines[0]) == 3 * pitch
+
+
+def test_duet_splits_6_singer1_lines_plus_overlapping_singer2_without_collision():
+    """When Singer 1 sings 6 lines and Singer 2 sings 1 overlapping line, splits into 3+3 Top while Bottom sustains."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    a_lines = [
+        Line("C", "A", 0, 0, syllables=[Syllable(f"A{i+1}", 1000 + i * 200, 1180 + i * 200)])
+        for i in range(6)  # 1000..2180
+    ]
+    # Singer 2 sings 1 long overlapping line across the middle (1300..1900), spanning both 3-line [A] groups!
+    b_line = Line("C", "B", 0, 0, syllables=[Syllable("HoldB", 1300, 1900)])
+    proj = KbpProject(header=header, pages=[Page(lines=[*a_lines, b_line])])
+
+    proj.apply_duet_layout(split_overflow_pages=True)
+    assert len(proj.pages) == 2
+
+    # Page 1 gets A1..A3 (Top) + HoldB (Bottom Row 4); Page 2 gets A4..A6 (Top)
+    assert [ln.full_text for ln in proj.pages[0].lines] == ["A1", "A2", "A3", "HoldB"]
+    assert [ln.full_text for ln in proj.pages[1].lines] == ["A4", "A5", "A6"]
+    assert proj.line_duet_zone(3, proj.pages[0].lines[3]) == "bottom"
+
+    # HoldB stays on Row 4 until 1950 while Page 2's A4..A6 roll into Rows 1..3 — zero vertical overlap!
+    pitch = proj.header.margins[3] + 19
+    for t in range(600, 2300, 10):
+        ys = [
+            ri * pitch + ln.offset_y
+            for pg in proj.pages
+            for ri, ln in enumerate(pg.lines)
+            if ln.display_start <= t <= ln.display_end
+        ]
+        ys.sort()
+        for y1, y2 in zip(ys, ys[1:]):
+            assert y2 - y1 >= 19
+
+
+def test_duet_call_and_response_pulls_response_start_to_match_call_instead_of_mid_line_pop_in():
+    """If [A] sings on Page 1 (Top only) and [B] responds on Page 2 (Bottom), [B] appears WITH [A] at Page 1's start."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    p1 = Page(lines=[
+        Line("C", "A", 0, 0, syllables=[Syllable("➣➣➣", 865, 1000), Syllable("Call1", 1001, 1300)]),
+        Line("C", "A", 0, 0, syllables=[Syllable("Call2", 1301, 1600)]),
+    ])
+    p2 = Page(lines=[
+        Line("C", "B", 0, 0, syllables=[Syllable("••", 1380, 1448), Syllable("Resp1", 1449, 1800)]),
+    ])
+    proj = KbpProject(header=header, pages=[p1, p2])
+    proj.apply_duet_layout(split_overflow_pages=True)
+
+    # Page 1 starts at 865 - 25 = 840 cs.
+    # Because Page 1's Bottom Zone is empty and [B] responds during Call2, [B] is pulled back to 840 cs
+    # (appearing right alongside [A], NOT popping in mid-line at 1080 cs or shrinking to 1355 cs!).
+    assert proj.pages[0].lines[0].display_start == 840
+    assert proj.pages[1].lines[0].display_start == 840
+
+
+
 
