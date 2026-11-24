@@ -856,11 +856,21 @@ def test_duet_mode_setup_two_pass_sync_and_overlapping_kbp_build(tmp_path, monke
         assert reloaded.duet_pass == 2
         assert [ln.style for _, _, ln in reloaded.flat_lines()] == ["A", "B", "C", "B"]
 
-        # 6) Built KBP has Singer 1 / Singer 2 / Together styles and preserves overlapping duet timings
+        # 6) Built KBP has Singer 1 / Singer 2 / Together styles with light-tinted base + vivid wipe colors
         proj = reloaded.build_kbp_project()
-        assert proj.header.styles["A"].name == "Singer 1"
-        assert proj.header.styles["B"].name == "Singer 2"
-        assert proj.header.styles["C"].name == "Together"
+        st_a = proj.header.styles["A"]
+        st_b = proj.header.styles["B"]
+        st_c = proj.header.styles["C"]
+        assert st_a.name == "Singer 1"
+        assert st_b.name == "Singer 2"
+        assert st_c.name == "Together"
+        # Base (unwiped) colors are light-saturated Red / Blue / Purple; wipes are vivid Red / Blue / Purple
+        assert proj.header.color(st_a.text_color_idx) == (255, 204, 204)   # #FFCCCC light blush red
+        assert proj.header.color(st_a.wipe_color_idx) == (255, 51, 51)     # #FF3333 vivid red wipe
+        assert proj.header.color(st_b.text_color_idx) == (204, 238, 255)   # #CCEEFF light ice blue
+        assert proj.header.color(st_b.wipe_color_idx) == (51, 136, 255)    # #3388FF vivid blue wipe
+        assert proj.header.color(st_c.text_color_idx) == (238, 204, 255)   # #EECCFF light lavender purple
+        assert proj.header.color(st_c.wipe_color_idx) == (187, 68, 255)    # #BB44FF vivid purple wipe
         assert proj.pages[0].lines[0].style == "A"
         assert proj.pages[0].lines[0].first_syl_start == 100
         assert proj.pages[0].lines[1].style == "B"

@@ -5,6 +5,15 @@ All notable changes to **Matt Joy Karaoke Builder** will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-23
+
+### Added
+- **Tap Sync Duet Mode (`🎭 Duet Mode`):** Full two-pass duet syncing workflow for concurrent/overlapping singers:
+  - **Interactive Duet Setup:** Assign lines to **`[A]` Singer 1** (default, Red/White), **`[B]` Singer 2** (Blue/White), and **`[C]` Sung Together** (Purple/White) by clicking lines directly on the teleprompter, multi-selecting in the sidebar, or pressing `1` / `2` / `3`, then click **`✓ Ready to Sync`**.
+  - **Two-Round Rolling Sync:** **Round 1** highlights `[A]` and `[C]` in color while greying out `[B]`; **Round 2** rewinds and highlights `[B]` while greying out `[A]` and `[C]` without overwriting Round 1 timings (including pass-isolated `Back Line`, `Undo Tap`, and pre-roll).
+  - **Scrollable Teleprompter & Split-Lane Waveform:** Scroll through greyed-out lines anytime with the mouse wheel (snapping back on the next tap), and view `[A]` (top, red) and `[B]` (bottom, blue) side-by-side on the live lookahead waveform.
+  - **Duet `.kbp` / `.ass` Export Palette:** Automatically builds Duet styles with light-tinted unwiped base colors (`#FFCCCC` / `#CCEEFF` / `#EECCFF`) so singers can see upcoming parts before the wipe, paired with vivid Red / Blue / Purple wipes (`#FF3333` / `#3388FF` / `#BB44FF`), while inheriting font, outline, margin, and background settings from any selected `.kbp` template.
+
 ## [1.0.1] - 2026-11-23
 
 ### Added

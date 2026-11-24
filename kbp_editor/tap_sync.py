@@ -94,7 +94,7 @@ DUET_KBP_HEADER_LINES: List[str] = [
     "'--- Template Information ---",
     "",
     "'Palette Colours (0-15)",
-    "  000,FFF,000,F44,611,FFF,000,49F,137,FFF,000,B6F,417,000,FFF,000",
+    "  000,FCC,000,F33,611,CEF,000,38F,137,ECF,000,B4F,417,FFF,000,FC0",
     "",
     "'Styles (00-19)",
     "'  Number,Name",
@@ -114,7 +114,7 @@ DUET_KBP_HEADER_LINES: List[str] = [
     "    Arial,12,B,0",
     "    2,2,2,2,0,0,0,L",
     "",
-    "  Style03,Other,4,8,12,14",
+    "  Style03,Label,13,14,15,2",
     "    Arial,12,B,0",
     "    2,2,2,2,0,0,0,L",
     "",
@@ -585,6 +585,56 @@ class TapSyncDraft:
         marker_idx, header_lines = extract_kbp_header_lines(raw_lines, section_markers=("PAGEV2", "LYRICSV2"))
         return header_lines if marker_idx is not None else None
 
+    @staticmethod
+    def _apply_duet_styles_to_header_lines(base_lines: Optional[List[str]]) -> List[str]:
+        """
+        Build a KBP header with Duet Mode's Red / Blue / Purple base+wipe palette while
+        inheriting font, outline/shadow, margins, and background color from `base_lines` if present.
+        """
+        if not base_lines:
+            return list(DUET_KBP_HEADER_LINES)
+        parsed = KbpHeader.parse(base_lines)
+        st0 = parsed.get_style("A")
+        bg_rgb = parsed.color(parsed.border_color_idx, (0, 0, 0))
+        bg_hex = f"{round(bg_rgb[0] / 17):X}{round(bg_rgb[1] / 17):X}{round(bg_rgb[2] / 17):X}"
+        font_line = f"    {st0.font_name},{st0.font_size},{st0.font_style},{st0.charset}"
+        ow = st0.outline_widths
+        sh = st0.shadow_offset
+        other_line = f"    {ow[0]},{ow[1]},{ow[2]},{ow[3]},{sh[0]},{sh[1]},{st0.wiping},{st0.uppercase}"
+        m = parsed.margins
+        margin_line = f"  {m[0]},{m[1]},{m[2]},{m[3]}"
+        other_hdr = f"  0,{parsed.detail_level}"
+
+        out: List[str] = []
+        i = 0
+        while i < len(DUET_KBP_HEADER_LINES):
+            ln = DUET_KBP_HEADER_LINES[i]
+            s = ln.strip()
+            if s.startswith("'Palette Colours") and i + 1 < len(DUET_KBP_HEADER_LINES):
+                out.append(ln)
+                out.append(f"  {bg_hex},FCC,000,F33,611,CEF,000,38F,137,ECF,000,B4F,417,FFF,000,FC0")
+                i += 2
+                continue
+            if s.startswith("Style0") and i + 2 < len(DUET_KBP_HEADER_LINES):
+                out.append(ln)
+                out.append(font_line)
+                out.append(other_line)
+                i += 3
+                continue
+            if s.startswith("'Margins") and i + 1 < len(DUET_KBP_HEADER_LINES):
+                out.append(ln)
+                out.append(margin_line)
+                i += 2
+                continue
+            if s.startswith("'Other:") and i + 1 < len(DUET_KBP_HEADER_LINES):
+                out.append(ln)
+                out.append(other_hdr)
+                i += 2
+                continue
+            out.append(ln)
+            i += 1
+        return out
+
     def build_kbp_project(self, default_tail_cs: int = 35) -> KbpProject:
         """
         Convert this TapSyncDraft into a full KbpProject with 0 cs flush borders
@@ -597,8 +647,10 @@ class TapSyncDraft:
             header_lines = self._extract_header_from_kbp(self.template_kbp_path)
         if header_lines is None and self.raw_header_lines:
             header_lines = list(self.raw_header_lines)
-        if header_lines is None:
-            header_lines = list(DUET_KBP_HEADER_LINES if self.duet_mode else DEFAULT_KBP_HEADER_LINES)
+        if self.duet_mode:
+            header_lines = self._apply_duet_styles_to_header_lines(header_lines)
+        elif header_lines is None:
+            header_lines = list(DEFAULT_KBP_HEADER_LINES)
 
         header = KbpHeader.parse(header_lines)
         if self.title:
