@@ -149,6 +149,11 @@ class AddLineDialog(QDialog):
 
         self._text_edit = QLineEdit()
         self._text_edit.setPlaceholderText("e.g. Sing a/long to/night")
+        self._pos_combo = QComboBox()
+        self._pos_combo.addItems([
+            "After Selected Line",
+            "Before Selected Line",
+        ])
         self._where_combo = QComboBox()
         self._where_combo.addItems([
             "Right After Selected Line",
@@ -158,12 +163,19 @@ class AddLineDialog(QDialog):
         self._style_combo.addItems(["A", "B", "C", "D", "E", "F"])
         self._fixed_cb = QCheckBox("Fixed Text (No Wipe)")
         self._fixed_cb.setToolTip("Creates a KBP Fixed Text line (lowercase style letter) that stays on screen without wiping")
+        self._blank_cb = QCheckBox("Blank Spacer Line (vertical gap)")
+        self._blank_cb.setToolTip(
+            "Insert an empty 0/0 KBS spacer row for vertical spacing (e.g., top padding or gap between duet singers)"
+        )
+        self._blank_cb.toggled.connect(self._on_blank_toggled)
         self._dur_spin = QSpinBox()
         self._dur_spin.setRange(5, 300)
         self._dur_spin.setValue(30)
         self._dur_spin.setSuffix(" cs / syl")
 
         form = QFormLayout()
+        form.addRow("", self._blank_cb)
+        form.addRow("Position:", self._pos_combo)
         form.addRow("Line Lyrics:", self._text_edit)
         form.addRow("Start Time:", self._where_combo)
         form.addRow("Track Style:", self._style_combo)
@@ -177,8 +189,26 @@ class AddLineDialog(QDialog):
         layout.addWidget(buttons)
         self._text_edit.setFocus()
 
+    def _on_blank_toggled(self, checked: bool) -> None:
+        enabled = not checked
+        self._text_edit.setEnabled(enabled)
+        self._where_combo.setEnabled(enabled)
+        self._style_combo.setEnabled(enabled)
+        self._fixed_cb.setEnabled(enabled)
+        self._dur_spin.setEnabled(enabled)
+
+    @property
+    def is_blank_spacer(self) -> bool:
+        return self._blank_cb.isChecked()
+
+    @property
+    def insert_before(self) -> bool:
+        return self._pos_combo.currentIndex() == 1
+
     @property
     def syllables(self) -> List[str]:
+        if self._blank_cb.isChecked():
+            return []
         if self._fixed_cb.isChecked():
             txt = self._text_edit.text().strip()
             return [txt] if txt else []
@@ -1645,7 +1675,7 @@ class LyricsWipingView(QWidget):
         _add_btn(l_r1, "Join", "Join current line with the next line", self._join_line)
         _add_btn(l_r1, "Delete", "Delete the selected line", self._delete_line)
         _add_btn(l_r2, "Select", "Highlight all syllables in the current line to slide it (or drag into [B])", self._select_current_line)
-        _add_btn(l_r2, "Duplicate", "Duplicate selected line in place onto the next style track", self._duplicate_selected_line)
+        _add_btn(l_r2, "Duplicate", "Duplicate selected line right below it (keeps the same style)", self._duplicate_selected_line)
         self._style_combo = QComboBox(ribbon)
         self._style_combo.setFixedWidth(92)
         self._style_combo.setToolTip("Set style ([A]–[F]) for selected line(s)")
@@ -1655,6 +1685,7 @@ class LyricsWipingView(QWidget):
         l_r2.addWidget(self._style_combo)
         self._fixed_btn = QPushButton("Fixed", ribbon)
         self._fixed_btn.setCheckable(True)
+        self._fixed_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._fixed_btn.setFixedWidth(48)
         self._fixed_btn.setToolTip("Toggle KBP Fixed Text mode (no wipe, lowercase style letter) for selected line(s)")
         self._fixed_btn.setStyleSheet(
@@ -1673,7 +1704,7 @@ class LyricsWipingView(QWidget):
         _add_btn(p_r1, "Join", "Merge current page with the next page", self._join_page)
         _add_btn(p_r1, "Delete", "Delete the current page", self._delete_page)
         _add_btn(p_r2, "Select", "Highlight all syllables on the current page to slide it", self._select_current_page)
-        _add_btn(p_r2, "Duplicate", "Duplicate current page in place onto the next style track so you can drag it", self._duplicate_selected_page)
+        _add_btn(p_r2, "Duplicate", "Duplicate current page in place (keeps original styles)", self._duplicate_selected_page)
         ribbon_layout.addLayout(sec_pages)
         ribbon_layout.addWidget(_make_divider())
 
@@ -2110,6 +2141,51 @@ class LyricsWipingView(QWidget):
             return self.project.pick_duplicate_style([cur_ln])
         return "B"
 
+    def _populate_line_menu(self, menu: QMenu, p_idx: int, l_idx: int) -> None:
+        act_play = QAction("▶ Play Line", self)
+        act_play.triggered.connect(self._play_current_line)
+        menu.addAction(act_play)
+
+        act_sel = QAction("Select Whole Line", self)
+        act_sel.triggered.connect(lambda: self.canvas.select_whole_line(p_idx, l_idx, center=False))
+        menu.addAction(act_sel)
+
+        menu.addSeparator()
+        for label, fn in [
+            ("Add Line…", self._add_line),
+            ("Duplicate Line", self._duplicate_selected_line),
+            ("Join with Next Line", self._join_line),
+            ("Split Page Here", self._split_page),
+            ("Delete Line", self._delete_line),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(fn)
+            menu.addAction(act)
+
+        menu.addSeparator()
+        self._add_style_submenu(menu, self.canvas.get_line(p_idx, l_idx))
+
+    def _populate_page_menu(self, menu: QMenu, p_idx: int, center_on_select: bool = False) -> None:
+        act_sel = QAction(f"Select Whole Page {p_idx + 1}", self)
+        act_sel.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=center_on_select))
+        menu.addAction(act_sel)
+
+        menu.addSeparator()
+        for label, fn in [
+            ("Add Page…", self._add_page),
+            (f"Duplicate Page {p_idx + 1}", lambda: self._duplicate_page_idx(p_idx)),
+            ("Join with Next Page", self._join_page),
+            ("Delete Page", self._delete_page),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(fn)
+            menu.addAction(act)
+
+        menu.addSeparator()
+        act_reset = QAction(f"Reset Page {p_idx + 1} Display Windows", self)
+        act_reset.triggered.connect(lambda: self._reset_page_displays(p_idx))
+        menu.addAction(act_reset)
+
     def _on_canvas_context_menu(self, kind: str, p_idx: int, l_idx: int, s_idx: int, global_pos: QPoint) -> None:
         if not self.project:
             return
@@ -2131,8 +2207,8 @@ class LyricsWipingView(QWidget):
 
             menu.addSeparator()
             for label, fn in [
-                ("Add Word / Syllable…", self._add_word),
                 ("Edit Syllable Text…", self._edit_syl),
+                ("Add Word / Syllable…", self._add_word),
                 ("Split Syllable…", self._split_syl),
                 ("Join with Next Syllable", self._join_syl),
                 ("Delete Syllable(s)", self._delete_syl),
@@ -2160,55 +2236,16 @@ class LyricsWipingView(QWidget):
             menu.addAction(act_dot)
 
             menu.addSeparator()
+            act_split_line = QAction("Split Line at This Syllable", self)
+            act_split_line.triggered.connect(self._split_line)
+            menu.addAction(act_split_line)
             self._add_style_submenu(menu, self.canvas.get_line(p_idx, l_idx))
 
         elif kind == "line":
-            act_play = QAction("▶ Play Line", self)
-            act_play.triggered.connect(self._play_current_line)
-            menu.addAction(act_play)
-
-            act_sel = QAction("Select Whole Line", self)
-            act_sel.triggered.connect(lambda: self.canvas.select_whole_line(p_idx, l_idx, center=False))
-            menu.addAction(act_sel)
-
-            cur_ln = self.canvas.get_line(p_idx, l_idx)
-            next_l_st = self._next_line_duplicate_style(cur_ln)
-            menu.addSeparator()
-            for label, fn in [
-                ("Add Line…", self._add_line),
-                ("Split Line at Selected Syllable", self._split_line),
-                ("Join with Next Line", self._join_line),
-                (f"Duplicate Line → Style [{next_l_st}]", self._duplicate_selected_line),
-                ("Delete Line", self._delete_line),
-            ]:
-                act = QAction(label, self)
-                act.triggered.connect(fn)
-                menu.addAction(act)
-
-            self._add_style_submenu(menu, cur_ln)
+            self._populate_line_menu(menu, p_idx, l_idx)
 
         elif kind == "page":
-            act_sel = QAction(f"Select Whole Page {p_idx + 1}", self)
-            act_sel.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=False))
-            menu.addAction(act_sel)
-
-            next_p_st = self._next_page_duplicate_style(p_idx)
-            menu.addSeparator()
-            for label, fn in [
-                ("Add Page…", self._add_page),
-                ("Split Page", self._split_page),
-                ("Join with Next Page", self._join_page),
-                (f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", lambda: self._duplicate_page_idx(p_idx)),
-                ("Delete Page", self._delete_page),
-            ]:
-                act = QAction(label, self)
-                act.triggered.connect(fn)
-                menu.addAction(act)
-
-            menu.addSeparator()
-            act_reset = QAction(f"Reset Page {p_idx + 1} Display Windows", self)
-            act_reset.triggered.connect(lambda: self._reset_page_displays(p_idx))
-            menu.addAction(act_reset)
+            self._populate_page_menu(menu, p_idx, center_on_select=False)
         else:
             return
 
@@ -2223,59 +2260,15 @@ class LyricsWipingView(QWidget):
             return
         p_idx, l_idx = data
         menu = QMenu(self)
-        next_p_st = self._next_page_duplicate_style(p_idx)
 
         if l_idx < 0:
-            act_sel_page = QAction(f"Select Whole Page {p_idx + 1} (for sliding)", self)
-            act_sel_page.triggered.connect(lambda: self.canvas.select_whole_page(p_idx, center=True))
-            menu.addAction(act_sel_page)
-
-            act_dup_page = QAction(f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", self)
-            act_dup_page.triggered.connect(lambda: self._duplicate_page_idx(p_idx))
-            menu.addAction(act_dup_page)
-
-            menu.addSeparator()
-            act_reset_p = QAction(f"Reset Page {p_idx + 1} Display Windows", self)
-            act_reset_p.triggered.connect(lambda: self._reset_page_displays(p_idx))
-            menu.addAction(act_reset_p)
-
+            self.set_selection(p_idx, 0, center=False)
+            self._populate_page_menu(menu, p_idx, center_on_select=True)
             menu.exec(self._line_tree.viewport().mapToGlobal(pos))
             return
 
         self.set_selection(p_idx, l_idx, center=False)
-
-        act_play = QAction("Play Line", self)
-        act_play.triggered.connect(self._play_current_line)
-        menu.addAction(act_play)
-
-        act_sel_line = QAction("Select Whole Line (for sliding)", self)
-        act_sel_line.triggered.connect(lambda: self.canvas.select_whole_line(p_idx, l_idx, center=False))
-        menu.addAction(act_sel_line)
-
-        cur_ln = self.canvas.get_line(p_idx, l_idx)
-        next_l_st = self._next_line_duplicate_style(cur_ln)
-        menu.addSeparator()
-        for label, fn in [
-            ("Add Word / Syllable…", self._add_word),
-            ("Split Line at Selected Syllable", self._split_line),
-            ("Join with Next Line", self._join_line),
-            (f"Duplicate Line → Style [{next_l_st}]", self._duplicate_selected_line),
-        ]:
-            act = QAction(label, self)
-            act.triggered.connect(fn)
-            menu.addAction(act)
-
-        self._add_style_submenu(menu, cur_ln)
-
-        act_dup_p = QAction(f"Duplicate Page {p_idx + 1} → Style [{next_p_st}]", self)
-        act_dup_p.triggered.connect(lambda: self._duplicate_page_idx(p_idx))
-        menu.addAction(act_dup_p)
-
-        menu.addSeparator()
-        act_reset = QAction("Reset All Display Windows", self)
-        act_reset.triggered.connect(self._reset_displays)
-        menu.addAction(act_reset)
-
+        self._populate_line_menu(menu, p_idx, l_idx)
         menu.exec(self._line_tree.viewport().mapToGlobal(pos))
 
     def _on_sticky(self, checked: bool) -> None:
@@ -2463,7 +2456,7 @@ class LyricsWipingView(QWidget):
             new_l_idx = l_idx + 1
             self._rebuild_tree(preserve_view=True, target_page=p_idx, target_line=new_l_idx)
             self.canvas.select_whole_line(p_idx, new_l_idx, center=False)
-            self.project_mutated.emit(f"Duplicate Line (P{p_idx + 1} L{l_idx + 1}) → [{new_line.style}]")
+            self.project_mutated.emit(f"Duplicate Line (P{p_idx + 1} L{l_idx + 1})")
 
     def _duplicate_selected_page(self) -> None:
         self._duplicate_page_idx(self.canvas.page_idx)
@@ -2471,12 +2464,11 @@ class LyricsWipingView(QWidget):
     def _duplicate_page_idx(self, p_idx: int) -> None:
         if not self.project or not (0 <= p_idx < len(self.project.pages)):
             return
-        target_style = self.project.pick_duplicate_style(self.project.pages[p_idx].lines)
-        self.project.duplicate_page(page_number=p_idx + 1, target_style=target_style, in_place=True)
+        self.project.duplicate_page(page_number=p_idx + 1, in_place=True)
         new_p_idx = p_idx + 1
         self._rebuild_tree(preserve_view=True, target_page=new_p_idx, target_line=0)
         self.canvas.select_whole_page(new_p_idx, center=False)
-        self.project_mutated.emit(f"Duplicate Page {p_idx + 1} → [{target_style}] (in place)")
+        self.project_mutated.emit(f"Duplicate Page {p_idx + 1} (in place)")
 
     def _add_line(self) -> None:
         if not self.project or not self.project.pages:
@@ -2484,23 +2476,31 @@ class LyricsWipingView(QWidget):
         dlg = AddLineDialog(self.canvas.playhead_cs, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        p_idx, l_idx = self.canvas.page_idx, self.canvas.line_idx
+        insert_idx = l_idx if dlg.insert_before else l_idx + 1
+
+        if dlg.is_blank_spacer:
+            if self.project.add_blank_line(p_idx, insert_idx):
+                self._rebuild_tree(preserve_view=True, target_page=p_idx, target_line=insert_idx)
+                self.canvas.update()
+                self.project_mutated.emit(f"Add Blank Spacer Line (P{p_idx + 1} L{insert_idx + 1})")
+            return
+
         syls = dlg.syllables
         if not syls:
             return
-        p_idx, l_idx = self.canvas.page_idx, self.canvas.line_idx
         start_cs = int(round(self.canvas.playhead_cs)) if dlg.use_playhead else None
         if self.project.add_line(
             p_idx,
-            l_idx,
+            insert_idx - 1,
             syls,
             start_cs=start_cs,
             duration_cs=dlg.duration_cs,
             style=dlg.style_letter,
         ):
-            new_l = l_idx + 1
-            self._rebuild_tree(preserve_view=True, target_page=p_idx, target_line=new_l)
-            self.canvas.select_whole_line(p_idx, new_l, center=False)
-            self.project_mutated.emit(f"Add Line (P{p_idx + 1} L{new_l + 1})")
+            self._rebuild_tree(preserve_view=True, target_page=p_idx, target_line=insert_idx)
+            self.canvas.select_whole_line(p_idx, insert_idx, center=False)
+            self.project_mutated.emit(f"Add Line (P{p_idx + 1} L{insert_idx + 1})")
 
     def _delete_line(self) -> None:
         if not self.project:

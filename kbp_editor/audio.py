@@ -247,7 +247,10 @@ class AudioEngine(QObject):
 
     @property
     def is_playing(self) -> bool:
-        return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        return (
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            or self._poll_timer.isActive()
+        )
 
     @property
     def smooth_position_cs(self) -> float:
@@ -385,14 +388,19 @@ class AudioEngine(QObject):
         self._play_start_pos_ms = cur_ms
         self._player.play()
         self._poll_timer.start()
+        if self._player.source().isEmpty():
+            self.state_changed.emit(True)
 
     def pause(self) -> None:
+        was_silent_playing = self._player.source().isEmpty() and self._poll_timer.isActive()
         cur_ms = self.smooth_position_cs * 10.0
         self._stop_at_cs = None
         self._awaiting_audio_start = False
         self._player.pause()
         self._poll_timer.stop()
         self._reanchor(cur_ms)
+        if was_silent_playing:
+            self.state_changed.emit(False)
 
     def toggle_play(self) -> None:
         if self.is_playing:

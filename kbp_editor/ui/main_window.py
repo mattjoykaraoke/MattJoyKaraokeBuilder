@@ -285,14 +285,17 @@ class MainWindow(QMainWindow):
         sec_play, play_row = _make_section("Playback")
         self._play_btn = QPushButton("▶ Play", bar)
         self._play_btn.setFixedWidth(90)
+        self._play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_btn.clicked.connect(self.audio.toggle_play)
         play_row.addWidget(self._play_btn)
 
         self._play_line_btn = QPushButton("Play Line", bar)
+        self._play_line_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_line_btn.clicked.connect(self._play_selected_line)
         play_row.addWidget(self._play_line_btn)
 
         self._play_word_btn = QPushButton("Play Word", bar)
+        self._play_word_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._play_word_btn.setToolTip("Play the selected word/syllable and stop right at its end")
         self._play_word_btn.clicked.connect(self._play_selected_word)
         play_row.addWidget(self._play_word_btn)

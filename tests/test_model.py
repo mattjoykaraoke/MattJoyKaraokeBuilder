@@ -179,30 +179,31 @@ def test_insert_and_multi_delete_syllables():
     assert len(line.syllables) == 3
 
 
-def test_duplicate_line_and_page_assigns_b_and_c_styles():
+def test_duplicate_line_and_page_preserves_original_style():
     proj = _sample_project()
-    # Duplicating an [A] line produces a [B] line right after it
+    # Duplicating an [A] line keeps Style [A] right below it
     dup_l = proj.duplicate_line(0, 0)
     assert dup_l is not None
-    assert dup_l.style == "B"
+    assert dup_l.style == "A"
     assert len(proj.pages[0].lines) == 3
 
-    # Duplicating that [B] line produces a [C] line
-    dup_l2 = proj.duplicate_line(0, 1)
-    assert dup_l2 is not None
-    assert dup_l2.style == "C"
+    # Explicit target_style override still works when requested
+    dup_b = proj.duplicate_line(0, 0, target_style="B")
+    assert dup_b is not None
+    assert dup_b.style == "B"
 
-    # Duplicating that [C] line advances to [D], [E], [F], then wraps to [A]
-    dup_l3 = proj.duplicate_line(0, 2)
-    assert dup_l3 is not None and dup_l3.style == "D"
-    dup_l4 = proj.duplicate_line(0, 3)
-    assert dup_l4 is not None and dup_l4.style == "E"
-    dup_l5 = proj.duplicate_line(0, 4)
-    assert dup_l5 is not None and dup_l5.style == "F"
-    dup_l6 = proj.duplicate_line(0, 5)
-    assert dup_l6 is not None and dup_l6.style == "A"
+    # Duplicating a fixed-text line preserves lowercase fixed style
+    dup_b.set_fixed(True)
+    dup_fixed = proj.duplicate_line(0, 1)
+    assert dup_fixed is not None
+    assert dup_fixed.style == "b"
+    assert dup_fixed.is_fixed
 
-    # Duplicating Page 2 ([A]) with pick_duplicate_style produces [B]
+    # Duplicating a page without target_style preserves original styles
+    dup_p = proj.duplicate_page(page_number=2, in_place=True)
+    assert [ln.style for ln in dup_p.lines] == [ln.style for ln in proj.pages[1].lines]
+
+    # Explicit target_style override still works on duplicate_page
     style_b = proj.pick_duplicate_style(proj.pages[1].lines)
     assert style_b == "B"
     new_p = proj.duplicate_page(page_number=2, target_style=style_b)
@@ -670,5 +671,27 @@ def test_universal_glyph_detection_ignores_mid_line_punctuation():
     assert ln.syllables[0].is_glyph
     assert not ln.syllables[1].is_glyph
     assert not ln.syllables[2].is_glyph
+
+
+def test_add_blank_line_creates_valid_spacer_at_top_or_middle():
+    proj = _sample_project()
+    # Insert blank spacer before Line 1 (index 0)
+    spacer_top = proj.add_blank_line(0, 0)
+    assert spacer_top is not None
+    assert spacer_top.is_spacer
+    assert (spacer_top.display_start, spacer_top.display_end) == (0, 0)
+    assert proj.pages[0].lines[0] is spacer_top
+    assert proj.pages[0].first_syl_start == 1000
+    assert proj.pages[0].starts_with_marker()
+
+    # Insert blank spacer in the middle (index 2)
+    spacer_mid = proj.add_blank_line(0, 2)
+    assert spacer_mid is not None
+    assert spacer_mid.is_spacer
+    proj.optimize_windows()
+    assert (spacer_top.display_start, spacer_top.display_end) == (0, 0)
+    assert (spacer_mid.display_start, spacer_mid.display_end) == (0, 0)
+    assert proj.pages[0].lines[1].display_start == 975
+
 
 

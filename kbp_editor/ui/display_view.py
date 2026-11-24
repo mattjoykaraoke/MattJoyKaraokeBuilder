@@ -523,6 +523,7 @@ class DisplayRemoveView(QWidget):
 
         bar1.addSpacing(12)
         self._fixed_cb = QCheckBox("Fixed Text (No Wipe)")
+        self._fixed_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._fixed_cb.setToolTip(
             "Toggle KBP Fixed Text mode (lowercase style letter) for the selected line.\n"
             "Fixed text stays visible across the page without wiping (e.g. singer labels)."

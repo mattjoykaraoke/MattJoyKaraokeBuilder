@@ -1264,7 +1264,7 @@ class KbpProject:
         target_style: Optional[str] = None,
         shift_cs: int = 0,
     ) -> Optional[Line]:
-        """Duplicate a single line on the same page, advancing to the next style by default."""
+        """Duplicate a single line on the same page, preserving its original style by default."""
         if not (0 <= page_idx < len(self.pages)):
             return None
         page = self.pages[page_idx]
@@ -1272,7 +1272,8 @@ class KbpProject:
             return None
         src = page.lines[line_idx]
         new_line = deepcopy(src)
-        new_line.style = target_style if target_style is not None else self.pick_duplicate_style([src])
+        if target_style is not None:
+            new_line.style = target_style
         if shift_cs:
             new_line.shift(shift_cs)
         page.lines.insert(line_idx + 1, new_line)
@@ -1372,6 +1373,22 @@ class KbpProject:
         )
         page.lines.insert(insert_at, new_line)
         return new_line
+
+    def add_blank_line(self, page_idx: int, insert_idx: int) -> Optional[Line]:
+        """Insert a blank 0/0 layout-spacer line at `insert_idx` on `page_idx`."""
+        if not (0 <= page_idx < len(self.pages)):
+            return None
+        page = self.pages[page_idx]
+        at = max(0, min(len(page.lines), insert_idx))
+        blank = Line(
+            align="C",
+            style="A",
+            display_start=0,
+            display_end=0,
+            syllables=[Syllable(text="", start=0, end=0)],
+        )
+        page.lines.insert(at, blank)
+        return blank
 
     def delete_line(self, page_idx: int, line_idx: int) -> bool:
         """Delete a line (removes empty page if >1 page exists; keeps at least 1 line in project)."""
