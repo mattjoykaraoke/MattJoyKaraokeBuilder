@@ -2,7 +2,7 @@
 
 **A modern, dark-mode karaoke lyric tap-syncing, syllable wiping, and display-window editor for Karaoke Builder Studio (`.kbp`) projects.**
 
-> **Status:** `v1.1.0` — Created by **Matt Joy** ([GitHub](https://github.com/MattJoyKaraoke))
+> **Status:** `v1.1.1` — Created by **Matt Joy** ([GitHub](https://github.com/MattJoyKaraoke))
 
 ---
 

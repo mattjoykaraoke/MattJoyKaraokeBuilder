@@ -5,6 +5,18 @@ All notable changes to **Matt Joy Karaoke Builder** will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-24
+
+### Added
+- **Split-Screen Duet Zones (`🎭 Duet Zones`):**
+  - Reserves the **Top Half (Rows 1–3)** for **`[A]` Singer 1** and **Bottom Half (Rows 4–6)** for **`[B]` Singer 2** via native KBP `down` (`offset_y`) coordinates, keeping Singer 2 anchored at Row 4 even on solo pages without inserting blank spacer lines.
+  - Places **`[C]` Together** in whichever 3-row zone is free when sharing a page, or across the full 6-row screen when alone.
+  - Auto-splits overflowing $>3$-line singer blocks across pages (paired by singing timestamp) while letting overlapping lines sustain uninterrupted across the other zone's page transitions.
+  - Added a **`🎭 Duet Zones`** toggle (with `↑` / `↓` zone indicators) and **`Re-Split & Align Zones`** button on the **Display / Remove Window** tab, auto-enabled when building from Tap Sync Duet Mode and auto-detected when reopening saved Duet `.kbp` files.
+- **Call-and-Response Duet Window Optimization:**
+  - Pulls upcoming response `display_start` times back into unused screen zones so Call & Response lines appear together at the start of an exchange instead of popping in mid-line.
+  - Checks row clearing across all prior pages independently per zone and restricts the `25 cs` pre-glyph shrink to true full-song instrumental breaks.
+
 ## [1.1.0] - 2026-11-23
 
 ### Added
@@ -13,7 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Two-Round Rolling Sync:** **Round 1** highlights `[A]` and `[C]` in color while greying out `[B]`; **Round 2** rewinds and highlights `[B]` while greying out `[A]` and `[C]` without overwriting Round 1 timings (including pass-isolated `Back Line`, `Undo Tap`, and pre-roll).
   - **Scrollable Teleprompter & Split-Lane Waveform:** Scroll through greyed-out lines anytime with the mouse wheel (snapping back on the next tap), and view `[A]` (top, red) and `[B]` (bottom, blue) side-by-side on the live lookahead waveform.
   - **Duet `.kbp` / `.ass` Export Palette:** Automatically builds Duet styles with light-tinted unwiped base colors (`#FFCCCC` / `#CCEEFF` / `#EECCFF`) so singers can see upcoming parts before the wipe, paired with vivid Red / Blue / Purple wipes (`#FF3333` / `#3388FF` / `#BB44FF`), while inheriting font, outline, margin, and background settings from any selected `.kbp` template.
-  - **Split-Screen Duet Zones & Call-and-Response Windows:** Auto-reserves the Top Half (Rows 1–3) for `[A]` Singer 1 and Bottom Half (Rows 4–6) for `[B]` Singer 2 (placing `[C]` Together in whichever zone is free, or full-screen when alone), auto-splits overflowing $>3$-line blocks across pages without interrupting overlapping lines, and aligns Call-and-Response `display_start` times across empty zones so responses appear alongside calls instead of popping in mid-line. Includes a **`🎭 Duet Zones`** toggle and **`Re-Split & Align Zones`** button on the **Display / Remove Window** tab.
 
 ## [1.0.1] - 2026-11-23
 
