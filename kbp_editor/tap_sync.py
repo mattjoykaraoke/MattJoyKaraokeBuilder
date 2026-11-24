@@ -83,6 +83,64 @@ DEFAULT_KBP_HEADER_LINES: List[str] = [
     "",
 ]
 
+DUET_KBP_HEADER_LINES: List[str] = [
+    SEPARATOR,
+    "KARAOKE BUILDER STUDIO",
+    "www.KaraokeBuilder.com",
+    "",
+    SEPARATOR,
+    "HEADERV2",
+    "",
+    "'--- Template Information ---",
+    "",
+    "'Palette Colours (0-15)",
+    "  000,FFF,000,F44,611,FFF,000,49F,137,FFF,000,B6F,417,000,FFF,000",
+    "",
+    "'Styles (00-19)",
+    "'  Number,Name",
+    "'  Colour: Text,Outline,Text Wipe,Outline Wipe",
+    "'  Font  : Name,Size,Style,Charset",
+    "'  Other : Outline*4,Shadow*2,Wiping,Uppercase",
+    "",
+    "  Style00,Singer 1,1,2,3,4",
+    "    Arial,12,B,0",
+    "    2,2,2,2,0,0,0,L",
+    "",
+    "  Style01,Singer 2,5,6,7,8",
+    "    Arial,12,B,0",
+    "    2,2,2,2,0,0,0,L",
+    "",
+    "  Style02,Together,9,10,11,12",
+    "    Arial,12,B,0",
+    "    2,2,2,2,0,0,0,L",
+    "",
+    "  Style03,Other,4,8,12,14",
+    "    Arial,12,B,0",
+    "    2,2,2,2,0,0,0,L",
+    "",
+    "  StyleEnd",
+    "",
+    "'Margins : L,R,T,Line Spacing",
+    "  2,2,7,12",
+    "",
+    "'Other: Border Colour,Detail Level",
+    "  0,2",
+    "",
+    "'--- Track Information ---",
+    "",
+    "Status    1",
+    "Title     ",
+    "Artist    ",
+    "Audio     ",
+    "BuildFile ",
+    "Intro     ",
+    "Outro     ",
+    "",
+    "Comments  Hacked by Matt Joy",
+    "          github.com/mattjoykaraoke",
+    "",
+]
+
 
 @dataclass
 class TapSyllable:
@@ -207,6 +265,8 @@ class TapSyncDraft:
     latency_enabled: bool = True
     latency_cs: int = 4
     pre_roll_cs: int = 150
+    duet_mode: bool = False
+    duet_pass: int = 1  # 1 = Singer 1 [A] + Together [C], 2 = Singer 2 [B]
     draft_id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
     updated_at: str = ""
 
@@ -250,7 +310,49 @@ class TapSyncDraft:
     def synced_syllables(self) -> int:
         return sum(1 for p in self.pages for ln in p.lines for s in ln.syllables if s.is_synced)
 
+    def is_line_in_pass(self, line: TapLine, duet_pass: Optional[int] = None) -> bool:
+        """True if `line` is active during `duet_pass` (always True when duet_mode is False)."""
+        if not self.duet_mode:
+            return True
+        p = duet_pass if duet_pass is not None else self.duet_pass
+        st = (line.style or "A").upper()
+        if p == 2:
+            return st == "B"
+        # Round 1 syncs Singer 1 [A] and Together [C] (plus any non-B style)
+        return st != "B"
+
+    def pass_syllable_counts(self, duet_pass: Optional[int] = None) -> Tuple[int, int]:
+        """Return (synced_syllables, total_syllables) for the specified duet pass."""
+        total = 0
+        synced = 0
+        for p in self.pages:
+            for ln in p.lines:
+                if not self.is_line_in_pass(ln, duet_pass):
+                    continue
+                total += len(ln.syllables)
+                synced += sum(1 for s in ln.syllables if s.is_synced)
+        return synced, total
+
+    def first_unsynced_coord_for_pass(self, duet_pass: Optional[int] = None) -> Optional[Tuple[int, int, int]]:
+        for p_idx, page in enumerate(self.pages):
+            for l_idx, line in enumerate(page.lines):
+                if not self.is_line_in_pass(line, duet_pass):
+                    continue
+                for s_idx, syl in enumerate(line.syllables):
+                    if not syl.has_start:
+                        return (p_idx, l_idx, s_idx)
+        return None
+
+    def first_coord_for_pass(self, duet_pass: Optional[int] = None) -> Optional[Tuple[int, int, int]]:
+        for p_idx, page in enumerate(self.pages):
+            for l_idx, line in enumerate(page.lines):
+                if self.is_line_in_pass(line, duet_pass) and line.syllables:
+                    return (p_idx, l_idx, 0)
+        return None
+
     def first_unsynced_coord(self) -> Optional[Tuple[int, int, int]]:
+        if self.duet_mode:
+            return self.first_unsynced_coord_for_pass(self.duet_pass)
         for p_idx, page in enumerate(self.pages):
             for l_idx, line in enumerate(page.lines):
                 for s_idx, syl in enumerate(line.syllables):
@@ -381,12 +483,15 @@ class TapSyncDraft:
             "latency_enabled": self.latency_enabled,
             "latency_cs": self.latency_cs,
             "pre_roll_cs": self.pre_roll_cs,
+            "duet_mode": self.duet_mode,
+            "duet_pass": self.duet_pass,
             "pages": [p.to_dict() for p in self.pages],
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TapSyncDraft":
         raw_hdr = data.get("raw_header_lines")
+        raw_pass = int(data.get("duet_pass", 1))
         return cls(
             pages=[TapPage.from_dict(p) for p in data.get("pages", [])],
             title=str(data.get("title", "")),
@@ -398,6 +503,8 @@ class TapSyncDraft:
             latency_enabled=bool(data.get("latency_enabled", True)),
             latency_cs=int(data.get("latency_cs", 4)),
             pre_roll_cs=int(data.get("pre_roll_cs", 150)),
+            duet_mode=bool(data.get("duet_mode", False)),
+            duet_pass=2 if raw_pass == 2 else 1,
             draft_id=str(data.get("draft_id") or uuid.uuid4().hex[:10]),
             updated_at=str(data.get("updated_at", "")),
         )
@@ -491,7 +598,7 @@ class TapSyncDraft:
         if header_lines is None and self.raw_header_lines:
             header_lines = list(self.raw_header_lines)
         if header_lines is None:
-            header_lines = list(DEFAULT_KBP_HEADER_LINES)
+            header_lines = list(DUET_KBP_HEADER_LINES if self.duet_mode else DEFAULT_KBP_HEADER_LINES)
 
         header = KbpHeader.parse(header_lines)
         if self.title:

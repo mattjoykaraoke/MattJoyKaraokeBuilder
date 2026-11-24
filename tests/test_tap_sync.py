@@ -721,3 +721,155 @@ def test_tap_sync_direct_coord_stepping_and_preview_cache_retention(tmp_path):
         win.close()
         app.processEvents()
 
+
+def test_duet_mode_setup_two_pass_sync_and_overlapping_kbp_build(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QImage, QWheelEvent
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from kbp_editor.audio import AudioEngine
+    from kbp_editor.ui.tap_sync_view import TapSyncView
+
+    app = QApplication.instance() or QApplication([])
+    audio = AudioEngine()
+    view = TapSyncView(audio)
+    view.resize(1000, 620)
+    try:
+        draft = TapSyncDraft.from_lyrics_text(
+            "Sing/er one\n"
+            "Sing/er two\n"
+            "\n"
+            "Both to/geth/er\n"
+            "Sec/ond so/lo\n"
+        )
+        draft.latency_enabled = False
+        view._apply_draft(draft, load_audio=False)
+
+        # 1) Enter Duet Mode -> opens Duet Setup Mode; Start Sync disabled until 'Ready to Sync'
+        view.set_duet_mode(True, enter_setup=True)
+        assert view.draft.duet_mode is True
+        assert view._duet_setup_mode is True
+        assert view._sync_btn.isEnabled() is False
+
+        # Assign styles: P0 L0 = [A], P0 L1 = [B] (via cycle), P1 L0 = [C], P1 L1 = [B]
+        view._cycle_line_duet_style(0, 1)  # A -> B
+        assert view.draft.pages[0].lines[1].style == "B"
+        view._cycle_line_duet_style(1, 0)  # A -> B
+        view._cycle_line_duet_style(1, 0)  # B -> C
+        assert view.draft.pages[1].lines[0].style == "C"
+        view._cycle_line_duet_style(1, 1)  # A -> B
+        assert view.draft.pages[1].lines[1].style == "B"
+
+        # Render teleprompter & waveform in Setup Mode (verifies Red/Blue/Purple setup paint path)
+        img = QImage(800, 400, QImage.Format.Format_ARGB32_Premultiplied)
+        view._teleprompter.render(img)
+
+        # 2) Click '✓ Ready to Sync' -> cues Round 1 ([A] + [C]), skips [B]
+        view.finish_duet_setup()
+        assert view._duet_setup_mode is False
+        assert view.draft.duet_pass == 1
+        assert view._sync_btn.isEnabled() is True
+        assert view._cursor == (0, 0, 0)
+
+        pass1_coords = []
+        cur = view._cursor
+        while cur is not None:
+            pass1_coords.append(cur)
+            cur = view._next_coord(cur)
+        # Only P0 L0 ([A], 3 syls: Sing/er/one) and P1 L0 ([C], 4 syls: Both/to/geth/er) are visited in Round 1!
+        assert pass1_coords == [
+            (0, 0, 0), (0, 0, 1), (0, 0, 2),
+            (1, 0, 0), (1, 0, 1), (1, 0, 2), (1, 0, 3),
+        ]
+
+        # 3) Tap Round 1 ([A] + [C]) and verify wheel scrolling works even while syncing
+        view.start_syncing()
+        ev = QWheelEvent(
+            QPointF(100.0, 100.0),
+            QPointF(100.0, 100.0),
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        view._teleprompter.wheelEvent(ev)
+        assert view._teleprompter.preview_flat_idx == 1  # scrolled to greyed-out [B] line while rolling
+
+        round1_times = [100, 150, 200, 500, 550, 600, 650]
+        for t_cs in round1_times:
+            audio.set_position_cs(float(t_cs), scrub_audio=False)
+            view._tap_next_syllable()
+        # Tapping snaps teleprompter scroll back to active cursor
+        assert view._teleprompter.preview_flat_idx is None
+
+        # Finish Round 1 -> automatically offers switching to Round 2 ([B]) & rewinding to 0.0
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **kw: QMessageBox.StandardButton.Yes)
+        audio.set_position_cs(720.0, scrub_audio=False)
+        view._end_current_phrase()
+
+        assert view.draft.duet_pass == 2
+        assert view._cursor == (0, 1, 0)
+        assert audio.position_cs == 0
+
+        # Pre-roll for Singer 2's first line ignores Singer 1's [A] timestamps so overlapping vocals work!
+        assert view._pre_roll_start_for((0, 1, 0)) is None
+
+        # Render Round 2 teleprompter & waveform (verifies Blue/White active + greyed-out [A]/[C])
+        view._teleprompter.render(img)
+        view._waveform.render(img)
+
+        # 4) Tap Round 2 ([B]: 3 syls on P0 L1 + 4 syls on P1 L1) overlapping Singer 1!
+        view.start_syncing()
+        for t_cs in [120, 170, 220, 820, 860, 900, 940]:
+            audio.set_position_cs(float(t_cs), scrub_audio=False)
+            view._tap_next_syllable()
+
+        # Verify Back Line (Left Arrow) in Round 2 ONLY clears [B] and NEVER erases Round 1 ([A]/[C])!
+        view.restart_or_back_line()
+        assert view.draft.pages[0].lines[0].sync_state == "full"  # [A] untouched!
+        assert view.draft.pages[1].lines[0].sync_state == "full"  # [C] untouched!
+        assert view.draft.pages[1].lines[1].sync_state == "none"  # [B] line 2 cleared for re-tap
+        assert view._cursor == (1, 1, 0)
+
+        # Re-tap P1 L1 [B] (4 syls) and finish song
+        if not view.is_syncing:
+            view.start_syncing()
+        for t_cs in [830, 870, 910, 950]:
+            audio.set_position_cs(float(t_cs), scrub_audio=False)
+            view._tap_next_syllable()
+
+        # Decline immediate build prompt so we can inspect JSON roundtrip & built KBP
+        monkeypatch.setattr(QMessageBox, "question", lambda *a, **kw: QMessageBox.StandardButton.No)
+        audio.set_position_cs(1030.0, scrub_audio=False)
+        view._end_current_phrase()
+
+        assert view.draft.synced_syllables() == view.draft.total_syllables()
+
+        # 5) JSON round-trip preserves duet_mode, duet_pass, and line styles
+        mjkp = tmp_path / "duet.mjkp"
+        view.draft.save_json(mjkp)
+        reloaded = TapSyncDraft.load_json(mjkp)
+        assert reloaded.duet_mode is True
+        assert reloaded.duet_pass == 2
+        assert [ln.style for _, _, ln in reloaded.flat_lines()] == ["A", "B", "C", "B"]
+
+        # 6) Built KBP has Singer 1 / Singer 2 / Together styles and preserves overlapping duet timings
+        proj = reloaded.build_kbp_project()
+        assert proj.header.styles["A"].name == "Singer 1"
+        assert proj.header.styles["B"].name == "Singer 2"
+        assert proj.header.styles["C"].name == "Together"
+        assert proj.pages[0].lines[0].style == "A"
+        assert proj.pages[0].lines[0].first_syl_start == 100
+        assert proj.pages[0].lines[1].style == "B"
+        assert proj.pages[0].lines[1].first_syl_start == 120  # overlaps Singer 1!
+        assert proj.pages[1].lines[0].style == "C"
+        assert proj.pages[1].lines[0].first_syl_start == 500
+    finally:
+        view.stop_syncing()
+        view.close()
+        app.processEvents()
+
+

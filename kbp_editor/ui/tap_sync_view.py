@@ -17,6 +17,7 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -325,6 +326,7 @@ class _RollingTeleprompterWidget(QWidget):
     """
 
     end_phrase_requested = Signal()
+    line_style_cycle_requested = Signal(int, int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -333,8 +335,12 @@ class _RollingTeleprompterWidget(QWidget):
         self.open_coord: Optional[Tuple[int, int, int]] = None  # currently sustaining syllable
         self.is_syncing: bool = False
         self.is_locked: bool = False
+        self.duet_mode: bool = False
+        self.duet_pass: int = 1
+        self.duet_setup_mode: bool = False
         self.punch_line: Optional[Tuple[int, int]] = None
         self.preview_flat_idx: Optional[int] = None
+        self._rendered_line_rects: List[Tuple[QRectF, int, int]] = []
         self._cached_flat_lines: Optional[List[Tuple[int, int, TapLine]]] = None
         self._cached_counts: Optional[Tuple[int, int]] = None
         self._cached_draft_id: int = 0
@@ -366,9 +372,6 @@ class _RollingTeleprompterWidget(QWidget):
         return max(0, len(flat_lines) - 1)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        if self.is_syncing:
-            event.ignore()
-            return
         flat_lines, _, _ = self._ensure_draft_cache()
         if not flat_lines:
             event.ignore()
@@ -388,6 +391,13 @@ class _RollingTeleprompterWidget(QWidget):
             self.end_phrase_requested.emit()
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton and self.duet_mode and self.duet_setup_mode and not self.is_locked:
+            pos = event.position()
+            for rect, p_i, l_i in self._rendered_line_rects:
+                if rect.contains(pos):
+                    self.line_style_cycle_requested.emit(p_i, l_i)
+                    event.accept()
+                    return
         super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:
@@ -397,6 +407,7 @@ class _RollingTeleprompterWidget(QWidget):
         h = self.height()
         painter.fillRect(0, 0, w, h, QColor(18, 21, 27))
 
+        self._rendered_line_rects.clear()
         flat_lines, synced, total = self._ensure_draft_cache()
         if not flat_lines:
             painter.setFont(QFont("Segoe UI", 12))
@@ -408,26 +419,50 @@ class _RollingTeleprompterWidget(QWidget):
             )
             return
 
-        # Find active line index in flat_lines (use wheel-scrolled preview index when browsing)
+        # Find active line index in flat_lines (use wheel-scrolled preview index when browsing, including while rolling)
         cursor_flat_idx = self._cursor_flat_index(flat_lines)
         is_preview_scrolled = (
-            not self.is_syncing
-            and self.preview_flat_idx is not None
+            self.preview_flat_idx is not None
             and 0 <= self.preview_flat_idx < len(flat_lines)
             and self.preview_flat_idx != cursor_flat_idx
         )
-        if not self.is_syncing and self.preview_flat_idx is not None:
-            active_flat_idx = max(0, min(len(flat_lines) - 1, self.preview_flat_idx))
+        if self.preview_flat_idx is not None and 0 <= self.preview_flat_idx < len(flat_lines):
+            active_flat_idx = self.preview_flat_idx
         else:
             active_flat_idx = cursor_flat_idx
 
-        # Top status pill (Locked / Syncing / Paused phrase / Punch-in / Previewing / Ready)
+        # Top status pill (Locked / Duet Setup / Syncing / Paused phrase / Punch-in / Previewing / Ready)
         if self.is_locked:
             badge_txt = f"🔒 LOCKED ({synced}/{total} syllables synced) — Click 'Unfreeze Tap Sync' above to re-tap or modify"
             badge_bg = QColor(71, 56, 30, 225)
+        elif self.duet_mode and self.duet_setup_mode:
+            badge_txt = (
+                "🎭 DUET SETUP — Click any line to cycle [A] → [B] → [C] (or use sidebar / keys 1·2·3), "
+                "then click '✓ Ready to Sync'"
+            )
+            badge_bg = QColor(88, 28, 135, 220)
         elif self.punch_line is not None and self.is_syncing:
             badge_txt = f"● RE-TAPPING P{self.punch_line[0] + 1} L{self.punch_line[1] + 1}  (stops automatically at end of line)"
             badge_bg = QColor(180, 83, 9, 210)
+        elif self.duet_mode:
+            p_synced, p_total = self.draft.pass_syllable_counts(self.duet_pass)
+            round_lbl = "ROUND 1 ([A] Singer 1 + [C] Together)" if self.duet_pass == 1 else "ROUND 2 ([B] Singer 2)"
+            if self.is_syncing and self.open_coord is None and self.cursor is not None:
+                badge_txt = f"⏸ {round_lbl} — Tap Space on the orange syllable ({p_synced}/{p_total} synced)"
+                badge_bg = QColor(30, 64, 115, 220)
+            elif self.is_syncing:
+                badge_txt = f"● {round_lbl} — Tap Space on the orange syllable ({p_synced}/{p_total} synced)"
+                badge_bg = QColor(22, 101, 52, 210)
+            elif is_preview_scrolled:
+                pv_p, pv_l, _ = flat_lines[active_flat_idx]
+                badge_txt = (
+                    f"PREVIEWING LINE {active_flat_idx + 1}/{len(flat_lines)} (P{pv_p + 1} L{pv_l + 1}) · "
+                    f"{round_lbl} ({p_synced}/{p_total}) — Press Space to sync"
+                )
+                badge_bg = QColor(30, 58, 95, 220)
+            else:
+                badge_txt = f"🎭 {round_lbl} READY ({p_synced}/{p_total} syllables synced) — Click 'Start Sync' or press Space"
+                badge_bg = QColor(45, 38, 72, 220) if self.duet_pass == 1 else QColor(28, 52, 92, 220)
         elif self.is_syncing and self.open_coord is None and self.cursor is not None:
             badge_txt = "⏸ WAITING FOR NEXT WORD — Tap Space on the orange syllable"
             badge_bg = QColor(30, 64, 115, 220)
@@ -453,15 +488,15 @@ class _RollingTeleprompterWidget(QWidget):
         painter.setPen(QColor(241, 245, 249))
         painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, badge_txt)
 
-        # Rolling window: 1 previous line above, active line centered, up to 3 upcoming lines below
+        # Rolling window: 1 previous line above, active line centered, up to 4 upcoming lines below
         start_idx = max(0, active_flat_idx - 1)
-        end_idx = min(len(flat_lines), active_flat_idx + 4)
+        end_idx = min(len(flat_lines), active_flat_idx + 5)
 
         top_y = 48.0
         bottom_y = float(h - 28)
         avail_h = max(120.0, bottom_y - top_y)
-        active_y = top_y + avail_h * 0.34
-        row_step = min(56.0, max(38.0, avail_h / 5.0))
+        active_y = top_y + avail_h * 0.30
+        row_step = min(54.0, max(36.0, avail_h / 5.4))
 
         prev_page_drawn: Optional[int] = None
         for idx in range(start_idx, end_idx):
@@ -487,38 +522,93 @@ class _RollingTeleprompterWidget(QWidget):
 
             is_active_line = rel == 0
             is_past_line = rel < 0
+            st_upper = (line.style or "A").upper()
+            in_active_pass = (
+                True
+                if (not self.duet_mode or self.duet_setup_mode)
+                else self.draft.is_line_in_pass(line, self.duet_pass)
+            )
+
+            row_hit_rect = QRectF(24.0, y_center - row_step * 0.44, float(w - 48), row_step * 0.88)
+            self._rendered_line_rects.append((row_hit_rect, p_i, l_i))
+
+            if is_active_line:
+                painter.setBrush(QColor(30, 38, 52, 200))
+                painter.setPen(QPen(QColor(71, 85, 105), 1))
+                painter.drawRoundedRect(row_hit_rect, 6.0, 6.0)
+            elif self.duet_mode and self.duet_setup_mode:
+                painter.setBrush(QColor(24, 29, 38, 140))
+                painter.setPen(QPen(QColor(48, 56, 70, 140), 1))
+                painter.drawRoundedRect(row_hit_rect, 5.0, 5.0)
+
+            # In Duet Mode, draw a clear [A] / [B] / [C] singer badge on the left of the row
+            if self.duet_mode:
+                pill_rect = QRectF(32.0, y_center - 10.0, 30.0, 20.0)
+                if not in_active_pass:
+                    p_bg = QColor(36, 41, 50, 165)
+                    p_bd = QColor(74, 82, 96, 150)
+                    p_fg = QColor(108, 116, 132, 185)
+                elif st_upper == "B":
+                    p_bg = QColor(30, 58, 138, 215)
+                    p_bd = QColor(96, 165, 250)
+                    p_fg = QColor(219, 234, 254)
+                elif st_upper == "C":
+                    p_bg = QColor(88, 28, 135, 215)
+                    p_bd = QColor(192, 132, 252)
+                    p_fg = QColor(243, 232, 255)
+                else:
+                    p_bg = QColor(127, 29, 29, 215)
+                    p_bd = QColor(248, 113, 113)
+                    p_fg = QColor(254, 226, 226)
+                painter.setBrush(p_bg)
+                painter.setPen(QPen(p_bd, 1))
+                painter.drawRoundedRect(pill_rect, 4.0, 4.0)
+                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                painter.setPen(p_fg)
+                painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, f"[{st_upper}]")
+
             font_size = 20 if is_active_line else (14 if rel == 1 else 12)
             font = QFont("Segoe UI", font_size, QFont.Weight.Bold if is_active_line else QFont.Weight.DemiBold)
             painter.setFont(font)
             fm = QFontMetrics(font)
 
-            if is_active_line:
-                hl = QRectF(24.0, y_center - row_step * 0.44, float(w - 48), row_step * 0.88)
-                painter.setBrush(QColor(30, 38, 52, 200))
-                painter.setPen(QPen(QColor(71, 85, 105), 1))
-                painter.drawRoundedRect(hl, 6.0, 6.0)
-
             # Measure total width of syllables so line is centered cleanly
             widths = [fm.horizontalAdvance(s.text) for s in line.syllables]
             total_w = sum(widths)
-            x = max(36.0, (w - total_w) * 0.5)
+            min_x = 70.0 if self.duet_mode else 36.0
+            x = max(min_x, (w - total_w) * 0.5)
             text_y = y_center + fm.ascent() * 0.36
 
             for s_idx, (syl, sw) in enumerate(zip(line.syllables, widths)):
                 coord = (p_i, l_i, s_idx)
-                is_next = coord == self.cursor
+                is_next = (not self.duet_setup_mode) and (coord == self.cursor)
 
                 if is_next:
                     # Clean KBS-style active highlight: plain bright orange text, no underline or box
                     color = QColor(245, 145, 35)
-                elif syl.has_start:
+                elif not in_active_pass:
+                    # Inactive singer style in this round: greyed out just like already-synced words
+                    color = QColor(74, 82, 96, 145 if is_past_line else 195)
+                elif (not self.duet_setup_mode) and syl.has_start:
                     # Done / inactive word: dull dark-mode gray so it recedes into the background
                     color = QColor(74, 82, 96, 150 if is_past_line else 210)
                 else:
-                    # Upcoming unsynced syllables: alternating crisp white / soft sage for slash-split readability
-                    if is_past_line:
+                    if is_past_line and not self.duet_setup_mode:
                         color = QColor(90, 98, 112, 130)
+                    elif self.duet_mode:
+                        # Duet Mode syllable splits:
+                        # [A] Singer 1 = Red/White, [B] Singer 2 = Blue/White, [C] Together = Purple/White
+                        alpha = 255 if is_active_line else (205 if abs(rel) == 1 else 145)
+                        if s_idx % 2 == 0:
+                            color = QColor(244, 246, 252, alpha)
+                        elif st_upper == "B":
+                            color = QColor(105, 180, 255, alpha)
+                        elif st_upper == "C":
+                            color = QColor(198, 142, 255, alpha)
+                        else:
+                            color = QColor(252, 120, 120, alpha)
                     else:
+                        # Solo Mode: alternating crisp white / soft sage for slash-split readability
                         alpha = 255 if is_active_line else (195 if rel == 1 else 130)
                         if s_idx % 2 == 0:
                             color = QColor(238, 242, 248, alpha)
@@ -642,8 +732,10 @@ class _TapWaveformStrip(QWidget):
         painter.fillRect(0, syl_top, w, syl_h, QColor(22, 25, 32))
         painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         ph_int = int(round(self.playhead_cs))
+        duet = self.draft.duet_mode
         for page in self.draft.pages:
             for line in page.lines:
+                st_up = (line.style or "A").upper()
                 for syl in line.syllables:
                     if syl.start_cs is None:
                         continue
@@ -654,10 +746,27 @@ class _TapWaveformStrip(QWidget):
                     x0 = self._cs_to_x(s_cs)
                     x1 = self._cs_to_x(e_cs)
                     bw = max(5.0, x1 - x0)
-                    rect = QRectF(x0, float(syl_top + 2), bw, float(syl_h - 4))
                     is_open = syl.end_cs is None
-                    painter.fillRect(rect, QColor(245, 152, 42) if is_open else QColor(58, 126, 192))
-                    painter.setPen(QPen(QColor(255, 255, 255) if is_open else QColor(140, 190, 235), 1))
+                    if duet:
+                        # Split [A] top / [B] bottom on the strip so overlapping duet vocals stay legible
+                        if st_up == "B":
+                            rect = QRectF(x0, float(syl_top + syl_h * 0.5), bw, float(syl_h * 0.5 - 1))
+                            fill_c = QColor(245, 152, 42) if is_open else QColor(48, 118, 205, 225)
+                            pen_c = QColor(255, 255, 255) if is_open else QColor(147, 197, 253)
+                        elif st_up == "C":
+                            rect = QRectF(x0, float(syl_top + 2), bw, float(syl_h - 4))
+                            fill_c = QColor(245, 152, 42) if is_open else QColor(138, 72, 208, 225)
+                            pen_c = QColor(255, 255, 255) if is_open else QColor(216, 180, 254)
+                        else:
+                            rect = QRectF(x0, float(syl_top + 1), bw, float(syl_h * 0.5 - 1))
+                            fill_c = QColor(245, 152, 42) if is_open else QColor(185, 60, 60, 225)
+                            pen_c = QColor(255, 255, 255) if is_open else QColor(252, 165, 165)
+                    else:
+                        rect = QRectF(x0, float(syl_top + 2), bw, float(syl_h - 4))
+                        fill_c = QColor(245, 152, 42) if is_open else QColor(58, 126, 192)
+                        pen_c = QColor(255, 255, 255) if is_open else QColor(140, 190, 235)
+                    painter.fillRect(rect, fill_c)
+                    painter.setPen(QPen(pen_c, 1))
                     painter.drawRect(rect)
                     painter.setPen(QColor(15, 18, 24) if is_open else QColor(240, 245, 252))
                     painter.drawText(rect.adjusted(2, 0, -2, 0), Qt.AlignmentFlag.AlignCenter, syl.text.strip() or "␣")
@@ -727,6 +836,7 @@ class TapSyncView(QWidget):
         self._item_by_coord: Dict[Tuple[int, int], QTreeWidgetItem] = {}
 
         self._is_syncing: bool = False
+        self._duet_setup_mode: bool = False
         self._dirty: bool = False
         self._locked: bool = False
         self._lock_reason: str = ""
@@ -818,6 +928,21 @@ class TapSyncView(QWidget):
         self._resume_btn.setToolTip("Open Project Organizer — resume saved drafts, clean up old drafts, or export/import .zip bundles")
         self._resume_btn.clicked.connect(self.open_project_organizer)
         lyr_r2.addWidget(self._resume_btn)
+
+        self._duet_btn = QPushButton("🎭 Duet Mode", ribbon)
+        self._duet_btn.setCheckable(True)
+        self._duet_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #6d28d9; color: #ffffff; font-weight: bold; }"
+        )
+        self._duet_btn.setToolTip(
+            "Enable 2-pass Duet Mode:\n"
+            "  [A] Singer 1 (Red/White, default)\n"
+            "  [B] Singer 2 (Blue/White)\n"
+            "  [C] Together (Purple/White)\n"
+            "Syncs [A] + [C] in Round 1, then [B] in Round 2."
+        )
+        self._duet_btn.toggled.connect(self._on_duet_btn_toggled)
+        lyr_r2.addWidget(self._duet_btn)
 
         rl.addLayout(sec_lyr)
         rl.addWidget(_div())
@@ -938,6 +1063,7 @@ class TapSyncView(QWidget):
         self._line_tree.setIndentation(10)
         self._line_tree.setMinimumWidth(220)
         self._line_tree.setMaximumWidth(360)
+        self._line_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._line_tree.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._line_tree.setStyleSheet(
             "QTreeWidget { background-color: #191c22; border: 1px solid #2e3440; font-size: 12px; }"
@@ -953,6 +1079,7 @@ class TapSyncView(QWidget):
 
         self._teleprompter = _RollingTeleprompterWidget(right_box)
         self._teleprompter.end_phrase_requested.connect(self._end_current_phrase)
+        self._teleprompter.line_style_cycle_requested.connect(self._cycle_line_duet_style)
         self._waveform = _TapWaveformStrip(self.audio, right_box)
         self._waveform.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
 
@@ -962,6 +1089,73 @@ class TapSyncView(QWidget):
         splitter.addWidget(self._line_tree)
         splitter.addWidget(right_box)
         splitter.setStretchFactor(1, 1)
+
+        # Duet Mode Setup & Round Switcher Banner
+        self._duet_banner = QFrame(self)
+        self._duet_banner.setObjectName("tapSyncDuetBanner")
+        db_layout = QHBoxLayout(self._duet_banner)
+        db_layout.setContentsMargins(10, 6, 10, 6)
+        db_layout.setSpacing(8)
+        self._duet_info_lbl = QLabel("", self._duet_banner)
+        self._duet_info_lbl.setWordWrap(True)
+        self._duet_info_lbl.setTextFormat(Qt.TextFormat.RichText)
+        db_layout.addWidget(self._duet_info_lbl, 1)
+
+        # Setup-phase style assignment buttons + Ready button
+        self._btn_duet_a = QPushButton("[A] Singer 1", self._duet_banner)
+        self._btn_duet_a.setToolTip("Assign selected line(s) to Singer 1 — Style [A] (Red/White, Round 1)  [Shortcut: 1]")
+        self._btn_duet_a.setStyleSheet(
+            "background-color: #7f1d1d; color: #fecaca; border: 1px solid #f87171; font-weight: bold; padding: 3px 10px;"
+        )
+        self._btn_duet_a.clicked.connect(lambda: self._assign_duet_style_to_selection("A"))
+        db_layout.addWidget(self._btn_duet_a)
+
+        self._btn_duet_b = QPushButton("[B] Singer 2", self._duet_banner)
+        self._btn_duet_b.setToolTip("Assign selected line(s) to Singer 2 — Style [B] (Blue/White, Round 2)  [Shortcut: 2]")
+        self._btn_duet_b.setStyleSheet(
+            "background-color: #1e3a8a; color: #bfdbfe; border: 1px solid #60a5fa; font-weight: bold; padding: 3px 10px;"
+        )
+        self._btn_duet_b.clicked.connect(lambda: self._assign_duet_style_to_selection("B"))
+        db_layout.addWidget(self._btn_duet_b)
+
+        self._btn_duet_c = QPushButton("[C] Together", self._duet_banner)
+        self._btn_duet_c.setToolTip("Assign selected line(s) to Both Singers — Style [C] (Purple/White, Round 1)  [Shortcut: 3]")
+        self._btn_duet_c.setStyleSheet(
+            "background-color: #581c87; color: #e9d5ff; border: 1px solid #c084fc; font-weight: bold; padding: 3px 10px;"
+        )
+        self._btn_duet_c.clicked.connect(lambda: self._assign_duet_style_to_selection("C"))
+        db_layout.addWidget(self._btn_duet_c)
+
+        self._btn_duet_ready = QPushButton("✓ Ready to Sync", self._duet_banner)
+        self._btn_duet_ready.setToolTip("Finish assigning line styles and cue Duet Sync")
+        self._btn_duet_ready.setStyleSheet(
+            "background-color: #15803d; color: #ffffff; font-weight: bold; padding: 4px 14px;"
+        )
+        self._btn_duet_ready.clicked.connect(self.finish_duet_setup)
+        db_layout.addWidget(self._btn_duet_ready)
+
+        # Sync-phase round switcher buttons + Edit Styles button
+        self._btn_pass1 = QPushButton("Round 1: [A] && [C]", self._duet_banner)
+        self._btn_pass1.setCheckable(True)
+        self._btn_pass1.setToolTip("Sync Singer 1 [A] (Red/White) and Together [C] (Purple/White); [B] is greyed out")
+        self._btn_pass1.clicked.connect(lambda: self._set_duet_pass(1, rewind_to_start=False))
+        db_layout.addWidget(self._btn_pass1)
+
+        self._btn_pass2 = QPushButton("Round 2: [B]", self._duet_banner)
+        self._btn_pass2.setCheckable(True)
+        self._btn_pass2.setToolTip("Sync Singer 2 [B] (Blue/White); [A] and [C] are greyed out")
+        self._btn_pass2.clicked.connect(lambda: self._set_duet_pass(2, rewind_to_start=False))
+        db_layout.addWidget(self._btn_pass2)
+
+        self._btn_duet_edit_styles = QPushButton("Edit Line Styles…", self._duet_banner)
+        self._btn_duet_edit_styles.setToolTip("Re-open Duet Setup to adjust [A] / [B] / [C] line assignments")
+        self._btn_duet_edit_styles.setStyleSheet("background-color: #334155; color: #e2e8f0; padding: 3px 10px;")
+        self._btn_duet_edit_styles.clicked.connect(self.enter_duet_setup)
+        db_layout.addWidget(self._btn_duet_edit_styles)
+
+        for db_btn in self._duet_banner.findChildren(QPushButton):
+            db_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._duet_banner.setVisible(False)
 
         # Lock / Freeze banner (shown when Tap Sync is frozen after save/import, or unlocked while editing a synced KBP)
         self._lock_banner = QFrame(self)
@@ -979,6 +1173,7 @@ class TapSyncView(QWidget):
         self._lock_banner.setVisible(False)
 
         root.addWidget(ribbon)
+        root.addWidget(self._duet_banner)
         root.addWidget(self._lock_banner)
         root.addWidget(splitter, 1)
 
@@ -1059,18 +1254,26 @@ class TapSyncView(QWidget):
 
         # Editing / tapping / building controls are enabled whenever unfrozen
         can_edit = not locked
+        in_setup = self.draft.duet_mode and self._duet_setup_mode
+        self._duet_btn.setEnabled(can_edit)
         self._btn_paste.setEnabled(can_edit)
         self._btn_save_draft.setEnabled(can_edit)
-        self._sync_btn.setEnabled(can_edit and not self._is_syncing)
+        self._sync_btn.setEnabled(can_edit and not self._is_syncing and not in_setup)
+        self._sync_btn.setToolTip(
+            "Click '✓ Ready to Sync' in the Duet bar first"
+            if in_setup
+            else "Start or resume tap-syncing from the current cursor (with pre-roll)"
+        )
         self._pause_btn.setEnabled(can_edit and self._is_syncing)
-        self._btn_back_line.setEnabled(can_edit)
-        self._btn_retap.setEnabled(can_edit)
-        self._btn_end_phrase.setEnabled(can_edit)
-        self._btn_undo_tap.setEnabled(can_edit)
+        self._btn_back_line.setEnabled(can_edit and not in_setup)
+        self._btn_retap.setEnabled(can_edit and not in_setup)
+        self._btn_end_phrase.setEnabled(can_edit and not in_setup)
+        self._btn_undo_tap.setEnabled(can_edit and not in_setup)
         self._btn_clear_line.setEnabled(can_edit)
         self._btn_clear_all.setEnabled(can_edit)
         self._tpl_btn.setEnabled(can_edit)
         self._build_btn.setEnabled(can_edit)
+        self._update_duet_ui()
 
         if has_synced:
             self._build_btn.setText("Apply to .kbp →")
@@ -1240,9 +1443,17 @@ class TapSyncView(QWidget):
         self._preroll_spin.blockSignals(False)
         self._refresh_template_btn()
 
+        self._duet_setup_mode = False
+        self._duet_btn.blockSignals(True)
+        self._duet_btn.setChecked(bool(draft.duet_mode))
+        self._duet_btn.blockSignals(False)
+
         self._cursor = draft.first_unsynced_coord()
-        if self._cursor is None and draft.pages and draft.pages[0].lines and draft.pages[0].lines[0].syllables:
-            self._cursor = (0, 0, 0)
+        if self._cursor is None:
+            if draft.duet_mode:
+                self._cursor = draft.first_coord_for_pass(draft.duet_pass)
+            elif draft.pages and draft.pages[0].lines and draft.pages[0].lines[0].syllables:
+                self._cursor = (0, 0, 0)
         self._open_coord = None
         self._last_released_coord = None
         self._punch_line = None
@@ -1259,6 +1470,7 @@ class TapSyncView(QWidget):
                 self.audio.load_vocal_stem(draft.vocal_path)
 
         self._rebuild_tree()
+        self._update_lock_ui()
         self._sync_visuals()
         return main_loaded
 
@@ -1301,7 +1513,22 @@ class TapSyncView(QWidget):
         new_draft.latency_enabled = self._latency_cb.isChecked()
         new_draft.latency_cs = self._latency_spin.value()
         new_draft.pre_roll_cs = int(round(self._preroll_spin.value() * 100))
+        new_draft.duet_mode = self.draft.duet_mode
+        new_draft.duet_pass = self.draft.duet_pass
+        # Preserve existing line styles where line text matches
+        old_styles_by_text: Dict[str, List[str]] = {}
+        for _, _, old_ln in self.draft.flat_lines():
+            if old_ln.style != "A":
+                key = old_ln.full_text.strip()
+                old_styles_by_text.setdefault(key, []).append(old_ln.style)
+        for _, _, new_ln in new_draft.flat_lines():
+            bucket = old_styles_by_text.get(new_ln.full_text.strip())
+            if bucket:
+                new_ln.style = bucket.pop(0)
+        was_setup = self._duet_setup_mode
         self._apply_draft(new_draft, load_audio=False)
+        if was_setup and new_draft.duet_mode:
+            self.enter_duet_setup()
         self._set_dirty(True)
         self._autosave()
         self.setFocus()
@@ -1455,6 +1682,254 @@ class TapSyncView(QWidget):
         self.setFocus()
         return True
 
+    def _on_duet_btn_toggled(self, checked: bool) -> None:
+        self.set_duet_mode(checked, enter_setup=checked)
+
+    def set_duet_mode(self, enabled: bool, enter_setup: bool = True) -> None:
+        if self._is_syncing:
+            self.stop_syncing()
+        val = bool(enabled)
+        if self.draft.duet_mode != val:
+            self.draft.duet_mode = val
+            self._set_dirty(True)
+        self._duet_btn.blockSignals(True)
+        self._duet_btn.setChecked(val)
+        self._duet_btn.blockSignals(False)
+
+        if val:
+            self._duet_setup_mode = bool(enter_setup)
+            self.draft.duet_pass = 1
+            self._cursor = self.draft.first_unsynced_coord_for_pass(1) or self.draft.first_coord_for_pass(1)
+            if self._duet_setup_mode:
+                self._teleprompter.preview_flat_idx = 0 if self.draft.flat_lines() else None
+        else:
+            self._duet_setup_mode = False
+            self._teleprompter.preview_flat_idx = None
+            self._cursor = self.draft.first_unsynced_coord()
+            if self._cursor is None and self.draft.pages and self.draft.pages[0].lines and self.draft.pages[0].lines[0].syllables:
+                self._cursor = (0, 0, 0)
+
+        self._open_coord = None
+        self._punch_line = None
+        self._rebuild_tree()
+        self._update_lock_ui()
+        self._sync_visuals()
+        self.setFocus()
+
+    def enter_duet_setup(self) -> None:
+        if self._locked:
+            return
+        if self._is_syncing:
+            self.stop_syncing()
+        self.draft.duet_mode = True
+        self._duet_setup_mode = True
+        self._duet_btn.blockSignals(True)
+        self._duet_btn.setChecked(True)
+        self._duet_btn.blockSignals(False)
+        self._rebuild_tree()
+        self._update_lock_ui()
+        self._sync_visuals()
+        self.setFocus()
+
+    def finish_duet_setup(self) -> None:
+        """Exit Duet Setup ('✓ Ready to Sync') and cue the next incomplete round."""
+        if not self.draft.duet_mode:
+            return
+        self._duet_setup_mode = False
+        self._teleprompter.preview_flat_idx = None
+        s1, t1 = self.draft.pass_syllable_counts(1)
+        s2, t2 = self.draft.pass_syllable_counts(2)
+        if t1 > 0 and s1 < t1:
+            target_pass = 1
+        elif t2 > 0 and s2 < t2:
+            target_pass = 2
+        else:
+            target_pass = 1 if t1 > 0 else 2
+        self._set_duet_pass(target_pass, rewind_to_start=False)
+        round_desc = "Round 1 ([A] Singer 1 + [C] Together)" if target_pass == 1 else "Round 2 ([B] Singer 2)"
+        self.status_message.emit(f"Duet Mode ready — {round_desc}. Press Space or '● Start Sync' to begin!", 5000)
+
+    def _set_duet_pass(self, duet_pass: int, rewind_to_start: bool = False) -> None:
+        if self._is_syncing:
+            self.stop_syncing()
+        self.draft.duet_pass = 2 if duet_pass == 2 else 1
+        self._duet_setup_mode = False
+        self._teleprompter.preview_flat_idx = None
+        self._cursor = (
+            self.draft.first_unsynced_coord_for_pass(self.draft.duet_pass)
+            or self.draft.first_coord_for_pass(self.draft.duet_pass)
+        )
+        self._open_coord = None
+        self._last_released_coord = None
+        self._punch_line = None
+        self._pending_punch_line = None
+        self._pending_seek_cs = None
+        if rewind_to_start:
+            self.audio.set_position_cs(0.0, scrub_audio=False)
+            self._waveform.playhead_cs = 0.0
+        self._rebuild_tree()
+        self._update_lock_ui()
+        self._sync_visuals()
+        self.setFocus()
+
+    def _assign_duet_style_to_selection(self, style_letter: str, advance_line: bool = False) -> None:
+        if self._locked or not self.draft.pages:
+            return
+        st = style_letter.upper()
+        coords: List[Tuple[int, int]] = []
+        for item in self._line_tree.selectedItems():
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data[1] >= 0:
+                coords.append((data[0], data[1]))
+        if not coords:
+            flat = self.draft.flat_lines()
+            if self._teleprompter.preview_flat_idx is not None and 0 <= self._teleprompter.preview_flat_idx < len(flat):
+                p_i, l_i, _ = flat[self._teleprompter.preview_flat_idx]
+                coords.append((p_i, l_i))
+            else:
+                sel = self._selected_line_coord()
+                if sel is not None:
+                    coords.append(sel)
+        if not coords:
+            return
+
+        changed = False
+        for p_i, l_i in coords:
+            ln = self.draft.pages[p_i].lines[l_i]
+            if ln.style != st:
+                ln.style = st
+                changed = True
+            self._update_tree_line(p_i, l_i)
+        if changed:
+            self._set_dirty(True)
+            self._autosave()
+
+        if advance_line and len(coords) == 1:
+            flat = self.draft.flat_lines()
+            for idx, (p_i, l_i, _) in enumerate(flat):
+                if (p_i, l_i) == coords[0] and idx + 1 < len(flat):
+                    np_i, nl_i, _ = flat[idx + 1]
+                    nxt_item = self._item_by_coord.get((np_i, nl_i))
+                    if nxt_item is not None:
+                        self._line_tree.blockSignals(True)
+                        self._line_tree.clearSelection()
+                        self._line_tree.setCurrentItem(nxt_item)
+                        nxt_item.setSelected(True)
+                        self._line_tree.scrollToItem(nxt_item)
+                        self._line_tree.blockSignals(False)
+                    self._teleprompter.preview_flat_idx = idx + 1
+                    break
+
+        self._update_duet_ui()
+        self._teleprompter.invalidate_cache()
+        self._teleprompter.update()
+        self._waveform.update()
+        self.setFocus()
+
+    def _cycle_line_duet_style(self, p_idx: int, l_idx: int) -> None:
+        if self._locked or not (0 <= p_idx < len(self.draft.pages)):
+            return
+        lines = self.draft.pages[p_idx].lines
+        if not (0 <= l_idx < len(lines)):
+            return
+        ln = lines[l_idx]
+        cur = (ln.style or "A").upper()
+        nxt = "B" if cur == "A" else ("C" if cur == "B" else "A")
+        ln.style = nxt
+        self._set_dirty(True)
+        self._update_tree_line(p_idx, l_idx)
+        item = self._item_by_coord.get((p_idx, l_idx))
+        if item is not None:
+            self._line_tree.blockSignals(True)
+            self._line_tree.clearSelection()
+            self._line_tree.setCurrentItem(item)
+            item.setSelected(True)
+            self._line_tree.scrollToItem(item)
+            self._line_tree.blockSignals(False)
+        self._autosave()
+        self._update_duet_ui()
+        self._teleprompter.invalidate_cache()
+        self._teleprompter.update()
+        self._waveform.update()
+        self.setFocus()
+
+    def _update_duet_ui(self) -> None:
+        if not hasattr(self, "_duet_banner"):
+            return
+        if not self.draft.duet_mode:
+            self._duet_banner.setVisible(False)
+            return
+
+        setup = self._duet_setup_mode
+        can_edit = not self._locked
+        self._btn_duet_a.setVisible(setup)
+        self._btn_duet_b.setVisible(setup)
+        self._btn_duet_c.setVisible(setup)
+        self._btn_duet_ready.setVisible(setup)
+        self._btn_pass1.setVisible(not setup)
+        self._btn_pass2.setVisible(not setup)
+        self._btn_duet_edit_styles.setVisible(not setup)
+
+        for w in (self._btn_duet_a, self._btn_duet_b, self._btn_duet_c, self._btn_duet_ready, self._btn_pass1, self._btn_pass2, self._btn_duet_edit_styles):
+            w.setEnabled(can_edit)
+
+        s1, t1 = self.draft.pass_syllable_counts(1)
+        s2, t2 = self.draft.pass_syllable_counts(2)
+
+        if setup:
+            self._duet_banner.setStyleSheet(
+                "QFrame#tapSyncDuetBanner { background-color: #241934; border: 1px solid #7e22ce; border-radius: 4px; }"
+                "QLabel { color: #f3e8ff; font-size: 11px; }"
+            )
+            self._duet_info_lbl.setText(
+                "<b>🎭 Duet Setup — Assign Singer Styles:</b>  "
+                "<span style='color:#fca5a5;'><b>[A] Singer 1</b> (Red/White, default)</span> · "
+                "<span style='color:#93c5fd;'><b>[B] Singer 2</b> (Blue/White)</span> · "
+                "<span style='color:#d8b4fe;'><b>[C] Sung Together</b> (Purple/White)</span><br>"
+                "Click lines on the teleprompter to cycle <b>[A]→[B]→[C]</b>, or select lines on the left (keys <b>1</b>, <b>2</b>, <b>3</b>), "
+                "then click <b>✓ Ready to Sync</b>."
+            )
+        else:
+            p = self.draft.duet_pass
+            self._duet_banner.setStyleSheet(
+                "QFrame#tapSyncDuetBanner { background-color: #1b2232; border: 1px solid #475569; border-radius: 4px; }"
+                "QLabel { color: #e2e8f0; font-size: 11px; }"
+            )
+            if p == 1:
+                self._duet_info_lbl.setText(
+                    "<b>🎭 Duet Mode — Round 1 Active:</b>  Syncing "
+                    "<span style='color:#fca5a5;'><b>[A] Singer 1</b> (Red/White)</span> &amp; "
+                    "<span style='color:#d8b4fe;'><b>[C] Together</b> (Purple/White)</span> · "
+                    "<span style='color:#94a3b8;'>[B] Singer 2 is greyed out for Round 2.</span>"
+                )
+            else:
+                self._duet_info_lbl.setText(
+                    "<b>🎭 Duet Mode — Round 2 Active:</b>  Syncing "
+                    "<span style='color:#93c5fd;'><b>[B] Singer 2</b> (Blue/White)</span> · "
+                    "<span style='color:#94a3b8;'>[A] Singer 1 &amp; [C] Together are greyed out.</span>"
+                )
+            self._btn_pass1.blockSignals(True)
+            self._btn_pass1.setChecked(p == 1)
+            self._btn_pass1.setText(f"Round 1: [A] && [C] ({s1}/{t1})")
+            self._btn_pass1.setStyleSheet(
+                "background-color: #6d28d9; color: #ffffff; font-weight: bold; padding: 3px 10px;"
+                if p == 1
+                else "background-color: #27303f; color: #cbd5e1; padding: 3px 10px;"
+            )
+            self._btn_pass1.blockSignals(False)
+
+            self._btn_pass2.blockSignals(True)
+            self._btn_pass2.setChecked(p == 2)
+            self._btn_pass2.setText(f"Round 2: [B] ({s2}/{t2})")
+            self._btn_pass2.setStyleSheet(
+                "background-color: #1d4ed8; color: #ffffff; font-weight: bold; padding: 3px 10px;"
+                if p == 2
+                else "background-color: #27303f; color: #cbd5e1; padding: 3px 10px;"
+            )
+            self._btn_pass2.blockSignals(False)
+
+        self._duet_banner.setVisible(True)
+
     def _rebuild_tree(self) -> None:
         self._line_tree.blockSignals(True)
         self._line_tree.clear()
@@ -1478,15 +1953,36 @@ class TapSyncView(QWidget):
         self._line_tree.blockSignals(False)
         self._highlight_cursor_in_tree()
 
-    @staticmethod
-    def _format_tree_line(line: TapLine) -> str:
+    def _format_tree_line(self, line: TapLine) -> str:
         st = line.sync_state
         dot = "●" if st == "full" else ("◐" if st == "partial" else "○")
-        return f"{dot} {line.full_text.strip() or '(empty)'}"
+        txt = line.full_text.strip() or "(empty)"
+        if self.draft.duet_mode:
+            return f"{dot} [{(line.style or 'A').upper()}] {txt}"
+        return f"{dot} {txt}"
 
-    @staticmethod
-    def _style_tree_item(item: QTreeWidgetItem, line: TapLine) -> None:
+    def _style_tree_item(self, item: QTreeWidgetItem, line: TapLine) -> None:
         st = line.sync_state
+        if self.draft.duet_mode:
+            letter = (line.style or "A").upper()
+            in_pass = True if self._duet_setup_mode else self.draft.is_line_in_pass(line, self.draft.duet_pass)
+            if not in_pass:
+                item.setForeground(0, QBrush(QColor(100, 110, 126)))
+                return
+            if not self._duet_setup_mode and st == "full":
+                item.setForeground(0, QBrush(QColor(110, 231, 183)))
+                return
+            if not self._duet_setup_mode and st == "partial":
+                item.setForeground(0, QBrush(QColor(251, 191, 36)))
+                return
+            if letter == "B":
+                item.setForeground(0, QBrush(QColor(147, 197, 253)))
+            elif letter == "C":
+                item.setForeground(0, QBrush(QColor(216, 180, 254)))
+            else:
+                item.setForeground(0, QBrush(QColor(252, 165, 165)))
+            return
+
         if st == "full":
             item.setForeground(0, QBrush(QColor(110, 231, 183)))
         elif st == "partial":
@@ -1524,6 +2020,30 @@ class TapSyncView(QWidget):
         if self._is_syncing:
             self.stop_syncing()
         line = self.draft.pages[p_idx].lines[l_idx]
+
+        if self.draft.duet_mode and self._duet_setup_mode:
+            flat = self.draft.flat_lines()
+            for idx, (fp, fl, _) in enumerate(flat):
+                if (fp, fl) == (p_idx, l_idx):
+                    self._teleprompter.preview_flat_idx = idx
+                    break
+            self._teleprompter.update()
+            self.setFocus()
+            return
+
+        if self.draft.duet_mode and not self.draft.is_line_in_pass(line):
+            # Preview greyed-out line from the other singer without moving the active-pass cursor onto it
+            flat = self.draft.flat_lines()
+            for idx, (fp, fl, _) in enumerate(flat):
+                if (fp, fl) == (p_idx, l_idx):
+                    self._teleprompter.preview_flat_idx = idx
+                    break
+            if line.first_start_cs is not None:
+                self.playhead_scrubbed.emit(float(max(0, line.first_start_cs - self.draft.pre_roll_cs)))
+            self._teleprompter.update()
+            self.setFocus()
+            return
+
         # Place cursor on first unsynced syllable in this line (or syllable 0 if already synced)
         s_idx = next((i for i, s in enumerate(line.syllables) if not s.has_start), 0)
         self._cursor = (p_idx, l_idx, s_idx)
@@ -1540,11 +2060,16 @@ class TapSyncView(QWidget):
         self._teleprompter.open_coord = self._open_coord
         self._teleprompter.is_syncing = self._is_syncing
         self._teleprompter.is_locked = self._locked
+        self._teleprompter.duet_mode = self.draft.duet_mode
+        self._teleprompter.duet_pass = self.draft.duet_pass
+        self._teleprompter.duet_setup_mode = self._duet_setup_mode
         self._teleprompter.punch_line = self._punch_line
         self._teleprompter.invalidate_cache()
         self._teleprompter.update()
         self._waveform.update()
-        self._highlight_cursor_in_tree()
+        self._update_duet_ui()
+        if not self._duet_setup_mode:
+            self._highlight_cursor_in_tree()
 
     def _selected_line_coord(self) -> Optional[Tuple[int, int]]:
         cur = self._line_tree.currentItem()
@@ -1576,14 +2101,14 @@ class TapSyncView(QWidget):
         lines = pages[p_i].lines
         if not (0 <= l_i < len(lines)):
             return None
-        if s_i + 1 < len(lines[l_i].syllables):
+        if self.draft.is_line_in_pass(lines[l_i]) and s_i + 1 < len(lines[l_i].syllables):
             return (p_i, l_i, s_i + 1)
         for nl_i in range(l_i + 1, len(lines)):
-            if lines[nl_i].syllables:
+            if lines[nl_i].syllables and self.draft.is_line_in_pass(lines[nl_i]):
                 return (p_i, nl_i, 0)
         for np_i in range(p_i + 1, len(pages)):
             for nl_i, nline in enumerate(pages[np_i].lines):
-                if nline.syllables:
+                if nline.syllables and self.draft.is_line_in_pass(nline):
                     return (np_i, nl_i, 0)
         return None
 
@@ -1595,15 +2120,15 @@ class TapSyncView(QWidget):
         lines = pages[p_i].lines
         if not (0 <= l_i < len(lines)):
             return None
-        if s_i > 0:
+        if self.draft.is_line_in_pass(lines[l_i]) and s_i > 0:
             return (p_i, l_i, s_i - 1)
         for pl_i in range(l_i - 1, -1, -1):
-            if lines[pl_i].syllables:
+            if lines[pl_i].syllables and self.draft.is_line_in_pass(lines[pl_i]):
                 return (p_i, pl_i, len(lines[pl_i].syllables) - 1)
         for pp_i in range(p_i - 1, -1, -1):
             plines = pages[pp_i].lines
             for pl_i in range(len(plines) - 1, -1, -1):
-                if plines[pl_i].syllables:
+                if plines[pl_i].syllables and self.draft.is_line_in_pass(plines[pl_i]):
                     return (pp_i, pl_i, len(plines[pl_i].syllables) - 1)
         return None
 
@@ -1613,15 +2138,18 @@ class TapSyncView(QWidget):
         return max(0, raw - offset)
 
     def _pre_roll_start_for(self, coord: Tuple[int, int, int]) -> Optional[float]:
-        """Compute a comfortable pre-roll playback start position before `coord`."""
+        """Compute a comfortable pre-roll playback start position before `coord` (within active pass)."""
         prev_time: Optional[int] = None
         for p_i, page in enumerate(self.draft.pages):
             for l_i, line in enumerate(page.lines):
+                in_pass = self.draft.is_line_in_pass(line)
                 for s_i, syl in enumerate(line.syllables):
                     if (p_i, l_i, s_i) == coord:
                         if prev_time is not None:
                             return float(max(0, prev_time - self.draft.pre_roll_cs))
                         return None
+                    if not in_pass:
+                        continue
                     if syl.end_cs is not None:
                         prev_time = syl.end_cs
                     elif syl.start_cs is not None:
@@ -1631,10 +2159,23 @@ class TapSyncView(QWidget):
         return None
 
     def start_syncing(self, punch_line: Optional[Tuple[int, int]] = None, seek_cs: Optional[float] = None) -> None:
-        if self._locked or not self.draft.pages:
+        if self._locked or not self.draft.pages or (self.draft.duet_mode and self._duet_setup_mode):
             return
         if self._cursor is None:
-            self._cursor = self.draft.first_unsynced_coord() or (0, 0, 0)
+            if self.draft.duet_mode:
+                self._cursor = (
+                    self.draft.first_unsynced_coord_for_pass(self.draft.duet_pass)
+                    or self.draft.first_coord_for_pass(self.draft.duet_pass)
+                )
+            else:
+                self._cursor = self.draft.first_unsynced_coord() or (0, 0, 0)
+        if self._cursor is None:
+            QMessageBox.information(
+                self,
+                "No Lines in Round",
+                "There are no lines assigned to this Duet round. Click 'Edit Line Styles…' or switch rounds.",
+            )
+            return
         if punch_line is None and self._pending_punch_line is not None:
             punch_line = self._pending_punch_line
         if seek_cs is None and self._pending_seek_cs is not None:
@@ -1693,13 +2234,17 @@ class TapSyncView(QWidget):
             self.start_syncing()
 
     def start_retap_selected_line(self) -> None:
-        if self._locked:
+        if self._locked or (self.draft.duet_mode and self._duet_setup_mode):
             return
         coord = self._selected_line_coord()
         if coord is None:
             return
         p_i, l_i = coord
         line = self.draft.pages[p_i].lines[l_i]
+        if self.draft.duet_mode and not self.draft.is_line_in_pass(line):
+            # Automatically switch to this line's duet pass when explicitly re-tapping it
+            self.draft.duet_pass = 2 if (line.style or "A").upper() == "B" else 1
+            self._rebuild_tree()
         old_start = line.first_start_cs
         line.clear_timing()
         self._set_dirty(True)
@@ -1736,9 +2281,9 @@ class TapSyncView(QWidget):
         - Rewinds to the end of the previous synced line (minus pre-roll) and either plays
           immediately or pauses depending on 'Play immediately on re-tap'.
         """
-        if self._locked:
+        if self._locked or (self.draft.duet_mode and self._duet_setup_mode):
             return
-        flat_lines = self.draft.flat_lines()
+        flat_lines = [entry for entry in self.draft.flat_lines() if self.draft.is_line_in_pass(entry[2])]
         if not flat_lines:
             return
 
@@ -1874,6 +2419,7 @@ class TapSyncView(QWidget):
         if cur_syl is None:
             self.stop_syncing()
             return
+        self._teleprompter.preview_flat_idx = None
 
         cur_syl.start_cs = now_cs
         cur_syl.end_cs = None
@@ -1915,9 +2461,29 @@ class TapSyncView(QWidget):
                 self._cursor = self.draft.first_unsynced_coord()
                 self._sync_visuals()
             elif finished_song:
-                self._prompt_build_after_finish()
+                self._on_pass_or_song_finished()
             return
         self._sync_visuals()
+
+    def _on_pass_or_song_finished(self) -> None:
+        if self.draft.duet_mode:
+            other_pass = 2 if self.draft.duet_pass == 1 else 1
+            other_synced, other_total = self.draft.pass_syllable_counts(other_pass)
+            if other_total > 0 and other_synced < other_total:
+                cur_lbl = "Round 1 ([A] Singer 1 & [C] Together)" if self.draft.duet_pass == 1 else "Round 2 ([B] Singer 2)"
+                nxt_lbl = "Round 2 ([B] Singer 2)" if other_pass == 2 else "Round 1 ([A] Singer 1 & [C] Together)"
+                reply = QMessageBox.question(
+                    self,
+                    "Duet Round Complete",
+                    f"{cur_lbl} is complete!\n\n"
+                    f"Rewind to the start and switch to {nxt_lbl} ({other_total - other_synced} syllables remaining)?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._set_duet_pass(other_pass, rewind_to_start=True)
+                return
+        self._prompt_build_after_finish()
 
     def _prompt_build_after_finish(self) -> None:
         reply = QMessageBox.question(
@@ -1931,13 +2497,19 @@ class TapSyncView(QWidget):
             self._build_kbp()
 
     def _undo_last_tap(self) -> None:
-        if self._locked:
+        if self._locked or (self.draft.duet_mode and self._duet_setup_mode):
             return
         target = self._open_coord
         if target is None and self._cursor is not None:
             target = self._prev_coord(self._cursor)
         elif target is None:
-            flat = self.draft.flat_syllables()
+            flat = [
+                (p_i, l_i, s_i, syl)
+                for p_i, page in enumerate(self.draft.pages)
+                for l_i, ln in enumerate(page.lines)
+                if self.draft.is_line_in_pass(ln)
+                for s_i, syl in enumerate(ln.syllables)
+            ]
             if flat:
                 p_i, l_i, s_i, _ = flat[-1]
                 target = (p_i, l_i, s_i)
@@ -1996,6 +2568,49 @@ class TapSyncView(QWidget):
                 return
             super().keyPressEvent(event)
             return
+        if self.draft.duet_mode and self._duet_setup_mode:
+            if key in (Qt.Key.Key_1, Qt.Key.Key_A):
+                self._assign_duet_style_to_selection("A", advance_line=True)
+                event.accept()
+                return
+            if key in (Qt.Key.Key_2, Qt.Key.Key_B):
+                self._assign_duet_style_to_selection("B", advance_line=True)
+                event.accept()
+                return
+            if key in (Qt.Key.Key_3, Qt.Key.Key_C):
+                self._assign_duet_style_to_selection("C", advance_line=True)
+                event.accept()
+                return
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.finish_duet_setup()
+                event.accept()
+                return
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                flat = self.draft.flat_lines()
+                if flat:
+                    step = -1 if key == Qt.Key.Key_Up else 1
+                    cur_i = self._teleprompter.preview_flat_idx if self._teleprompter.preview_flat_idx is not None else 0
+                    nxt_i = max(0, min(len(flat) - 1, cur_i + step))
+                    self._teleprompter.preview_flat_idx = nxt_i
+                    np_i, nl_i, _ = flat[nxt_i]
+                    item = self._item_by_coord.get((np_i, nl_i))
+                    if item is not None:
+                        self._line_tree.blockSignals(True)
+                        self._line_tree.clearSelection()
+                        self._line_tree.setCurrentItem(item)
+                        item.setSelected(True)
+                        self._line_tree.scrollToItem(item)
+                        self._line_tree.blockSignals(False)
+                    self._teleprompter.update()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Space:
+                self.audio.toggle_play()
+                event.accept()
+                return
+            super().keyPressEvent(event)
+            return
+
         if key == Qt.Key.Key_Space:
             if self._is_syncing:
                 self._tap_next_syllable()
@@ -2056,7 +2671,7 @@ class TapSyncView(QWidget):
                         self._cursor = self.draft.first_unsynced_coord()
                         self._sync_visuals()
                     else:
-                        self._prompt_build_after_finish()
+                        self._on_pass_or_song_finished()
                     event.accept()
                     return
                 self._sync_visuals()
