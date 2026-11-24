@@ -37,3 +37,6 @@ Thumbs.db
 desktop.ini
 .DS_Store
 *.log
+
+# Local batch scripts
+*.bat
