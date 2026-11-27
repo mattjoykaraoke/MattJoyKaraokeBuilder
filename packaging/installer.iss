@@ -2,7 +2,7 @@
 ; Version is passed automatically by build_installer.bat via /DMyAppVersion=X.Y.Z
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.1.1"
+  #define MyAppVersion "1.1.2"
 #endif
 
 #define MyAppName "Matt Joy Karaoke Builder"

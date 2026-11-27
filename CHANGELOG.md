@@ -5,6 +5,16 @@ All notable changes to **Matt Joy Karaoke Builder** will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-27
+
+### Changed
+- **Instant Low-Latency `1.0x` Audio Playback:**
+  - Replaced `QMediaPlayer` for `1.0x` playback with a persistent, pre-warmed `QAudioSink` streaming full-quality in-memory int16 PCM (`25 ms` hardware buffer), enabling sub-millisecond play/pause, instant range previews, seamless main/vocal audio switching, and zero-debounce seeking without WASAPI reopen delays.
+  - Upgraded playhead clock tracking to ~120 fps (`8 ms` polling) using hardware-interpolated `processedUSecs()`, and tightened `QMediaPlayer` warm-up and phase-lock slew when playing at slower speeds (`50%` / `75%`).
+- **Optimized 120 fps Timeline & Minimap Rendering:**
+  - Switched playhead updates on **Lyrics Wiping**, **Display / Remove Window**, and the **Song Minimap** from full-widget repaints to targeted dirty-strip redraws around the old and new playhead positions, skipping sub-pixel no-ops.
+  - Clipped **Lyrics Wiping** grid and time-ruler painting to the active repaint region and deduplicated transport time-label text updates.
+
 ## [1.1.1] - 2026-11-24
 
 ### Added
