@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import QSettings, Qt, QLineF, QRectF, Signal
+from PySide6.QtCore import QRect, QSettings, Qt, QLineF, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -639,13 +639,22 @@ class DisplayRemoveView(QWidget):
         self._sync_duet_controls()
 
     def set_playhead_cs(self, cs: float, follow_if_playing: bool = False) -> None:
+        old_x = self.canvas.cs_to_x(self.canvas.playhead_cs)
         self.canvas.playhead_cs = cs
         if follow_if_playing and self._follow_cb.isChecked():
             span = self.canvas.view_span_cs()
             if cs > self.canvas.scroll_x_cs + span * 0.85 or cs < self.canvas.scroll_x_cs:
                 self.canvas.set_scroll_x_cs(cs - span * 0.15)
                 return
-        self.canvas.update()
+        new_x = self.canvas.cs_to_x(cs)
+        if abs(new_x - old_x) < 0.25:
+            return
+        h = self.canvas.height()
+        w = self.canvas.width()
+        for px in (old_x, new_x):
+            left = max(0, int(px) - 6)
+            if left < w:
+                self.canvas.update(QRect(left, 0, min(14, w - left), h))
 
     def set_selection(self, page_idx: int, line_idx: int, scroll_to: bool = False) -> None:
         self.canvas.selected_page = page_idx

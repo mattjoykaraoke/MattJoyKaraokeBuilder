@@ -30,6 +30,7 @@ htmlcov/
 
 # IDE & OS files
 .vscode/
+*.code-workspace
 .idea/
 *.swp
 *.swo

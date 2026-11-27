@@ -555,7 +555,10 @@ class MainWindow(QMainWindow):
 
     def _on_playhead_moved(self, cs: float) -> None:
         playing = self.audio.is_playing
-        self._time_lbl.setText(format_time_cs(cs, include_cs_suffix=True))
+        lbl_text = format_time_cs(cs, include_cs_suffix=True)
+        if getattr(self, "_last_time_lbl_text", None) != lbl_text:
+            self._last_time_lbl_text = lbl_text
+            self._time_lbl.setText(lbl_text)
         if self._tabs.currentWidget() is self.display_view:
             self.display_view.set_playhead_cs(cs, follow_if_playing=playing)
         elif self._tabs.currentWidget() is self.tap_sync_view:

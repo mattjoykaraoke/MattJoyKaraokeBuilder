@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from PySide6.QtCore import Qt, QLineF, QRectF, Signal
+from PySide6.QtCore import QRect, Qt, QLineF, QRectF, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
@@ -56,8 +56,17 @@ class SongMinimapWidget(QWidget):
 
     def set_playhead_cs(self, cs: float) -> None:
         if abs(cs - self.playhead_cs) > 1e-3:
+            old_px = self.cs_to_x(self.playhead_cs)
             self.playhead_cs = cs
-            self.update()
+            new_px = self.cs_to_x(cs)
+            if abs(new_px - old_px) < 0.5:
+                return
+            w = self.width()
+            h = self.height()
+            for px in (old_px, new_px):
+                left = max(0, int(px) - 4)
+                if left < w:
+                    self.update(QRect(left, 0, min(10, w - left), h))
 
     def set_viewport(self, start_cs: float, span_cs: float) -> None:
         self.view_start_cs = max(0.0, start_cs)

@@ -10,8 +10,73 @@ from PySide6.QtCore import QIODevice, QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudioFormat, QAudioOutput, QAudioSink, QMediaDevices, QMediaPlayer
 
 
+class _PcmStreamDevice(QIODevice):
+    """Always-open sequential PCM stream so QAudioSink can suspend/resume in <0.3 ms without reopening WASAPI."""
+
+    def __init__(self, data: bytes, sr: int, channels: int, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._data: bytes = data
+        self._mv = memoryview(data)
+        self.sr: int = max(1, sr)
+        self.channels: int = max(1, channels)
+        self.frame_bytes: int = self.channels * 2
+        self.pos_bytes: int = 0
+        self.eof: bool = False
+        self.open(QIODevice.OpenModeFlag.ReadOnly)
+
+    @property
+    def duration_ms(self) -> float:
+        total_frames = len(self._mv) // self.frame_bytes
+        return (total_frames / self.sr) * 1000.0
+
+    def set_data(self, data: bytes, sr: int, channels: int) -> None:
+        self._data = data
+        self._mv = memoryview(data)
+        self.sr = max(1, sr)
+        self.channels = max(1, channels)
+        self.frame_bytes = self.channels * 2
+        self.pos_bytes = min(self.pos_bytes, len(self._mv))
+        self.eof = False
+
+    def seek_ms(self, pos_ms: float) -> float:
+        total_frames = len(self._mv) // self.frame_bytes
+        frame = max(0, min(total_frames, int(round((pos_ms / 1000.0) * self.sr))))
+        self.pos_bytes = frame * self.frame_bytes
+        self.eof = frame >= total_frames
+        return (frame / self.sr) * 1000.0
+
+    def isSequential(self) -> bool:
+        return True
+
+    def bytesAvailable(self) -> int:
+        # Always report data available so QAudioSink stays active/suspended and never needs a slow reopen
+        return max(32768, len(self._mv) - self.pos_bytes) + super().bytesAvailable()
+
+    def readData(self, maxlen: int) -> bytes:
+        if maxlen <= 0:
+            return b""
+        # Keep frame alignment
+        req = (maxlen // self.frame_bytes) * self.frame_bytes
+        if req <= 0:
+            return b""
+        rem = len(self._mv) - self.pos_bytes
+        if rem <= 0:
+            self.eof = True
+            return bytes(req)
+        n = min(req, rem)
+        chunk = self._mv[self.pos_bytes : self.pos_bytes + n].tobytes()
+        self.pos_bytes += n
+        if n < req:
+            self.eof = True
+            chunk += bytes(req - n)
+        return chunk
+
+    def writeData(self, data) -> int:
+        return -1
+
+
 class WaveformData:
-    """Precomputed peak envelope + compact mono int16 PCM buffer for low-latency audio scrubbing."""
+    """Precomputed peak envelope + compact mono int16 PCM buffer for low-latency scrubbing & playback."""
 
     def __init__(
         self,
@@ -20,12 +85,18 @@ class WaveformData:
         buckets_per_sec: int = 200,
         scrub_pcm: Optional[np.ndarray] = None,
         scrub_sr: int = 22050,
+        play_pcm: Optional[bytes] = None,
+        play_sr: int = 44100,
+        play_channels: int = 2,
     ) -> None:
         self.peaks = peaks  # float32 array in [0.0, 1.0]
         self.duration_cs = duration_cs
         self.buckets_per_sec = buckets_per_sec
         self.scrub_pcm = scrub_pcm  # optional 1D int16 mono PCM for instant scrubbing
         self.scrub_sr = scrub_sr
+        self.play_pcm = play_pcm  # interleaved int16 PCM for instant low-latency QAudioSink playback
+        self.play_sr = play_sr
+        self.play_channels = play_channels
 
     @classmethod
     def from_file(cls, path: str | Path, buckets_per_sec: int = 200) -> "WaveformData":
@@ -53,12 +124,24 @@ class WaveformData:
             scrub_sr = sr
         scrub_pcm = np.clip(pcm_f * 32767.0, -32768.0, 32767.0).astype(np.int16)
 
+        # Full-quality int16 PCM buffer for instant-start, sample-accurate 1.0x QAudioSink playback
+        play_pcm: Optional[bytes] = None
+        play_channels = min(2, data.shape[1]) if data.ndim == 2 else 1
+        if duration_sec <= 1200.0 and total_samples > 0 and sr > 0:
+            play_arr = data[:, :play_channels] if data.ndim == 2 else data
+            play_pcm = np.ascontiguousarray(
+                np.clip(play_arr * 32767.0, -32768.0, 32767.0).astype(np.int16)
+            ).tobytes()
+
         return cls(
             peaks=peaks.astype(np.float32),
             duration_cs=duration_cs,
             buckets_per_sec=buckets_per_sec,
             scrub_pcm=scrub_pcm,
             scrub_sr=int(scrub_sr),
+            play_pcm=play_pcm,
+            play_sr=int(sr),
+            play_channels=int(play_channels),
         )
 
 
@@ -108,6 +191,18 @@ class AudioEngine(QObject):
         self._seek_debounce_timer.setInterval(35)
         self._seek_debounce_timer.timeout.connect(self._flush_pending_seek)
 
+        # Persistent pre-warmed PCM sink (1.0x via QAudioSink suspend/resume -> <0.3 ms play/pause)
+        self._pcm_sink: Optional[QAudioSink] = None
+        self._pcm_stream: Optional[_PcmStreamDevice] = None
+        self._pcm_sink_sr: int = 0
+        self._pcm_sink_ch: int = 0
+        self._pcm_active: bool = False
+        self._pcm_start_ms: float = 0.0
+        self._pcm_base_processed_us: int = 0
+        self._pcm_hw_pos_ms: float = 0.0
+        self._pcm_hw_wall: float = 0.0
+        self._pcm_duration_ms: float = 0.0
+
         # Low-latency scrub audio output
         self.scrub_audio_enabled: bool = False
         self._scrub_sink: Optional[QAudioSink] = None
@@ -118,7 +213,7 @@ class AudioEngine(QObject):
         self._stop_at_cs: Optional[float] = None
         self._poll_timer = QTimer(self)
         self._poll_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._poll_timer.setInterval(16)  # ~60 fps
+        self._poll_timer.setInterval(8)  # ~120 fps for crisp playhead tracking
         self._poll_timer.timeout.connect(self._on_poll)
 
         self._player.playbackStateChanged.connect(self._on_playback_state)
@@ -170,6 +265,8 @@ class AudioEngine(QObject):
         self.main_waveform = None
         if not self.use_vocal_audio:
             self._player.setSource(QUrl())
+            if self.vocal_waveform is None:
+                self._teardown_pcm()
         self.duration_cs = self.vocal_waveform.duration_cs if self.vocal_waveform is not None else 0
         self.waveform_loaded.emit()
 
@@ -185,6 +282,8 @@ class AudioEngine(QObject):
                 self._player.setSource(QUrl.fromLocalFile(str(self.main_path)))
             else:
                 self._player.setSource(QUrl())
+        if self.main_waveform is None:
+            self._teardown_pcm()
         self.duration_cs = self.main_waveform.duration_cs if self.main_waveform is not None else 0
         self.waveform_loaded.emit()
 
@@ -201,6 +300,7 @@ class AudioEngine(QObject):
         self.duration_cs = wf.duration_cs
         if not self.use_vocal_audio:
             self._player.setSource(QUrl.fromLocalFile(str(p)))
+            self._ensure_pcm_sink(wf)
         self.waveform_loaded.emit()
         return True
 
@@ -218,25 +318,30 @@ class AudioEngine(QObject):
             self.duration_cs = wf.duration_cs
         if self.use_vocal_audio:
             self._player.setSource(QUrl.fromLocalFile(str(p)))
+            self._ensure_pcm_sink(wf)
         self.waveform_loaded.emit()
         return True
 
     def set_use_vocal_audio(self, enabled: bool) -> None:
-        pos_ms = int(round(self.smooth_position_cs * 10.0))
+        pos_ms = self.smooth_position_cs * 10.0
         was_playing = self.is_playing
         if enabled and self.vocal_path and self.vocal_path.exists():
             self.use_vocal_audio = True
             self._player.setSource(QUrl.fromLocalFile(str(self.vocal_path)))
-            self._player.setPosition(pos_ms)
-            self._reanchor(float(pos_ms))
-            if was_playing:
-                self._player.play()
         elif not enabled and self.main_path and self.main_path.exists():
             self.use_vocal_audio = False
             self._player.setSource(QUrl.fromLocalFile(str(self.main_path)))
-            self._player.setPosition(pos_ms)
-            self._reanchor(float(pos_ms))
-            if was_playing:
+        else:
+            return
+        self._reanchor(pos_ms)
+        if was_playing:
+            if self._can_use_pcm() and self._start_pcm_at(pos_ms):
+                self._player.pause()
+                if not self._poll_timer.isActive():
+                    self._poll_timer.start()
+            else:
+                self._stop_pcm()
+                self._player.setPosition(int(round(pos_ms)))
                 self._player.play()
 
     @property
@@ -248,7 +353,8 @@ class AudioEngine(QObject):
     @property
     def is_playing(self) -> bool:
         return (
-            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            self._pcm_active
+            or self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
             or self._poll_timer.isActive()
         )
 
@@ -261,6 +367,110 @@ class AudioEngine(QObject):
     @property
     def position_cs(self) -> int:
         return int(round(self.smooth_position_cs))
+
+    def _can_use_pcm(self) -> bool:
+        wf = self.active_waveform
+        return (
+            abs(self._rate - 1.0) < 1e-3
+            and wf is not None
+            and wf.play_pcm is not None
+            and wf.play_sr > 0
+            and wf.play_channels > 0
+        )
+
+    def _teardown_pcm(self) -> None:
+        self._pcm_active = False
+        if self._pcm_sink is not None:
+            try:
+                self._pcm_sink.stop()
+            except Exception:
+                pass
+            self._pcm_sink.deleteLater()
+            self._pcm_sink = None
+        if self._pcm_stream is not None:
+            try:
+                self._pcm_stream.close()
+            except Exception:
+                pass
+            self._pcm_stream.deleteLater()
+            self._pcm_stream = None
+        self._pcm_sink_sr = 0
+        self._pcm_sink_ch = 0
+
+    def _stop_pcm(self) -> None:
+        """Suspend the pre-warmed QAudioSink in ~0.2 ms without closing the WASAPI device."""
+        self._pcm_active = False
+        if self._pcm_sink is not None:
+            try:
+                self._pcm_sink.suspend()
+            except Exception:
+                pass
+
+    def _ensure_pcm_sink(self, wf: Optional[WaveformData]) -> bool:
+        """Open & suspend a persistent QAudioSink once per audio format so Play/Pause/Seek take <0.3 ms."""
+        if wf is None or wf.play_pcm is None or wf.play_sr <= 0 or wf.play_channels <= 0:
+            return False
+        if (
+            self._pcm_sink is not None
+            and self._pcm_stream is not None
+            and self._pcm_sink_sr == wf.play_sr
+            and self._pcm_sink_ch == wf.play_channels
+        ):
+            if self._pcm_stream._data is not wf.play_pcm:
+                self._pcm_stream.set_data(wf.play_pcm, wf.play_sr, wf.play_channels)
+            return True
+
+        self._teardown_pcm()
+        try:
+            dev = QMediaDevices.defaultAudioOutput()
+            if dev.isNull():
+                return False
+            fmt = QAudioFormat()
+            fmt.setSampleRate(wf.play_sr)
+            fmt.setChannelCount(wf.play_channels)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+
+            stream = _PcmStreamDevice(wf.play_pcm, wf.play_sr, wf.play_channels, self)
+            sink = QAudioSink(dev, fmt, self)
+            sink.setVolume(self._output.volume())
+            # 25 ms hardware buffer for instantaneous start/stop without underruns
+            sink.setBufferSize(max(2048, int(wf.play_sr * wf.play_channels * 2 * 0.025)))
+            sink.start(stream)
+            sink.suspend()
+
+            self._pcm_stream = stream
+            self._pcm_sink = sink
+            self._pcm_sink_sr = wf.play_sr
+            self._pcm_sink_ch = wf.play_channels
+            self._pcm_active = False
+            return True
+        except Exception:
+            self._teardown_pcm()
+            return False
+
+    def _start_pcm_at(self, pos_ms: float) -> bool:
+        wf = self.active_waveform
+        if not self._ensure_pcm_sink(wf) or self._pcm_sink is None or self._pcm_stream is None:
+            return False
+        try:
+            actual_start_ms = self._pcm_stream.seek_ms(pos_ms)
+            self._pcm_sink.setVolume(self._output.volume())
+            self._pcm_base_processed_us = int(self._pcm_sink.processedUSecs())
+            if not self._pcm_active:
+                self._pcm_sink.resume()
+
+            now = time.perf_counter()
+            self._pcm_active = True
+            self._pcm_start_ms = actual_start_ms
+            self._pcm_hw_pos_ms = actual_start_ms
+            self._pcm_hw_wall = now
+            self._pcm_duration_ms = self._pcm_stream.duration_ms
+            self._reanchor(actual_start_ms)
+            self._awaiting_audio_start = False
+            return True
+        except Exception:
+            self._teardown_pcm()
+            return False
 
     def set_scrub_audio_enabled(self, enabled: bool) -> None:
         self.scrub_audio_enabled = bool(enabled)
@@ -341,15 +551,28 @@ class AudioEngine(QObject):
         self._seek_target_ms = pos_ms
         self._seek_guard_until = time.perf_counter() + 0.22
 
-        if self.is_playing and not self._player.source().isEmpty():
-            self._awaiting_audio_start = True
-            self._play_start_wall = time.perf_counter()
-            self._play_start_pos_ms = pos_ms
+        if self._pcm_active:
+            # Instant zero-debounce seek in direct PCM mode
+            self._seek_debounce_timer.stop()
+            self._pending_seek_ms = None
+            if not self._start_pcm_at(pos_ms):
+                self._stop_pcm()
+                self._player.setPosition(target_int)
+                self._player.play()
+        elif self._can_use_pcm() and not self.is_playing:
+            # Paused in PCM-capable mode: no need to spam QMediaPlayer while scrubbing
+            self._seek_debounce_timer.stop()
+            self._pending_seek_ms = None
+        else:
+            if self.is_playing and not self._player.source().isEmpty():
+                self._awaiting_audio_start = True
+                self._play_start_wall = time.perf_counter()
+                self._play_start_pos_ms = pos_ms
 
-        # Debounce rapid drag seeks to QMediaPlayer so async Windows seeks never pile up
-        self._pending_seek_ms = target_int
-        if not self._seek_debounce_timer.isActive():
-            self._seek_debounce_timer.start()
+            # Debounce rapid drag seeks to QMediaPlayer so async Windows seeks never pile up
+            self._pending_seek_ms = target_int
+            if not self._seek_debounce_timer.isActive():
+                self._seek_debounce_timer.start()
 
         if scrub_audio:
             self.play_scrub_grain(cs)
@@ -360,23 +583,46 @@ class AudioEngine(QObject):
     def set_playback_rate(self, rate: float) -> None:
         # Preserve current interpolated position before changing rate
         cur_ms = self.smooth_position_cs * 10.0
+        was_playing = self.is_playing
         self._rate = max(0.1, float(rate))
         self._reanchor(cur_ms)
         self._player.setPlaybackRate(self._rate)
+        if was_playing:
+            if self._can_use_pcm():
+                if not self._pcm_active and self._start_pcm_at(cur_ms):
+                    self._player.pause()
+                    if not self._poll_timer.isActive():
+                        self._poll_timer.start()
+            elif self._pcm_active:
+                self._stop_pcm()
+                if not self._player.source().isEmpty():
+                    self._player.setPosition(int(round(cur_ms)))
+                    self._awaiting_audio_start = True
+                    self._play_start_wall = time.perf_counter()
+                    self._play_start_pos_ms = cur_ms
+                    self._player.play()
 
     def set_volume(self, vol: float) -> None:
         v = max(0.0, min(1.0, vol))
         self._output.setVolume(v)
         if self._scrub_sink is not None:
             self._scrub_sink.setVolume(v)
+        if self._pcm_sink is not None:
+            self._pcm_sink.setVolume(v)
 
     def play(self) -> None:
         self._stop_scrub_sink()
         self._stop_at_cs = None
         cur_ms = self._smooth_cs * 10.0
-        # Ensure any debounced scrub position is committed to QMediaPlayer before play starts
+        # Ensure any debounced scrub position is committed before play starts
         self._seek_debounce_timer.stop()
         self._pending_seek_ms = None
+        if self._can_use_pcm() and self._start_pcm_at(cur_ms):
+            self._player.pause()
+            self._poll_timer.start()
+            self.state_changed.emit(True)
+            return
+        self._stop_pcm()
         target_int = int(round(cur_ms))
         self._seek_target_ms = cur_ms
         self._seek_guard_until = time.perf_counter() + 0.22
@@ -392,14 +638,21 @@ class AudioEngine(QObject):
             self.state_changed.emit(True)
 
     def pause(self) -> None:
-        was_silent_playing = self._player.source().isEmpty() and self._poll_timer.isActive()
+        was_pcm = self._pcm_active
+        was_silent_playing = (
+            not was_pcm
+            and self._player.source().isEmpty()
+            and self._poll_timer.isActive()
+        )
         cur_ms = self.smooth_position_cs * 10.0
         self._stop_at_cs = None
         self._awaiting_audio_start = False
+        if was_pcm:
+            self._stop_pcm()
         self._player.pause()
         self._poll_timer.stop()
         self._reanchor(cur_ms)
-        if was_silent_playing:
+        if was_pcm or was_silent_playing:
             self.state_changed.emit(False)
 
     def toggle_play(self) -> None:
@@ -414,6 +667,12 @@ class AudioEngine(QObject):
         self._pending_seek_ms = None
         self._stop_at_cs = float(max(start_cs + 1, end_cs))
         pos_ms = float(max(0, start_cs) * 10)
+        if self._can_use_pcm() and self._start_pcm_at(pos_ms):
+            self._player.pause()
+            self._poll_timer.start()
+            self.state_changed.emit(True)
+            return
+        self._stop_pcm()
         self._seek_target_ms = pos_ms
         self._seek_guard_until = time.perf_counter() + 0.22
         self._player.setPosition(int(round(pos_ms)))
@@ -429,9 +688,47 @@ class AudioEngine(QObject):
         dt = max(0.0, min(0.1, now - self._last_tick_wall))
         self._last_tick_wall = now
 
+        if self._pcm_active and self._pcm_sink is not None:
+            delta_ms = max(0.0, (self._pcm_sink.processedUSecs() - self._pcm_base_processed_us) / 1000.0)
+            hw_ms = self._pcm_start_ms + delta_ms
+            if hw_ms > self._pcm_hw_pos_ms + 0.05:
+                self._pcm_hw_pos_ms = hw_ms
+                self._pcm_hw_wall = now
+            # Smoothly interpolate between ~10 ms hardware audio buffer ticks
+            interp_ms = self._pcm_hw_pos_ms + min(25.0, (now - self._pcm_hw_wall) * 1000.0)
+            self._clock_ms = max(self._clock_ms, min(self._pcm_duration_ms, interp_ms))
+            cs = self._clock_ms / 10.0
+
+            if self._stop_at_cs is not None and cs >= self._stop_at_cs:
+                stop_cs = self._stop_at_cs
+                self._clock_ms = stop_cs * 10.0
+                self._smooth_cs = stop_cs
+                self.position_changed_float.emit(stop_cs)
+                self.position_changed.emit(int(round(stop_cs)))
+                self.pause()
+                return
+
+            if (
+                self._pcm_stream is not None
+                and self._pcm_stream.eof
+                and hw_ms >= self._pcm_duration_ms - 15.0
+            ):
+                end_cs = self._pcm_duration_ms / 10.0
+                self._clock_ms = self._pcm_duration_ms
+                self._smooth_cs = end_cs
+                self.position_changed_float.emit(end_cs)
+                self.position_changed.emit(int(round(end_cs)))
+                self.pause()
+                return
+
+            self._smooth_cs = cs
+            self.position_changed_float.emit(cs)
+            self.position_changed.emit(int(round(cs)))
+            return
+
         if self._awaiting_audio_start:
-            # Hold position while Windows audio backend warms up (avoids start jump-back)
-            if (now - self._play_start_wall) < 0.35:
+            # Brief hold while QMediaPlayer backend warms up (50%/75% fallback)
+            if (now - self._play_start_wall) < 0.12:
                 return
             self._awaiting_audio_start = False
             self._backend_wall = now
@@ -439,10 +736,10 @@ class AudioEngine(QObject):
         # Phase-locked smooth advance: strictly forward, never jumps backwards on backend jitter
         est_backend_ms = self._backend_pos_ms + (now - self._backend_wall) * 1000.0 * self._rate
         err_ms = est_backend_ms - self._clock_ms
-        if abs(err_ms) > 300.0:
+        if abs(err_ms) > 120.0:
             self._clock_ms = max(0.0, est_backend_ms)
         else:
-            slew = 1.0 + max(-0.08, min(0.08, err_ms / 400.0))
+            slew = 1.0 + max(-0.25, min(0.25, err_ms / 120.0))
             self._clock_ms = max(0.0, self._clock_ms + dt * 1000.0 * self._rate * slew)
 
         cs = self._clock_ms / 10.0
@@ -459,6 +756,8 @@ class AudioEngine(QObject):
         self.position_changed.emit(int(round(cs)))
 
     def _on_playback_state(self, state: QMediaPlayer.PlaybackState) -> None:
+        if self._pcm_active:
+            return
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         if playing:
             self._last_tick_wall = time.perf_counter()

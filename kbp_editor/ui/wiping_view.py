@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Set, Tuple
 
-from PySide6.QtCore import QSettings, Qt, QLineF, QPoint, QRectF, Signal
+from PySide6.QtCore import QRect, QSettings, Qt, QLineF, QPoint, QRectF, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -772,14 +772,20 @@ class _WipingTimelineCanvas(QWidget):
     def _paint_grid(self, painter: QPainter, w: int, h: int) -> None:
         steps = (5, 10, 25, 50, 100, 200, 500, 1000)
         step_cs = next((s for s in steps if s * self.px_per_cs >= 28.0), steps[-1])
-        start_cs = int(self.scroll_x_cs // step_cs) * step_cs
-        end_cs = self.x_to_cs(w) + step_cs
+        clip = painter.clipBoundingRect()
+        left_px = max(0.0, clip.left() - 2.0) if not clip.isEmpty() else 0.0
+        right_px = min(float(w), clip.right() + 2.0) if not clip.isEmpty() else float(w)
+        start_cs = int(self.x_to_cs(left_px) // step_cs) * step_cs
+        end_cs = int(self.x_to_cs(right_px)) + step_cs
         painter.setPen(QPen(QColor(38, 42, 50), 1))
         for t in range(start_cs, end_cs + 1, step_cs):
             x = int(self.cs_to_x(t))
             painter.drawLine(x, RULER_H, x, h)
 
     def _paint_ruler(self, painter: QPainter, w: int) -> None:
+        clip = painter.clipBoundingRect()
+        if not clip.isEmpty() and clip.top() > RULER_H:
+            return
         painter.fillRect(0, 0, w, RULER_H, QColor(33, 37, 44))
         painter.setPen(QColor(70, 75, 86))
         painter.drawLine(0, RULER_H - 1, w, RULER_H - 1)
@@ -787,8 +793,10 @@ class _WipingTimelineCanvas(QWidget):
 
         steps = (5, 10, 25, 50, 100, 200, 500, 1000)
         step_cs = next((s for s in steps if s * self.px_per_cs >= 78.0), steps[-1])
-        start_cs = int(self.scroll_x_cs // step_cs) * step_cs
-        end_cs = self.x_to_cs(w) + step_cs
+        left_px = max(0.0, clip.left() - 80.0) if not clip.isEmpty() else 0.0
+        right_px = min(float(w), clip.right() + 8.0) if not clip.isEmpty() else float(w)
+        start_cs = int(self.x_to_cs(left_px) // step_cs) * step_cs
+        end_cs = int(self.x_to_cs(right_px)) + step_cs
         for t in range(start_cs, end_cs + 1, step_cs):
             x = int(self.cs_to_x(t))
             painter.setPen(QColor(100, 108, 120))
@@ -2052,13 +2060,22 @@ class LyricsWipingView(QWidget):
         self._refresh_word_adjust_bar()
 
     def set_playhead_cs(self, cs: float, follow_if_playing: bool = False) -> None:
+        old_x = self.canvas.cs_to_x(self.canvas.playhead_cs)
         self.canvas.playhead_cs = cs
         if follow_if_playing and self._follow_cb.isChecked() and not self._word_adjust_active:
             span = self.canvas.view_span_cs()
             if cs > self.canvas.scroll_x_cs + span * 0.82 or cs < self.canvas.scroll_x_cs:
                 self.canvas.set_scroll_x_cs(cs - span * 0.2)
                 return
-        self.canvas.update()
+        new_x = self.canvas.cs_to_x(cs)
+        if abs(new_x - old_x) < 0.25:
+            return
+        h = self.canvas.height()
+        w = self.canvas.width()
+        for px in (old_x, new_x):
+            left = max(0, int(px) - 6)
+            if left < w:
+                self.canvas.update(QRect(left, 0, min(14, w - left), h))
 
     def jump_to_cs(self, cs: float) -> None:
         self.canvas.center_on_cs(cs)
