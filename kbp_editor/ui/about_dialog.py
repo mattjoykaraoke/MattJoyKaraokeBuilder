@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen, QPixmap
@@ -80,8 +80,13 @@ class _LicensesDialog(QDialog):
 class AboutDialog(QDialog):
     """About dialog displaying app logo, version, creator info, GitHub link, and license info."""
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        on_check_updates: Optional[Callable[[], None]] = None,
+    ) -> None:
         super().__init__(parent)
+        self._on_check_updates = on_check_updates
         self.setWindowTitle(f"About {APP_NAME}")
         self.setFixedWidth(480)
 
@@ -139,6 +144,10 @@ class AboutDialog(QDialog):
         btn_lic = QPushButton("View Licenses && Attribution…", self)
         btn_lic.clicked.connect(self._open_licenses)
         btns.addWidget(btn_lic)
+        if self._on_check_updates is not None:
+            btn_upd = QPushButton("Check for Updates…", self)
+            btn_upd.clicked.connect(self._trigger_check_updates)
+            btns.addWidget(btn_upd)
         btns.addStretch()
         btn_ok = QPushButton("Close", self)
         btn_ok.setDefault(True)
@@ -149,3 +158,9 @@ class AboutDialog(QDialog):
     def _open_licenses(self) -> None:
         dlg = _LicensesDialog(self)
         dlg.exec()
+
+    def _trigger_check_updates(self) -> None:
+        cb = self._on_check_updates
+        self.accept()
+        if cb is not None:
+            cb()

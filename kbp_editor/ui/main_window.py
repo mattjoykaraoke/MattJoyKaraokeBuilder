@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QProcess, QSettings, Qt
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtCore import QProcess, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -17,6 +19,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QStatusBar,
     QTabWidget,
@@ -29,6 +32,7 @@ from ..audio import AudioEngine
 from ..history import HistoryManager
 from ..model import KbpProject, suggest_project_filename
 from ..tap_sync import register_saved_project
+from ..updater import InstallerDownloadWorker, ReleaseInfo, UpdateCheckWorker, launch_installer
 from .about_dialog import AboutDialog
 from .common import format_time_cs, load_app_icon, make_ribbon_divider
 from .display_view import DisplayRemoveView
@@ -36,6 +40,7 @@ from .finishing_view import FinishingView
 from .minimap_widget import SongMinimapWidget
 from .preview_widget import FloatingPreviewWindow
 from .tap_sync_view import TapSyncView
+from .update_banner import UpdateBanner
 from .wiping_view import LyricsWipingView
 
 
@@ -52,12 +57,21 @@ class MainWindow(QMainWindow):
         self.history = HistoryManager()
         self.audio = AudioEngine(self)
         self._page_buttons: List[QPushButton] = []
+        self._update_check_worker: Optional[UpdateCheckWorker] = None
+        self._update_download_worker: Optional[InstallerDownloadWorker] = None
+        self._update_check_manual: bool = False
+        self._skip_close_confirm: bool = False
 
-        # Central container: Song Minimap + Quick Page Bar + Tabs + Transport
+        # Central container: Update Banner + Song Minimap + Quick Page Bar + Tabs + Transport
         central = QWidget(self)
         c_layout = QVBoxLayout(central)
         c_layout.setContentsMargins(0, 0, 0, 0)
         c_layout.setSpacing(0)
+
+        self.update_banner = UpdateBanner(central)
+        self.update_banner.install_requested.connect(self._download_and_install_update)
+        self.update_banner.open_release_page_requested.connect(self._open_release_page)
+        self.update_banner.skip_version_requested.connect(self._skip_update_version)
 
         # Top Navigation Strip: Song Overview Minimap + Quick Page Jump Bar
         nav_box = QWidget(central)
@@ -91,6 +105,7 @@ class MainWindow(QMainWindow):
 
         transport = self._build_transport_bar()
 
+        c_layout.addWidget(self.update_banner)
         c_layout.addWidget(nav_box)
         c_layout.addWidget(self._tabs, 1)
         c_layout.addWidget(transport)
@@ -141,6 +156,8 @@ class MainWindow(QMainWindow):
                     self._refresh_actions()
             else:
                 self.open_kbp(initial_file)
+
+        QTimer.singleShot(2500, self._maybe_auto_check_updates)
 
     def _rebuild_page_buttons(self) -> None:
         while self._page_bar_layout.count():
@@ -473,8 +490,21 @@ class MainWindow(QMainWindow):
         act_reset_zoom.triggered.connect(self._reset_zoom_active)
         m_view.addAction(act_reset_zoom)
 
-        act_about = mb.addAction("&About")
+        m_help = mb.addMenu("&Help")
+        act_check_updates = QAction("Check for &Updates…", self)
+        act_check_updates.triggered.connect(lambda: self._check_for_updates(manual=True))
+        m_help.addAction(act_check_updates)
+
+        self._act_auto_updates = QAction("Check for Updates &Automatically on Startup", self)
+        self._act_auto_updates.setCheckable(True)
+        self._act_auto_updates.setChecked(self._settings.value("updates/auto_check", True, type=bool))
+        self._act_auto_updates.toggled.connect(self._on_auto_update_toggled)
+        m_help.addAction(self._act_auto_updates)
+
+        m_help.addSeparator()
+        act_about = QAction(f"&About {APP_NAME}…", self)
         act_about.triggered.connect(self._open_about_dialog)
+        m_help.addAction(act_about)
 
         self.preview_win.visibility_changed.connect(self._on_preview_visibility_changed)
 
@@ -1082,8 +1112,185 @@ class MainWindow(QMainWindow):
         msg.exec()
 
     def _open_about_dialog(self) -> None:
-        dlg = AboutDialog(self)
+        dlg = AboutDialog(self, on_check_updates=lambda: self._check_for_updates(manual=True))
         dlg.exec()
+
+    # ------------------------------------------------------------------
+    # GitHub Release Update Checker & In-App Installer
+    # ------------------------------------------------------------------
+    def _on_auto_update_toggled(self, enabled: bool) -> None:
+        self._settings.setValue("updates/auto_check", bool(enabled))
+        self._settings.sync()
+
+    def _maybe_auto_check_updates(self) -> None:
+        if not self._settings.value("updates/auto_check", True, type=bool):
+            return
+        try:
+            last_checked = float(self._settings.value("updates/last_checked", 0.0))
+        except (TypeError, ValueError):
+            last_checked = 0.0
+        # Check at most once every 24 hours on startup
+        if (time.time() - last_checked) < 86400.0:
+            return
+        self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, manual: bool = False) -> None:
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
+            if manual:
+                self._update_check_manual = True
+                self.statusBar().showMessage("Checking GitHub for updates…", 3000)
+            return
+        self._update_check_manual = bool(manual)
+        if manual:
+            self.statusBar().showMessage("Checking GitHub for updates…", 3000)
+        worker = UpdateCheckWorker(parent=self)
+        worker.update_available.connect(self._on_update_available)
+        worker.up_to_date.connect(self._on_update_up_to_date)
+        worker.check_failed.connect(self._on_update_check_failed)
+        worker.finished.connect(self._on_update_check_finished)
+        self._update_check_worker = worker
+        worker.start()
+
+    def _on_update_check_finished(self) -> None:
+        worker = self._update_check_worker
+        self._update_check_worker = None
+        if worker is not None:
+            worker.deleteLater()
+
+    def _on_update_available(self, release: ReleaseInfo) -> None:
+        self._settings.setValue("updates/last_checked", time.time())
+        self._settings.sync()
+        skipped = str(self._settings.value("updates/skipped_version", "", type=str) or "")
+        if not self._update_check_manual and skipped == release.version:
+            return
+        self.update_banner.show_release(release)
+        self.statusBar().showMessage(f"Update available: v{release.version}", 5000)
+
+    def _on_update_up_to_date(self, current_ver: str) -> None:
+        self._settings.setValue("updates/last_checked", time.time())
+        self._settings.sync()
+        if self._update_check_manual:
+            QMessageBox.information(
+                self,
+                "You're Up to Date",
+                f"{APP_NAME} v{current_ver} is the latest available release.",
+            )
+
+    def _on_update_check_failed(self, err: str) -> None:
+        if self._update_check_manual:
+            QMessageBox.warning(
+                self,
+                "Update Check Failed",
+                f"Could not check GitHub for updates.\n\n{err}",
+            )
+
+    def _skip_update_version(self, version: str) -> None:
+        self._settings.setValue("updates/skipped_version", version)
+        self._settings.sync()
+        self.statusBar().showMessage(f"Skipped update reminder for v{version}", 3000)
+
+    def _open_release_page(self, release: ReleaseInfo) -> None:
+        QDesktopServices.openUrl(QUrl(release.html_url))
+
+    def _download_and_install_update(self, release: ReleaseInfo) -> None:
+        if self._update_download_worker is not None and self._update_download_worker.isRunning():
+            return
+        if not release.installer_url:
+            self._open_release_page(release)
+            return
+
+        dlg = QProgressDialog(
+            f"Downloading {APP_NAME} v{release.version} installer…",
+            "Cancel",
+            0,
+            100,
+            self,
+        )
+        dlg.setWindowTitle(f"Updating {APP_NAME}")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(420)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        dlg.show()
+
+        worker = InstallerDownloadWorker(release, parent=self)
+        self._update_download_worker = worker
+
+        def _on_progress(done: int, total: int) -> None:
+            if total > 0:
+                dlg.setMaximum(100)
+                pct = min(100, int((done * 100) / total))
+                dlg.setValue(pct)
+                dlg.setLabelText(
+                    f"Downloading {APP_NAME} v{release.version} installer…\n"
+                    f"{done / (1024 * 1024):.1f} MB / {total / (1024 * 1024):.1f} MB ({pct}%)"
+                )
+            else:
+                dlg.setMaximum(0)
+                dlg.setLabelText(
+                    f"Downloading {APP_NAME} v{release.version} installer…\n"
+                    f"{done / (1024 * 1024):.1f} MB downloaded"
+                )
+
+        def _on_canceled() -> None:
+            if worker.isRunning():
+                worker.requestInterruption()
+
+        def _on_finished_ok(installer_path: str) -> None:
+            dlg.close()
+            if not self._confirm_save_before_close():
+                self.statusBar().showMessage(
+                    f"Update paused — installer saved to {installer_path}", 6000
+                )
+                return
+            try:
+                launch_installer(installer_path)
+            except Exception as exc:
+                reply = QMessageBox.warning(
+                    self,
+                    "Could Not Launch Installer",
+                    f"The installer was downloaded but could not be started:\n\n{exc}\n\n"
+                    "Would you like to open the GitHub release page instead?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._open_release_page(release)
+                return
+            self._skip_close_confirm = True
+            self.close()
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+
+        def _on_failed(err: str) -> None:
+            dlg.close()
+            if not err:
+                self.statusBar().showMessage("Update download cancelled.", 3000)
+                return
+            reply = QMessageBox.warning(
+                self,
+                "Update Download Failed",
+                f"{err}\n\nWould you like to open the GitHub release page in your browser instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._open_release_page(release)
+
+        def _cleanup() -> None:
+            if self._update_download_worker is worker:
+                self._update_download_worker = None
+            worker.deleteLater()
+
+        dlg.canceled.connect(_on_canceled)
+        worker.progress.connect(_on_progress)
+        worker.finished_ok.connect(_on_finished_ok)
+        worker.failed.connect(_on_failed)
+        worker.finished.connect(_cleanup)
+        worker.start()
 
     def _bind_project_to_views(self, preserve_view: bool = False) -> None:
         self.display_view.set_project(self.project, preserve_view=preserve_view)
@@ -1221,9 +1428,13 @@ class MainWindow(QMainWindow):
         return self.tap_sync_view.save_draft()
 
     def closeEvent(self, event) -> None:
-        if not self._confirm_save_before_close():
+        if not self._skip_close_confirm and not self._confirm_save_before_close():
             event.ignore()
             return
+        for worker in (self._update_check_worker, self._update_download_worker):
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(500)
         self.preview_win.close()
         super().closeEvent(event)
 

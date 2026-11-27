@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.2] - 2026-11-27
 
+### Added
+- **GitHub Release Update Checker & In-App Installer:**
+  - Automatically checks GitHub Releases in the background on startup (at most once every 24 hours, failing silently when offline) and displays a dismissible top banner when a newer release is available.
+  - Supports **Download & Install** directly from the banner (downloading the Windows `.exe` installer with a cancellable progress dialog, prompting to save unsaved work, and launching the installer cleanly), with automatic fallback to opening the GitHub Release page.
+  - Includes a **What's New** release notes viewer, **Skip Version** option, and a new **Help** menu (**Check for Updates…**, **Check for Updates Automatically on Startup**, and **About** with a **Check for Updates…** button).
+
 ### Changed
 - **Instant Low-Latency `1.0x` Audio Playback:**
   - Replaced `QMediaPlayer` for `1.0x` playback with a persistent, pre-warmed `QAudioSink` streaming full-quality in-memory int16 PCM (`25 ms` hardware buffer), enabling sub-millisecond play/pause, instant range previews, seamless main/vocal audio switching, and zero-debounce seeking without WASAPI reopen delays.
