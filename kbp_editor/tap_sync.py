@@ -636,12 +636,10 @@ class TapSyncDraft:
             i += 1
         return out
 
-    def build_kbp_project(self, default_tail_cs: int = 35) -> KbpProject:
+    def resolve_header(self) -> KbpHeader:
         """
-        Convert this TapSyncDraft into a full KbpProject with 0 cs flush borders
-        and optimized Display/Remove windows.
-        Any unsynced syllables (if building a partial draft) are placed sequentially
-        after the last synced timestamp so the resulting KBP is always valid.
+        Resolve the effective KbpHeader (fonts, styles, margins, colors) that will be used
+        when building this draft into a .kbp / 16:9 video.
         """
         header_lines: Optional[List[str]] = None
         if self.template_kbp_path:
@@ -652,8 +650,75 @@ class TapSyncDraft:
             header_lines = self._apply_duet_styles_to_header_lines(header_lines)
         elif header_lines is None:
             header_lines = list(DEFAULT_KBP_HEADER_LINES)
+        return KbpHeader.parse(header_lines)
 
-        header = KbpHeader.parse(header_lines)
+    def replace_page_from_text(self, page_idx: int, text: str) -> Tuple[int, int]:
+        """
+        Replace `self.pages[page_idx]` with the page(s) parsed from slash-delimited `text`.
+        - Blank lines inside `text` split the page into multiple pages.
+        - Exact unchanged lines (matching slash_text) preserve their style, align, and syllable timings.
+        - Lines with identical full_text (only slash splits changed) preserve their style and align.
+        Returns `(focus_page_idx, num_pages_inserted)`.
+        """
+        if not (0 <= page_idx < len(self.pages)):
+            return (0, 0)
+
+        old_page = self.pages[page_idx]
+        parsed_pages = TapSyncDraft.from_lyrics_text(text).pages
+
+        # Build preservation buckets from the old page's lines
+        exact_by_slash: Dict[str, List[TapLine]] = {}
+        style_by_full: Dict[str, List[Tuple[str, str]]] = {}
+        for old_ln in old_page.lines:
+            sk = old_ln.slash_text.strip()
+            if sk:
+                exact_by_slash.setdefault(sk, []).append(old_ln)
+            fk = old_ln.full_text.strip()
+            if fk:
+                style_by_full.setdefault(fk, []).append((old_ln.style, old_ln.align))
+
+        for new_page in parsed_pages:
+            for new_ln in new_page.lines:
+                sk = new_ln.slash_text.strip()
+                exact_bucket = exact_by_slash.get(sk)
+                if exact_bucket:
+                    prev_ln = exact_bucket.pop(0)
+                    new_ln.style = prev_ln.style
+                    new_ln.align = prev_ln.align
+                    if len(prev_ln.syllables) == len(new_ln.syllables):
+                        for ns, os_ in zip(new_ln.syllables, prev_ln.syllables):
+                            ns.start_cs = os_.start_cs
+                            ns.end_cs = os_.end_cs
+                    # Consume matching style bucket entry too so duplicate lines stay balanced
+                    fk = new_ln.full_text.strip()
+                    sb = style_by_full.get(fk)
+                    if sb:
+                        sb.pop(0)
+                    continue
+
+                fk = new_ln.full_text.strip()
+                style_bucket = style_by_full.get(fk)
+                if style_bucket:
+                    st, al = style_bucket.pop(0)
+                    new_ln.style = st
+                    new_ln.align = al
+
+        if not parsed_pages:
+            del self.pages[page_idx]
+            focus_idx = min(page_idx, len(self.pages) - 1) if self.pages else 0
+            return (focus_idx, 0)
+
+        self.pages[page_idx : page_idx + 1] = parsed_pages
+        return (page_idx, len(parsed_pages))
+
+    def build_kbp_project(self, default_tail_cs: int = 35) -> KbpProject:
+        """
+        Convert this TapSyncDraft into a full KbpProject with 0 cs flush borders
+        and optimized Display/Remove windows.
+        Any unsynced syllables (if building a partial draft) are placed sequentially
+        after the last synced timestamp so the resulting KBP is always valid.
+        """
+        header = self.resolve_header()
         if self.title:
             header.set_title(self.title)
         if self.artist:

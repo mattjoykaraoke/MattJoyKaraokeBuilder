@@ -293,6 +293,8 @@ class MainWindow(QMainWindow):
                 self._set_preview_visible(True)
             self.wiping_view.set_playhead_cs(cs, follow_if_playing=False)
             self.minimap.set_viewport(self.wiping_view.canvas.scroll_x_cs, self.wiping_view.canvas.view_span_cs())
+        if hasattr(self, "_act_undo"):
+            self._refresh_actions()
 
     def _build_transport_bar(self) -> QWidget:
         bar = QFrame(self)
@@ -457,13 +459,13 @@ class MainWindow(QMainWindow):
         m_edit = mb.addMenu("&Edit")
         self._act_undo = QAction("&Undo", self)
         self._act_undo.setShortcut(QKeySequence("Ctrl+Z"))
-        self._act_undo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._act_undo.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         self._act_undo.triggered.connect(self.undo)
         m_edit.addAction(self._act_undo)
 
         self._act_redo = QAction("&Redo", self)
         self._act_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
-        self._act_redo.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._act_redo.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         self._act_redo.triggered.connect(self.redo)
         m_edit.addAction(self._act_redo)
 
@@ -567,6 +569,7 @@ class MainWindow(QMainWindow):
         self.tap_sync_view.status_message.connect(self.statusBar().showMessage)
         self.tap_sync_view.main_audio_status_changed.connect(self._on_tap_sync_main_audio_status)
         self.tap_sync_view.dirty_changed.connect(lambda _d: self._refresh_actions())
+        self.tap_sync_view.history_changed.connect(self._refresh_actions)
         self.tap_sync_view.open_project_requested.connect(self._open_project_path)
         self.tap_sync_view.save_project_requested.connect(self.save_kbp)
 
@@ -1520,6 +1523,10 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def undo(self) -> None:
+        if self._tabs.currentWidget() is self.tap_sync_view:
+            if self.tap_sync_view.undo_edit():
+                self._refresh_actions()
+            return
         snap = self.history.undo()
         if snap is not None:
             self.project = snap
@@ -1532,6 +1539,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Undid last action", 2500)
 
     def redo(self) -> None:
+        if self._tabs.currentWidget() is self.tap_sync_view:
+            if self.tap_sync_view.redo_edit():
+                self._refresh_actions()
+            return
         snap = self.history.redo()
         if snap is not None:
             self.project = snap
@@ -1615,11 +1626,21 @@ class MainWindow(QMainWindow):
         self._act_save.setEnabled(can_save)
         self._act_save_as.setEnabled(can_save)
 
-        self._act_undo.setEnabled(self.history.can_undo)
-        self._act_undo.setText(f"&Undo: {self.history.undo_label}" if self.history.can_undo else "&Undo")
+        if self._tabs.currentWidget() is self.tap_sync_view:
+            self._act_undo.setEnabled(self.tap_sync_view.can_undo)
+            self._act_undo.setText(
+                f"&Undo: {self.tap_sync_view.undo_label}" if self.tap_sync_view.can_undo else "&Undo"
+            )
+            self._act_redo.setEnabled(self.tap_sync_view.can_redo)
+            self._act_redo.setText(
+                f"&Redo: {self.tap_sync_view.redo_label}" if self.tap_sync_view.can_redo else "&Redo"
+            )
+        else:
+            self._act_undo.setEnabled(self.history.can_undo)
+            self._act_undo.setText(f"&Undo: {self.history.undo_label}" if self.history.can_undo else "&Undo")
 
-        self._act_redo.setEnabled(self.history.can_redo)
-        self._act_redo.setText(f"&Redo: {self.history.redo_label}" if self.history.can_redo else "&Redo")
+            self._act_redo.setEnabled(self.history.can_redo)
+            self._act_redo.setText(f"&Redo: {self.history.redo_label}" if self.history.can_redo else "&Redo")
 
         title = "Matt Joy Karaoke Builder"
         dirty = "*" if (self.history.is_dirty or self.tap_sync_view.is_dirty) else ""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -10,10 +11,14 @@ from PySide6.QtGui import (
     QDesktopServices,
     QFont,
     QFontMetrics,
+    QFontMetricsF,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPen,
+    QShortcut,
+    QTextCursor,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -41,9 +46,10 @@ from PySide6.QtWidgets import (
 
 from ..audio import AudioEngine
 from ..local_lyric_splitter import find_local_lyric_splitter_exe, run_local_lyric_splitter
-from ..model import KbpProject, read_kbp_text, suggest_project_filename
+from ..model import KbpHeader, KbpProject, KbpStyle, parse_line_to_syllables, read_kbp_text, suggest_project_filename
 from ..tap_sync import (
     TapLine,
+    TapPage,
     TapSyllable,
     TapSyncDraft,
     default_autosaves_dir,
@@ -52,6 +58,43 @@ from ..tap_sync import (
 )
 from .common import WaveformTileCache, format_time_cs, make_ribbon_divider, make_ribbon_section
 from .project_organizer import ProjectOrganizerDialog
+
+
+_VIDEO_LOGICAL_W = 1920.0
+_VIDEO_CDG_SCALE_X = _VIDEO_LOGICAL_W / 300.0
+_BORDER_NEAR_RATIO = 0.90
+_BORDER_OVERFLOW_RATIO = 1.00
+
+
+def _video_usable_width(header: KbpHeader) -> float:
+    """Return the usable 16:9 (1920x1080) horizontal safe width matching PreviewCanvas."""
+    margin_l, margin_r, _margin_t, _line_spacing = header.margins
+    safe_x_left = (6.0 + margin_l) * _VIDEO_CDG_SCALE_X
+    safe_x_right = _VIDEO_LOGICAL_W - (6.0 + margin_r) * _VIDEO_CDG_SCALE_X
+    return max(200.0, safe_x_right - safe_x_left)
+
+
+def _make_video_font(style: KbpStyle, scale: float = 1.0) -> QFont:
+    """Build a QFont matching PreviewCanvas's 16:9 1080p font scaled by `scale`."""
+    px_size = max(28, int(round(style.font_size * 5.2)))
+    font = QFont(style.font_name or "Arial")
+    font.setPixelSize(max(10, int(round(px_size * scale))))
+    font.setBold(style.is_bold)
+    font.setItalic(style.is_italic)
+    return font
+
+
+def _measure_line_16_9(text: str, header: KbpHeader, style_letter: str = "A") -> Tuple[float, float, KbpStyle]:
+    """
+    Measure `text` in 1920x1080 16:9 logical pixels using `header`'s style for `style_letter`.
+    Returns `(line_width_px, usable_width_px, style)`.
+    """
+    usable_w = _video_usable_width(header)
+    style = header.get_style((style_letter or "A").upper())
+    font = _make_video_font(style, scale=1.0)
+    fm = QFontMetricsF(font)
+    disp = text.upper() if style.uppercase == "U" else text
+    return fm.horizontalAdvance(disp), usable_w, style
 
 
 class _LocalLyricSplitterWorker(QThread):
@@ -318,15 +361,130 @@ class _LyricsInputDialog(QDialog):
         return self._artist_edit.text().strip()
 
 
+class _PageLyricsEditDialog(QDialog):
+    """Focused modal editor for a single page's lyrics with live 16:9 width feedback."""
+
+    def __init__(
+        self,
+        page_idx: int,
+        page: TapPage,
+        header: KbpHeader,
+        focus_line_idx: int = 0,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit Page {page_idx + 1} Lyrics")
+        self.resize(600, 340)
+        self._header = header
+        self._default_style = (
+            page.lines[focus_line_idx].style
+            if 0 <= focus_line_idx < len(page.lines)
+            else (page.lines[0].style if page.lines else "A")
+        )
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            f"Edit lyrics for <b>Page {page_idx + 1}</b> using <b>/</b> for syllable splits "
+            "(insert a <b>blank line</b> to split into multiple pages):"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._text_edit = QPlainTextEdit(self)
+        self._text_edit.setFont(QFont("Consolas", 11))
+        page_text = "\n".join(ln.slash_text for ln in page.lines if ln.syllables)
+        self._text_edit.setPlainText(page_text)
+        self._text_edit.textChanged.connect(self._update_fit_status)
+        layout.addWidget(self._text_edit, 1)
+
+        self._fit_label = QLabel("", self)
+        self._fit_label.setWordWrap(True)
+        self._fit_label.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        layout.addWidget(self._fit_label)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        # Ctrl+Enter / Ctrl+Return submits immediately for fast page-by-page checking
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.accept)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self.accept)
+
+        # Position cursor on the line that was double-clicked
+        doc = self._text_edit.document()
+        block_num = max(0, min(focus_line_idx, max(0, doc.blockCount() - 1)))
+        block = doc.findBlockByNumber(block_num)
+        if block.isValid():
+            cur = self._text_edit.textCursor()
+            cur.setPosition(block.position())
+            cur.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+            self._text_edit.setTextCursor(cur)
+        self._text_edit.setFocus()
+        self._update_fit_status()
+
+    def _update_fit_status(self) -> None:
+        raw_lines = self._text_edit.toPlainText().splitlines()
+        max_ratio = 0.0
+        max_line_num = 0
+        non_empty_count = 0
+        style_used = self._header.get_style((self._default_style or "A").upper())
+
+        for idx, raw in enumerate(raw_lines):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            non_empty_count += 1
+            rendered = "".join(parse_line_to_syllables(stripped))
+            line_w, usable_w, style_used = _measure_line_16_9(rendered, self._header, self._default_style)
+            ratio = line_w / usable_w if usable_w > 0 else 0.0
+            if ratio > max_ratio:
+                max_ratio = ratio
+                max_line_num = idx + 1
+
+        font_desc = f"{style_used.font_name} {style_used.font_size}pt"
+        if non_empty_count == 0:
+            self._fit_label.setStyleSheet("font-size: 11px; color: #94a3b8;")
+            self._fit_label.setText("Page is empty — clicking OK will remove this page.")
+            return
+
+        pct = int(round(max_ratio * 100))
+        if max_ratio > _BORDER_OVERFLOW_RATIO:
+            self._fit_label.setStyleSheet("font-size: 11px; color: #fca5a5; font-weight: bold;")
+            self._fit_label.setText(
+                f"✕ Line {max_line_num} exceeds 16:9 border ({pct}% — {font_desc}) — consider splitting"
+            )
+        elif max_ratio >= _BORDER_NEAR_RATIO:
+            self._fit_label.setStyleSheet("font-size: 11px; color: #fcd34d; font-weight: bold;")
+            self._fit_label.setText(
+                f"⚠ Line {max_line_num} is close to 16:9 border ({pct}% — {font_desc})"
+            )
+        else:
+            self._fit_label.setStyleSheet("font-size: 11px; color: #86efac;")
+            self._fit_label.setText(
+                f"✓ All {non_empty_count} line{'s' if non_empty_count != 1 else ''} fit 16:9 border "
+                f"(widest: Line {max_line_num} at {pct}% — {font_desc})"
+            )
+
+    @property
+    def lyrics_text(self) -> str:
+        return self._text_edit.toPlainText()
+
+
 class _RollingTeleprompterWidget(QWidget):
     """
     High-contrast rolling line teleprompter with cross-page lookahead.
     Never blindsides the user with a sudden page flip: upcoming lines from the
     next page are always visible below with a clear page-break badge.
+    Also displays thin vertical 16:9 safe-area borders scaled to the active
+    KBP style font so long lines can be spotted and split before syncing.
     """
 
     end_phrase_requested = Signal()
     line_style_cycle_requested = Signal(int, int)
+    page_edit_requested = Signal(int, int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -343,18 +501,27 @@ class _RollingTeleprompterWidget(QWidget):
         self._rendered_line_rects: List[Tuple[QRectF, int, int]] = []
         self._cached_flat_lines: Optional[List[Tuple[int, int, TapLine]]] = None
         self._cached_counts: Optional[Tuple[int, int]] = None
+        self._cached_header: Optional[KbpHeader] = None
         self._cached_draft_id: int = 0
         self.setMinimumHeight(220)
 
     def invalidate_cache(self) -> None:
         self._cached_flat_lines = None
         self._cached_counts = None
+        self._cached_header = None
+
+    def _ensure_header(self) -> KbpHeader:
+        did = id(self.draft)
+        if self._cached_header is None or self._cached_draft_id != did:
+            self._cached_header = self.draft.resolve_header()
+        return self._cached_header
 
     def _ensure_draft_cache(self) -> Tuple[List[Tuple[int, int, TapLine]], int, int]:
         did = id(self.draft)
         if self._cached_flat_lines is None or self._cached_counts is None or self._cached_draft_id != did:
             self._cached_flat_lines = self.draft.flat_lines()
             self._cached_counts = (self.draft.synced_syllables(), self.draft.total_syllables())
+            self._cached_header = self.draft.resolve_header()
             self._cached_draft_id = did
         return self._cached_flat_lines, self._cached_counts[0], self._cached_counts[1]
 
@@ -399,6 +566,16 @@ class _RollingTeleprompterWidget(QWidget):
                     event.accept()
                     return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self.is_syncing and not self.is_locked:
+            pos = event.position()
+            for rect, p_i, l_i in self._rendered_line_rects:
+                if rect.contains(pos):
+                    self.page_edit_requested.emit(p_i, l_i)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -473,11 +650,14 @@ class _RollingTeleprompterWidget(QWidget):
             pv_p, pv_l, _ = flat_lines[active_flat_idx]
             badge_txt = (
                 f"PREVIEWING LINE {active_flat_idx + 1}/{len(flat_lines)} (P{pv_p + 1} L{pv_l + 1}) — "
-                "Scroll to inspect splits · Click 'Start Sync' or press Space to begin"
+                "Scroll to inspect · Double-click a line to edit its page · Space to sync"
             )
             badge_bg = QColor(30, 58, 95, 220)
         else:
-            badge_txt = f"READY ({synced}/{total} syllables synced) — Click 'Start Sync' or press Space to begin"
+            badge_txt = (
+                f"READY ({synced}/{total} syllables synced) — "
+                "Double-click any line to edit its page · Click 'Start Sync' or press Space"
+            )
             badge_bg = QColor(38, 46, 60, 210)
 
         bar_rect = QRectF(16.0, 10.0, float(w - 32), 26.0)
@@ -493,10 +673,63 @@ class _RollingTeleprompterWidget(QWidget):
         end_idx = min(len(flat_lines), active_flat_idx + 5)
 
         top_y = 48.0
-        bottom_y = float(h - 28)
+        bottom_y = float(h - 24)
         avail_h = max(120.0, bottom_y - top_y)
         active_y = top_y + avail_h * 0.30
         row_step = min(54.0, max(36.0, avail_h / 5.4))
+
+        # Compute 16:9 safe-area vertical border geometry scaled from the active KBP style font
+        header = self._ensure_header()
+        usable_w_1080 = _video_usable_width(header)
+        gutter = 76.0 if self.duet_mode else max(44.0, w * 0.06)
+        max_guide_w = max(200.0, w - 2.0 * gutter)
+        guide_scale = min(max_guide_w / usable_w_1080, 0.46)
+        guide_w = usable_w_1080 * guide_scale
+        guide_left_x = (w - guide_w) * 0.5
+        guide_right_x = guide_left_x + guide_w
+
+        _, _, active_line_obj = flat_lines[active_flat_idx]
+        active_video_w, _, active_style = _measure_line_16_9(
+            active_line_obj.full_text, header, active_line_obj.style
+        )
+        active_ratio = active_video_w / usable_w_1080 if usable_w_1080 > 0 else 0.0
+
+        # Draw thin vertical 16:9 page borders spanning the lyric preview area
+        if active_ratio > _BORDER_OVERFLOW_RATIO:
+            guide_pen_color = QColor(239, 68, 68, 215)
+            guide_active_color = QColor(248, 113, 113, 245)
+            guide_lbl_color = QColor(252, 165, 165)
+        elif active_ratio >= _BORDER_NEAR_RATIO:
+            guide_pen_color = QColor(245, 158, 11, 185)
+            guide_active_color = QColor(251, 191, 36, 235)
+            guide_lbl_color = QColor(253, 230, 138)
+        else:
+            guide_pen_color = QColor(120, 140, 170, 88)
+            guide_active_color = QColor(148, 163, 184, 150)
+            guide_lbl_color = QColor(148, 163, 184, 190)
+
+        guide_top = top_y - 4.0
+        guide_bottom = float(h - 22)
+        painter.setPen(QPen(guide_pen_color, 1.0, Qt.PenStyle.DashLine))
+        painter.drawLine(QLineF(guide_left_x, guide_top, guide_left_x, guide_bottom))
+        painter.drawLine(QLineF(guide_right_x, guide_top, guide_right_x, guide_bottom))
+
+        # Subtle bottom caption showing the active font & 16:9 width percentage
+        pct = int(round(active_ratio * 100))
+        if active_ratio > _BORDER_OVERFLOW_RATIO:
+            fit_suffix = f"{pct}% — Exceeds 16:9 border!"
+        elif active_ratio >= _BORDER_NEAR_RATIO:
+            fit_suffix = f"{pct}% — Near 16:9 border"
+        else:
+            fit_suffix = f"{pct}%"
+        guide_caption = f"16:9 Border ({active_style.font_name} {active_style.font_size}pt · {fit_suffix})"
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.setPen(guide_lbl_color)
+        painter.drawText(
+            QRectF(guide_left_x, float(h - 20), guide_w, 16.0),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            guide_caption,
+        )
 
         prev_page_drawn: Optional[int] = None
         for idx in range(start_idx, end_idx):
@@ -536,6 +769,14 @@ class _RollingTeleprompterWidget(QWidget):
                 painter.setBrush(QColor(30, 38, 52, 200))
                 painter.setPen(QPen(QColor(71, 85, 105), 1))
                 painter.drawRoundedRect(row_hit_rect, 6.0, 6.0)
+                # Crisp solid vertical border ticks inside the active row so edge clearance is unmistakable
+                painter.setPen(QPen(guide_active_color, 1.5))
+                painter.drawLine(
+                    QLineF(guide_left_x, row_hit_rect.top() + 2.0, guide_left_x, row_hit_rect.bottom() - 2.0)
+                )
+                painter.drawLine(
+                    QLineF(guide_right_x, row_hit_rect.top() + 2.0, guide_right_x, row_hit_rect.bottom() - 2.0)
+                )
             elif self.duet_mode and self.duet_setup_mode:
                 painter.setBrush(QColor(24, 29, 38, 140))
                 painter.setPen(QPen(QColor(48, 56, 70, 140), 1))
@@ -567,19 +808,30 @@ class _RollingTeleprompterWidget(QWidget):
                 painter.setPen(p_fg)
                 painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, f"[{st_upper}]")
 
-            font_size = 20 if is_active_line else (14 if rel == 1 else 12)
-            font = QFont("Segoe UI", font_size, QFont.Weight.Bold if is_active_line else QFont.Weight.DemiBold)
+            line_style = header.get_style(st_upper)
+            if is_active_line:
+                # Active line uses the exact KBP style font scaled 1:1 with the 16:9 vertical borders
+                font = _make_video_font(line_style, scale=guide_scale)
+            else:
+                # Upcoming/previous lines scale down for visual hierarchy while keeping style family
+                rel_scale = guide_scale * (0.68 if rel == 1 else 0.58)
+                font = _make_video_font(line_style, scale=rel_scale)
             painter.setFont(font)
-            fm = QFontMetrics(font)
+            fm = QFontMetricsF(font)
 
-            # Measure total width of syllables so line is centered cleanly
-            widths = [fm.horizontalAdvance(s.text) for s in line.syllables]
+            use_upper = line_style.uppercase == "U"
+            disp_texts = [s.text.upper() if use_upper else s.text for s in line.syllables]
+            widths = [fm.horizontalAdvance(t) for t in disp_texts]
             total_w = sum(widths)
-            min_x = 70.0 if self.duet_mode else 36.0
-            x = max(min_x, (w - total_w) * 0.5)
+            if is_active_line:
+                # Center symmetrically against the 16:9 border guides (allow overflow past guides to show!)
+                x = (w - total_w) * 0.5
+            else:
+                min_x = 70.0 if self.duet_mode else 36.0
+                x = max(min_x, (w - total_w) * 0.5)
             text_y = y_center + fm.ascent() * 0.36
 
-            for s_idx, (syl, sw) in enumerate(zip(line.syllables, widths)):
+            for s_idx, (syl, disp_t, sw) in enumerate(zip(line.syllables, disp_texts, widths)):
                 coord = (p_i, l_i, s_idx)
                 is_next = (not self.duet_setup_mode) and (coord == self.cursor)
 
@@ -616,7 +868,7 @@ class _RollingTeleprompterWidget(QWidget):
                             color = QColor(152, 212, 174, alpha)
 
                 painter.setPen(color)
-                painter.drawText(int(round(x)), int(round(text_y)), syl.text)
+                painter.drawText(int(round(x)), int(round(text_y)), disp_t)
                 x += sw
 
 
@@ -826,6 +1078,7 @@ class TapSyncView(QWidget):
     status_message = Signal(str, int)
     main_audio_status_changed = Signal(bool, str)  # (loaded, raw_path)
     dirty_changed = Signal(bool)
+    history_changed = Signal()
     open_project_requested = Signal(str)  # path selected in Project Organizer
     save_project_requested = Signal()  # unified Save Project action
 
@@ -834,6 +1087,9 @@ class TapSyncView(QWidget):
         self.audio = audio
         self.draft: TapSyncDraft = TapSyncDraft()
         self._item_by_coord: Dict[Tuple[int, int], QTreeWidgetItem] = {}
+        self._undo_stack: List[Tuple[str, TapSyncDraft, Optional[Tuple[int, int, int]], Optional[int]]] = []
+        self._redo_stack: List[Tuple[str, TapSyncDraft, Optional[Tuple[int, int, int]], Optional[int]]] = []
+        self._max_history: int = 80
 
         self._is_syncing: bool = False
         self._duet_setup_mode: bool = False
@@ -1071,6 +1327,7 @@ class TapSyncView(QWidget):
             "QTreeWidget::item:selected { background-color: #2b5b84; color: #ffffff; }"
         )
         self._line_tree.itemClicked.connect(self._on_tree_clicked)
+        self._line_tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
 
         right_box = QWidget(splitter)
         right_layout = QVBoxLayout(right_box)
@@ -1080,6 +1337,7 @@ class TapSyncView(QWidget):
         self._teleprompter = _RollingTeleprompterWidget(right_box)
         self._teleprompter.end_phrase_requested.connect(self._end_current_phrase)
         self._teleprompter.line_style_cycle_requested.connect(self._cycle_line_duet_style)
+        self._teleprompter.page_edit_requested.connect(self._open_page_lyrics_editor)
         self._waveform = _TapWaveformStrip(self.audio, right_box)
         self._waveform.playhead_scrubbed.connect(self.playhead_scrubbed.emit)
 
@@ -1202,6 +1460,81 @@ class TapSyncView(QWidget):
     def has_synced_project(self) -> bool:
         return self._has_synced_project
 
+    @property
+    def can_undo(self) -> bool:
+        return (not self._locked) and (not self._is_syncing) and bool(self._undo_stack)
+
+    @property
+    def can_redo(self) -> bool:
+        return (not self._locked) and (not self._is_syncing) and bool(self._redo_stack)
+
+    @property
+    def undo_label(self) -> str:
+        return self._undo_stack[-1][0] if self.can_undo else ""
+
+    @property
+    def redo_label(self) -> str:
+        return self._redo_stack[-1][0] if self.can_redo else ""
+
+    def _clear_edit_history(self) -> None:
+        if self._undo_stack or self._redo_stack:
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self.history_changed.emit()
+
+    def _push_undo_snapshot(self, label: str) -> None:
+        self._undo_stack.append(
+            (label, deepcopy(self.draft), self._cursor, self._teleprompter.preview_flat_idx)
+        )
+        if len(self._undo_stack) > self._max_history:
+            del self._undo_stack[: len(self._undo_stack) - self._max_history]
+        self._redo_stack.clear()
+        self.history_changed.emit()
+
+    def _restore_snapshot(
+        self,
+        draft: TapSyncDraft,
+        cursor: Optional[Tuple[int, int, int]],
+        preview_flat_idx: Optional[int],
+    ) -> None:
+        self._apply_draft(draft, load_audio=False, clear_history=False)
+        flat = self.draft.flat_lines()
+        if cursor is not None and self._get_syl(cursor) is not None:
+            self._cursor = cursor
+        if preview_flat_idx is not None and flat:
+            self._teleprompter.preview_flat_idx = max(0, min(preview_flat_idx, len(flat) - 1))
+        else:
+            self._teleprompter.preview_flat_idx = None
+        self._set_dirty(True)
+        self._autosave()
+        self._sync_visuals()
+        self.history_changed.emit()
+        self.history_changed.emit()
+
+    def undo_edit(self) -> bool:
+        """Undo the last lyric edit in Tap Sync (Ctrl+Z)."""
+        if not self.can_undo:
+            return False
+        label, prev_draft, prev_cursor, prev_flat_idx = self._undo_stack.pop()
+        self._redo_stack.append(
+            (label, deepcopy(self.draft), self._cursor, self._teleprompter.preview_flat_idx)
+        )
+        self._restore_snapshot(prev_draft, prev_cursor, prev_flat_idx)
+        self.status_message.emit(f"Undid {label}", 3000)
+        return True
+
+    def redo_edit(self) -> bool:
+        """Redo the last undone lyric edit in Tap Sync (Ctrl+Y / Ctrl+Shift+Z)."""
+        if not self.can_redo:
+            return False
+        label, next_draft, next_cursor, next_flat_idx = self._redo_stack.pop()
+        self._undo_stack.append(
+            (label, deepcopy(self.draft), self._cursor, self._teleprompter.preview_flat_idx)
+        )
+        self._restore_snapshot(next_draft, next_cursor, next_flat_idx)
+        self.status_message.emit(f"Redid {label}", 3000)
+        return True
+
     def set_synced_project_active(self, active: bool) -> None:
         self._has_synced_project = bool(active)
         self._update_lock_ui()
@@ -1216,6 +1549,7 @@ class TapSyncView(QWidget):
             self._lock_reason = ""
         self._update_lock_ui()
         self._sync_visuals()
+        self.history_changed.emit()
 
     def _toggle_lock(self) -> None:
         if self._locked:
@@ -1423,9 +1757,11 @@ class TapSyncView(QWidget):
     def _autosave(self) -> None:
         self.archive_current_draft()
 
-    def _apply_draft(self, draft: TapSyncDraft, load_audio: bool = True) -> bool:
+    def _apply_draft(self, draft: TapSyncDraft, load_audio: bool = True, clear_history: bool = True) -> bool:
         if self._is_syncing:
             self.stop_syncing()
+        if clear_history:
+            self._clear_edit_history()
         self.draft = draft
         self._teleprompter.draft = draft
         self._teleprompter.preview_flat_idx = None
@@ -1472,6 +1808,7 @@ class TapSyncView(QWidget):
         self._rebuild_tree()
         self._update_lock_ui()
         self._sync_visuals()
+        self.history_changed.emit()
         return main_loaded
 
     def _refresh_template_btn(self) -> None:
@@ -1503,6 +1840,15 @@ class TapSyncView(QWidget):
         dlg = _LyricsInputDialog(self.draft, self, settings=self._settings)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        old_text = self.draft.to_lyrics_text()
+        if (
+            dlg.lyrics_text.strip() == old_text.strip()
+            and dlg.title_text == self.draft.title
+            and dlg.artist_text == self.draft.artist
+        ):
+            self.setFocus()
+            return
+        self._push_undo_snapshot("Edit Lyrics")
         new_draft = TapSyncDraft.from_lyrics_text(dlg.lyrics_text)
         new_draft.title = dlg.title_text
         new_draft.artist = dlg.artist_text
@@ -1526,7 +1872,7 @@ class TapSyncView(QWidget):
             if bucket:
                 new_ln.style = bucket.pop(0)
         was_setup = self._duet_setup_mode
-        self._apply_draft(new_draft, load_audio=False)
+        self._apply_draft(new_draft, load_audio=False, clear_history=False)
         if was_setup and new_draft.duet_mode:
             self.enter_duet_setup()
         self._set_dirty(True)
@@ -1649,6 +1995,9 @@ class TapSyncView(QWidget):
             self._settings.setValue("default_template_kbp", path)
             self._settings.sync()
             self._refresh_template_btn()
+            self._teleprompter.invalidate_cache()
+            self._rebuild_tree()
+            self._teleprompter.update()
             self._autosave()
             self.status_message.emit(f"Style template set from {Path(path).name}", 4000)
 
@@ -1714,6 +2063,7 @@ class TapSyncView(QWidget):
         self._rebuild_tree()
         self._update_lock_ui()
         self._sync_visuals()
+        self.history_changed.emit()
         self.setFocus()
 
     def enter_duet_setup(self) -> None:
@@ -1729,6 +2079,7 @@ class TapSyncView(QWidget):
         self._rebuild_tree()
         self._update_lock_ui()
         self._sync_visuals()
+        self.history_changed.emit()
         self.setFocus()
 
     def finish_duet_setup(self) -> None:
@@ -1770,6 +2121,7 @@ class TapSyncView(QWidget):
         self._rebuild_tree()
         self._update_lock_ui()
         self._sync_visuals()
+        self.history_changed.emit()
         self.setFocus()
 
     def _assign_duet_style_to_selection(self, style_letter: str, advance_line: bool = False) -> None:
@@ -1935,6 +2287,7 @@ class TapSyncView(QWidget):
         self._line_tree.clear()
         self._item_by_coord.clear()
         hdr_font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        header = self.draft.resolve_header()
         for p_idx, page in enumerate(self.draft.pages):
             p_item = QTreeWidgetItem([f"Page {p_idx + 1}"])
             p_item.setFont(0, hdr_font)
@@ -1942,11 +2295,12 @@ class TapSyncView(QWidget):
             p_item.setBackground(0, QBrush(QColor(34, 40, 52)))
             p_item.setForeground(0, QBrush(QColor(155, 185, 225)))
             p_item.setData(0, Qt.ItemDataRole.UserRole, (p_idx, -1))
+            p_item.setToolTip(0, f"Double-click to edit Page {p_idx + 1} lyrics")
             self._line_tree.addTopLevelItem(p_item)
             for l_idx, line in enumerate(page.lines):
                 child = QTreeWidgetItem([self._format_tree_line(line)])
                 child.setData(0, Qt.ItemDataRole.UserRole, (p_idx, l_idx))
-                self._style_tree_item(child, line)
+                self._style_tree_item(child, line, p_idx=p_idx, header=header)
                 p_item.addChild(child)
                 self._item_by_coord[(p_idx, l_idx)] = child
             p_item.setExpanded(True)
@@ -1961,7 +2315,34 @@ class TapSyncView(QWidget):
             return f"{dot} [{(line.style or 'A').upper()}] {txt}"
         return f"{dot} {txt}"
 
-    def _style_tree_item(self, item: QTreeWidgetItem, line: TapLine) -> None:
+    def _style_tree_item(
+        self,
+        item: QTreeWidgetItem,
+        line: TapLine,
+        p_idx: Optional[int] = None,
+        header: Optional[KbpHeader] = None,
+    ) -> None:
+        hdr = header if header is not None else self.draft.resolve_header()
+        line_w, usable_w, style_used = _measure_line_16_9(line.full_text, hdr, line.style)
+        ratio = line_w / usable_w if usable_w > 0 else 0.0
+        pct = int(round(ratio * 100))
+        page_hint = f" — Double-click to edit Page {p_idx + 1}" if p_idx is not None else ""
+        if ratio > _BORDER_OVERFLOW_RATIO:
+            item.setToolTip(
+                0,
+                f"16:9 width: {pct}% ({style_used.font_name} {style_used.font_size}pt) — Exceeds 16:9 border!{page_hint}",
+            )
+        elif ratio >= _BORDER_NEAR_RATIO:
+            item.setToolTip(
+                0,
+                f"16:9 width: {pct}% ({style_used.font_name} {style_used.font_size}pt) — Close to 16:9 border{page_hint}",
+            )
+        else:
+            item.setToolTip(
+                0,
+                f"16:9 width: {pct}% ({style_used.font_name} {style_used.font_size}pt){page_hint}",
+            )
+
         st = line.sync_state
         if self.draft.duet_mode:
             letter = (line.style or "A").upper()
@@ -1987,6 +2368,10 @@ class TapSyncView(QWidget):
             item.setForeground(0, QBrush(QColor(110, 231, 183)))
         elif st == "partial":
             item.setForeground(0, QBrush(QColor(251, 191, 36)))
+        elif ratio > _BORDER_OVERFLOW_RATIO:
+            item.setForeground(0, QBrush(QColor(252, 165, 165)))
+        elif ratio >= _BORDER_NEAR_RATIO:
+            item.setForeground(0, QBrush(QColor(253, 230, 138)))
         else:
             item.setForeground(0, QBrush(QColor(203, 213, 225)))
 
@@ -1995,7 +2380,7 @@ class TapSyncView(QWidget):
         if item is not None and 0 <= p_idx < len(self.draft.pages) and 0 <= l_idx < len(self.draft.pages[p_idx].lines):
             line = self.draft.pages[p_idx].lines[l_idx]
             item.setText(0, self._format_tree_line(line))
-            self._style_tree_item(item, line)
+            self._style_tree_item(item, line, p_idx=p_idx)
 
     def _highlight_cursor_in_tree(self) -> None:
         focus = self._cursor or self._open_coord
@@ -2053,6 +2438,75 @@ class TapSyncView(QWidget):
         if line.first_start_cs is not None:
             self.playhead_scrubbed.emit(float(max(0, line.first_start_cs - self.draft.pre_roll_cs)))
         self._sync_visuals()
+        self.setFocus()
+
+    def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        p_idx, l_idx = data
+        self._open_page_lyrics_editor(p_idx, max(0, l_idx))
+
+    def _open_page_lyrics_editor(self, page_idx: int, line_idx: int = 0) -> None:
+        if self._locked or self._is_syncing:
+            return
+        if not (0 <= page_idx < len(self.draft.pages)):
+            return
+        page = self.draft.pages[page_idx]
+        dlg = _PageLyricsEditDialog(
+            page_idx=page_idx,
+            page=page,
+            header=self.draft.resolve_header(),
+            focus_line_idx=line_idx,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.setFocus()
+            return
+
+        old_page_text = "\n".join(ln.slash_text for ln in page.lines if ln.syllables)
+        if dlg.lyrics_text.strip() == old_page_text.strip():
+            self.setFocus()
+            return
+
+        self._push_undo_snapshot(f"Edit Page {page_idx + 1} Lyrics")
+        focus_page_idx, inserted = self.draft.replace_page_from_text(page_idx, dlg.lyrics_text)
+        self._open_coord = None
+        self._last_released_coord = None
+        self._punch_line = None
+        self._pending_punch_line = None
+
+        # Keep the user right on the page/line they just edited
+        if self.draft.pages:
+            fp = max(0, min(focus_page_idx, len(self.draft.pages) - 1))
+            fl = max(0, min(line_idx, len(self.draft.pages[fp].lines) - 1))
+            target_line = self.draft.pages[fp].lines[fl]
+            s_idx = next((i for i, s in enumerate(target_line.syllables) if not s.has_start), 0)
+            if not self.draft.duet_mode or self.draft.is_line_in_pass(target_line):
+                self._cursor = (fp, fl, s_idx)
+            else:
+                self._cursor = (
+                    self.draft.first_unsynced_coord_for_pass(self.draft.duet_pass)
+                    or self.draft.first_coord_for_pass(self.draft.duet_pass)
+                )
+            flat = self.draft.flat_lines()
+            flat_idx = next((idx for idx, (p_i, l_i, _) in enumerate(flat) if (p_i, l_i) == (fp, fl)), None)
+            self._teleprompter.preview_flat_idx = flat_idx
+        else:
+            self._cursor = None
+            self._teleprompter.preview_flat_idx = None
+
+        self._rebuild_tree()
+        self._set_dirty(True)
+        self._autosave()
+        self._sync_visuals()
+        self.history_changed.emit()
+        if inserted > 1:
+            self.status_message.emit(f"Updated Page {page_idx + 1} (split into {inserted} pages)", 3500)
+        elif inserted == 0:
+            self.status_message.emit(f"Removed empty Page {page_idx + 1}", 3500)
+        else:
+            self.status_message.emit(f"Updated Page {page_idx + 1} lyrics", 3000)
         self.setFocus()
 
     def _sync_visuals(self) -> None:
@@ -2202,6 +2656,7 @@ class TapSyncView(QWidget):
             self._waveform.playhead_cs = seek_cs
         self.audio.play()
         self._sync_visuals()
+        self.history_changed.emit()
         self.setFocus()
 
     def stop_syncing(self) -> None:
@@ -2226,6 +2681,7 @@ class TapSyncView(QWidget):
         self._pause_btn.setStyleSheet("")
         self._autosave()
         self._sync_visuals()
+        self.history_changed.emit()
 
     def toggle_syncing(self) -> None:
         if self._is_syncing:
@@ -2363,6 +2819,7 @@ class TapSyncView(QWidget):
         self._last_released_coord = None
         self._autosave()
         self._sync_visuals()
+        self.history_changed.emit()
 
     def _clear_all_syncs(self) -> None:
         if self._locked or not self.draft.pages:
@@ -2390,6 +2847,7 @@ class TapSyncView(QWidget):
         self._punch_line = None
         self._autosave()
         self._sync_visuals()
+        self.history_changed.emit()
         self.status_message.emit("Cleared all sync timestamps — ready to restart from syllable 1", 4000)
         self.setFocus()
 

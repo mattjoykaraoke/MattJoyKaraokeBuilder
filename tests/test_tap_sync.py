@@ -309,6 +309,7 @@ def test_synced_kbp_locks_tap_sync_and_blocks_unsynced_import(tmp_path, monkeypa
         assert win.tap_sync_view.has_synced_project is False
         assert win.tap_sync_view._btn_load_lyr.isEnabled() is True
     finally:
+        win.tap_sync_view.mark_clean()
         win.close()
         app.processEvents()
 
@@ -523,6 +524,7 @@ def test_unified_save_works_for_unsynced_tap_sync_project(tmp_path, monkeypatch)
         assert saved_draft.exists()
         assert win.tap_sync_view.is_dirty is False
     finally:
+        win.tap_sync_view.mark_clean()
         win.close()
         app.processEvents()
 
@@ -640,6 +642,7 @@ def test_drag_and_drop_mjkp_loads_project_and_updates_organizer(tmp_path, monkey
         assert win._tabs.currentWidget() is win.tap_sync_view
         assert [p.resolve() for p in list_saved_projects(reg_path)] == [mjkp_path.resolve()]
     finally:
+        win.tap_sync_view.mark_clean()
         win.close()
         app.processEvents()
 
@@ -881,5 +884,202 @@ def test_duet_mode_setup_two_pass_sync_and_overlapping_kbp_build(tmp_path, monke
         view.stop_syncing()
         view.close()
         app.processEvents()
+
+
+def test_replace_page_from_text_preserves_timings_and_supports_splitting():
+    draft = TapSyncDraft.from_lyrics_text(
+        "Hel/lo world\n"
+        "A ver/y long sec/ond line\n"
+        "\n"
+        "Page two stays un/touched\n"
+    )
+    # Sync Page 1 Line 1 and give it a custom style
+    ln0 = draft.pages[0].lines[0]
+    ln0.style = "B"
+    ln0.syllables[0].start_cs, ln0.syllables[0].end_cs = 100, 140
+    ln0.syllables[1].start_cs, ln0.syllables[1].end_cs = 140, 180
+    ln0.syllables[2].start_cs, ln0.syllables[2].end_cs = 180, 240
+
+    # Edit Page 1: keep line 1 unchanged, split line 2 across two lines
+    focus_idx, inserted = draft.replace_page_from_text(
+        0,
+        "Hel/lo world\nA ver/y long\nsec/ond line\n",
+    )
+    assert (focus_idx, inserted) == (0, 1)
+    assert len(draft.pages) == 2
+    assert len(draft.pages[0].lines) == 3
+    assert draft.pages[0].lines[0].style == "B"
+    assert draft.pages[0].lines[0].syllables[0].start_cs == 100
+    assert draft.pages[0].lines[0].syllables[2].end_cs == 240
+    assert draft.pages[0].lines[1].full_text == "A very long"
+    assert draft.pages[0].lines[2].full_text == "second line"
+    assert draft.pages[1].lines[0].full_text == "Page two stays untouched"
+
+    # Splitting Page 1 with a blank line creates two pages in place
+    focus_idx, inserted = draft.replace_page_from_text(
+        0,
+        "Hel/lo world\n\nA ver/y long\nsec/ond line\n",
+    )
+    assert (focus_idx, inserted) == (0, 2)
+    assert len(draft.pages) == 3
+    assert draft.pages[0].lines[0].syllables[0].start_cs == 100
+    assert draft.pages[1].lines[0].full_text == "A very long"
+    assert draft.pages[2].lines[0].full_text == "Page two stays untouched"
+
+    # Clearing a page removes it cleanly
+    focus_idx, inserted = draft.replace_page_from_text(1, "   \n")
+    assert inserted == 0
+    assert len(draft.pages) == 2
+
+
+def test_teleprompter_border_guide_and_double_click_page_editor(tmp_path, monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QImage, QMouseEvent
+    from PySide6.QtWidgets import QApplication, QDialog
+    from kbp_editor.audio import AudioEngine
+    from kbp_editor.ui import tap_sync_view as tsv_mod
+    from kbp_editor.ui.tap_sync_view import TapSyncView, _PageLyricsEditDialog
+
+    app = QApplication.instance() or QApplication([])
+    audio = AudioEngine()
+    view = TapSyncView(audio)
+    try:
+        draft = TapSyncDraft.from_lyrics_text(
+            "Short line one\n"
+            "This is a much lon/ger line that we might want to split in/to two lines\n"
+            "\n"
+            "Sec/ond page line one\n"
+        )
+        view._apply_draft(draft, load_audio=False)
+        tp = view._teleprompter
+        tp.resize(860, 320)
+
+        # Paint the teleprompter to populate hit-test rects and exercise the 16:9 vertical border drawing
+        img = QImage(860, 320, QImage.Format.Format_ARGB32)
+        tp.render(img)
+        assert len(tp._rendered_line_rects) >= 2
+
+        # Double-clicking a line in the teleprompter emits page_edit_requested with (page_idx, line_idx)
+        emitted = []
+        tp.page_edit_requested.connect(lambda p, l: emitted.append((p, l)))
+        rect0, p0, l0 = tp._rendered_line_rects[0]
+        dbl = QMouseEvent(
+            QEvent.Type.MouseButtonDblClick,
+            rect0.center(),
+            rect0.center(),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        # Intercept the modal dialog so it doesn't block the test
+        monkeypatch.setattr(_PageLyricsEditDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
+        tp.mouseDoubleClickEvent(dbl)
+        assert emitted == [(p0, l0)]
+
+        # Double-clicking while syncing or locked does NOT open the page editor
+        emitted.clear()
+        tp.is_syncing = True
+        tp.mouseDoubleClickEvent(dbl)
+        assert emitted == []
+        tp.is_syncing = False
+
+        # Test _PageLyricsEditDialog directly for live 16:9 fit status and editing
+        dlg = _PageLyricsEditDialog(0, view.draft.pages[0], view.draft.resolve_header(), focus_line_idx=1)
+        assert "Short line one" in dlg.lyrics_text
+        assert "16:9 border" in dlg._fit_label.text()
+        dlg._text_edit.setPlainText("Short line one\nFixed ty/po\nSplit line two")
+        assert dlg._fit_label.text()
+        dlg.close()
+
+        # Test TapSyncView._open_page_lyrics_editor accepting edits to Page 1 only
+        class _FakePageDialog:
+            def __init__(self, page_idx, page, header, focus_line_idx=0, parent=None):
+                self.page_idx = page_idx
+                self.focus_line_idx = focus_line_idx
+                self.lyrics_text = "Short line one\nSplit first half\nSplit sec/ond half"
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(tsv_mod, "_PageLyricsEditDialog", _FakePageDialog)
+        view._open_page_lyrics_editor(0, 1)
+        assert len(view.draft.pages) == 2
+        assert [ln.full_text for ln in view.draft.pages[0].lines] == [
+            "Short line one",
+            "Split first half",
+            "Split second half",
+        ]
+        assert view.draft.pages[1].lines[0].full_text == "Second page line one"
+        assert view.is_dirty is True
+
+        # Undo restores Page 1 to its original pre-edit lyrics, and Redo re-applies the split
+        assert view.can_undo is True
+        assert view.undo_label == "Edit Page 1 Lyrics"
+        assert view.undo_edit() is True
+        assert [ln.full_text for ln in view.draft.pages[0].lines] == [
+            "Short line one",
+            "This is a much longer line that we might want to split into two lines",
+        ]
+        assert view.can_undo is False
+        assert view.can_redo is True
+        assert view.redo_edit() is True
+        assert [ln.full_text for ln in view.draft.pages[0].lines] == [
+            "Short line one",
+            "Split first half",
+            "Split second half",
+        ]
+    finally:
+        view.stop_syncing()
+        view.close()
+        app.processEvents()
+
+
+def test_main_window_undo_redo_routes_to_tap_sync_lyric_edits(monkeypatch):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+    from kbp_editor.ui import tap_sync_view as tsv_mod
+    from kbp_editor.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    try:
+        win._tabs.setCurrentWidget(win.tap_sync_view)
+        draft = TapSyncDraft.from_lyrics_text("Line one\nLine two\n\nPage two")
+        win.tap_sync_view._apply_draft(draft, load_audio=False)
+        win._refresh_actions()
+        assert win._act_undo.isEnabled() is False
+
+        class _FakePageDialog:
+            def __init__(self, page_idx, page, header, focus_line_idx=0, parent=None):
+                self.lyrics_text = "Line one fixed\nLine two"
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr(tsv_mod, "_PageLyricsEditDialog", _FakePageDialog)
+        win.tap_sync_view._open_page_lyrics_editor(0, 0)
+        assert win.tap_sync_view.draft.pages[0].lines[0].full_text == "Line one fixed"
+        assert win._act_undo.isEnabled() is True
+        assert "Edit Page 1 Lyrics" in win._act_undo.text()
+
+        # Trigger MainWindow Undo (same path as Ctrl+Z / Edit -> Undo)
+        win.undo()
+        assert win.tap_sync_view.draft.pages[0].lines[0].full_text == "Line one"
+        assert win._act_undo.isEnabled() is False
+        assert win._act_redo.isEnabled() is True
+
+        # Trigger MainWindow Redo (same path as Ctrl+Y / Edit -> Redo)
+        win.redo()
+        assert win.tap_sync_view.draft.pages[0].lines[0].full_text == "Line one fixed"
+        assert win._act_undo.isEnabled() is True
+        assert win._act_redo.isEnabled() is False
+    finally:
+        win.tap_sync_view.mark_clean()
+        win.close()
+        app.processEvents()
+
 
 
