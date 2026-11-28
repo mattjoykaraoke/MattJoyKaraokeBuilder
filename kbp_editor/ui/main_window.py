@@ -480,6 +480,18 @@ class MainWindow(QMainWindow):
         self._act_dup_line.triggered.connect(self.wiping_view._duplicate_selected_line)
         m_edit.addAction(self._act_dup_line)
 
+        act_move_line_up = QAction("Move Selected Line &Up", self)
+        act_move_line_up.setShortcut(QKeySequence("Alt+Up"))
+        act_move_line_up.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        act_move_line_up.triggered.connect(lambda: self._move_selected_line(-1))
+        m_edit.addAction(act_move_line_up)
+
+        act_move_line_down = QAction("Move Selected Line D&own", self)
+        act_move_line_down.setShortcut(QKeySequence("Alt+Down"))
+        act_move_line_down.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        act_move_line_down.triggered.connect(lambda: self._move_selected_line(1))
+        m_edit.addAction(act_move_line_down)
+
         self._act_dup_page = QAction("&Duplicate Selected Page (Next Style)", self)
         self._act_dup_page.setShortcut(QKeySequence("Ctrl+D"))
         self._act_dup_page.triggered.connect(self.wiping_view._duplicate_selected_page)
@@ -1179,6 +1191,11 @@ class MainWindow(QMainWindow):
         dlg = AboutDialog(self, on_check_updates=lambda: self._check_for_updates(manual=True))
         dlg.exec()
 
+    def _move_selected_line(self, delta: int) -> None:
+        if self._tabs.currentWidget() is self.tap_sync_view:
+            return
+        self.wiping_view._move_selected_line(delta)
+
     # ------------------------------------------------------------------
     # GitHub Release Update Checker & In-App Installer
     # ------------------------------------------------------------------
@@ -1372,7 +1389,7 @@ class MainWindow(QMainWindow):
             self.project.optimize_windows()
         self.history.push(label, self.project)
         self.wiping_view.canvas.invalidate_layout_cache()
-        if any(k in label for k in ("Duet", "Style", "Fixed", "Add ", "Delete ", "Split", "Join", "Duplicate")):
+        if any(k in label for k in ("Duet", "Style", "Fixed", "Add ", "Delete ", "Split", "Join", "Duplicate", "Move ")):
             self.preview_win.canvas.invalidate_cache()
             self.wiping_view.set_project(self.project, preserve_view=True)
             self._rebuild_page_buttons()

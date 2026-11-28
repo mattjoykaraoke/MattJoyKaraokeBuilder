@@ -800,5 +800,58 @@ def test_duet_call_and_response_pulls_response_start_to_match_call_instead_of_mi
     assert proj.pages[1].lines[0].display_start == 840
 
 
+def test_move_line_within_and_across_pages_preserves_timestamps():
+    """move_line shuffles lines within a page, crosses page boundaries, removes empty pages, and keeps timestamps."""
+    header = KbpHeader.parse(["HEADERV2", "Status    1"])
+    p1 = Page(lines=[
+        Line("C", "A", 0, 0, syllables=[Syllable("L1", 100, 200)]),
+        Line("C", "A", 0, 0, syllables=[Syllable("L2", 250, 350)]),
+    ])
+    p2 = Page(lines=[
+        Line("C", "A", 0, 0, syllables=[Syllable("L3", 400, 500)]),
+    ])
+    proj = KbpProject(header=header, pages=[p1, p2])
+
+    # Boundary no-ops
+    assert proj.move_line(0, 0, -1) is None
+    assert proj.move_line(1, 0, 1) is None
+
+    # Duplicate P1 L1 (becomes P1 L2) then shuffle it down to P1 L3
+    proj.duplicate_line(0, 0)
+    assert [ln.full_text for ln in proj.pages[0].lines] == ["L1", "L1", "L2"]
+    assert proj.move_line(0, 1, 1) == (0, 2)
+    assert [ln.full_text for ln in proj.pages[0].lines] == ["L1", "L2", "L1"]
+    assert proj.pages[0].lines[2].syllables[0].start == 100
+    assert proj.pages[0].lines[2].syllables[0].end == 200
+
+    # Cross down from bottom of P1 into top of P2
+    assert proj.move_line(0, 2, 1) == (1, 0)
+    assert [ln.full_text for ln in proj.pages[0].lines] == ["L1", "L2"]
+    assert [ln.full_text for ln in proj.pages[1].lines] == ["L1", "L3"]
+
+    # Cross up from top of P2 back to bottom of P1
+    assert proj.move_line(1, 0, -1) == (0, 2)
+    assert [ln.full_text for ln in proj.pages[0].lines] == ["L1", "L2", "L1"]
+    assert [ln.full_text for ln in proj.pages[1].lines] == ["L3"]
+
+    # Moving the sole line of P2 up into P1 removes the now-empty P2
+    assert proj.move_line(1, 0, -1) == (0, 3)
+    assert len(proj.pages) == 1
+    assert [ln.full_text for ln in proj.pages[0].lines] == ["L1", "L2", "L1", "L3"]
+
+    # Moving the sole line of a 1-line P1 down into P2 removes the now-empty P1 and shifts target page to 0
+    proj2 = KbpProject(
+        header=header,
+        pages=[
+            Page(lines=[Line("C", "A", 0, 0, syllables=[Syllable("Solo", 10, 20)])]),
+            Page(lines=[Line("C", "A", 0, 0, syllables=[Syllable("Next", 30, 40)])]),
+        ],
+    )
+    assert proj2.move_line(0, 0, 1) == (0, 0)
+    assert len(proj2.pages) == 1
+    assert [ln.full_text for ln in proj2.pages[0].lines] == ["Solo", "Next"]
+
+
+
 
 

@@ -5,6 +5,14 @@ All notable changes to **Matt Joy Karaoke Builder** will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-11-27
+
+### Added
+- **Move Line Up / Down (Within & Across Pages):**
+  - Added **Move Line Up (`Alt+Up`)** and **Move Line Down (`Alt+Down`)** in the **Lyrics Wiping** ribbon (**Lines** → `↑` / `↓`), the line right-click menu (sidebar & timeline canvas), and the **Edit** menu so duplicated or existing lines can be shuffled to any slot within a page or across page boundaries (automatically removing any source page left empty).
+  - Keeps syllable timestamps unchanged and preserves whole-line selection after each move so you can duplicate a repeating line, shuffle it into its target row or page, and immediately drag it to its singing position.
+  - *Note on Auto-Reset Display:* Because shuffling preserves the line's original timestamps, if **Auto-Reset Display** is enabled, the page's display windows may look temporarily out of order until you drag the moved line forward to where it is actually sung — once dragged into place, the display windows recalculate cleanly.
+
 ## [1.1.2] - 2026-11-27
 
 ### Added

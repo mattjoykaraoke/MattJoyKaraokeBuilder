@@ -1298,6 +1298,61 @@ class KbpProject:
         page.lines.insert(line_idx + 1, new_line)
         return new_line
 
+    def move_line(
+        self,
+        page_idx: int,
+        line_idx: int,
+        delta: int,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Move a line up (delta < 0) or down (delta > 0) by one slot, crossing page
+        boundaries when at the top or bottom of a page. Removes any source page
+        left empty. Keeps syllable timestamps unchanged.
+        Returns the new (page_idx, line_idx) or None if the line cannot move further.
+        """
+        if delta == 0 or not (0 <= page_idx < len(self.pages)):
+            return None
+        page = self.pages[page_idx]
+        if not (0 <= line_idx < len(page.lines)):
+            return None
+
+        if delta < 0:
+            if line_idx > 0:
+                page.lines[line_idx - 1], page.lines[line_idx] = (
+                    page.lines[line_idx],
+                    page.lines[line_idx - 1],
+                )
+                return (page_idx, line_idx - 1)
+            if page_idx > 0:
+                prev_page = self.pages[page_idx - 1]
+                line = page.lines.pop(0)
+                prev_page.lines.append(line)
+                new_p_idx = page_idx - 1
+                new_l_idx = len(prev_page.lines) - 1
+                if not page.lines:
+                    self.pages.pop(page_idx)
+                return (new_p_idx, new_l_idx)
+            return None
+
+        # delta > 0
+        if line_idx + 1 < len(page.lines):
+            page.lines[line_idx], page.lines[line_idx + 1] = (
+                page.lines[line_idx + 1],
+                page.lines[line_idx],
+            )
+            return (page_idx, line_idx + 1)
+        if page_idx + 1 < len(self.pages):
+            next_page = self.pages[page_idx + 1]
+            line = page.lines.pop(line_idx)
+            next_page.lines.insert(0, line)
+            if not page.lines:
+                self.pages.pop(page_idx)
+                new_p_idx = page_idx
+            else:
+                new_p_idx = page_idx + 1
+            return (new_p_idx, 0)
+        return None
+
     def duplicate_page(
         self,
         page_number: int,          # 1-based page number (e.g. 8)

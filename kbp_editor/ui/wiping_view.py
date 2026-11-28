@@ -1682,6 +1682,8 @@ class LyricsWipingView(QWidget):
         _add_btn(l_r1, "Split", "Split current line into two lines at the selected syllable", self._split_line)
         _add_btn(l_r1, "Join", "Join current line with the next line", self._join_line)
         _add_btn(l_r1, "Delete", "Delete the selected line", self._delete_line)
+        _add_btn(l_r1, "↑", "Move selected line up one slot (Alt+Up) — crosses to previous page at top", lambda: self._move_selected_line(-1))
+        _add_btn(l_r1, "↓", "Move selected line down one slot (Alt+Down) — crosses to next page at bottom", lambda: self._move_selected_line(1))
         _add_btn(l_r2, "Select", "Highlight all syllables in the current line to slide it (or drag into [B])", self._select_current_line)
         _add_btn(l_r2, "Duplicate", "Duplicate selected line right below it (keeps the same style)", self._duplicate_selected_line)
         self._style_combo = QComboBox(ribbon)
@@ -2180,6 +2182,23 @@ class LyricsWipingView(QWidget):
             menu.addAction(act)
 
         menu.addSeparator()
+        can_up = self.project is not None and (l_idx > 0 or p_idx > 0)
+        can_down = (
+            self.project is not None
+            and 0 <= p_idx < len(self.project.pages)
+            and (l_idx + 1 < len(self.project.pages[p_idx].lines) or p_idx + 1 < len(self.project.pages))
+        )
+        act_up = QAction("Move Line Up (Alt+Up)", self)
+        act_up.setEnabled(can_up)
+        act_up.triggered.connect(lambda: self._move_selected_line(-1))
+        menu.addAction(act_up)
+
+        act_down = QAction("Move Line Down (Alt+Down)", self)
+        act_down.setEnabled(can_down)
+        act_down.triggered.connect(lambda: self._move_selected_line(1))
+        menu.addAction(act_down)
+
+        menu.addSeparator()
         self._add_style_submenu(menu, self.canvas.get_line(p_idx, l_idx))
 
     def _populate_page_menu(self, menu: QMenu, p_idx: int, center_on_select: bool = False) -> None:
@@ -2474,6 +2493,19 @@ class LyricsWipingView(QWidget):
             self._rebuild_tree(preserve_view=True, target_page=p_idx, target_line=new_l_idx)
             self.canvas.select_whole_line(p_idx, new_l_idx, center=False)
             self.project_mutated.emit(f"Duplicate Line (P{p_idx + 1} L{l_idx + 1})")
+
+    def _move_selected_line(self, delta: int) -> None:
+        if not self.project:
+            return
+        p_idx, l_idx = self.canvas.page_idx, self.canvas.line_idx
+        moved = self.project.move_line(p_idx, l_idx, delta)
+        if moved is None:
+            return
+        new_p, new_l = moved
+        self._rebuild_tree(preserve_view=True, target_page=new_p, target_line=new_l)
+        self.canvas.select_whole_line(new_p, new_l, center=False)
+        direction = "Up" if delta < 0 else "Down"
+        self.project_mutated.emit(f"Move Line {direction} (P{new_p + 1} L{new_l + 1})")
 
     def _duplicate_selected_page(self) -> None:
         self._duplicate_page_idx(self.canvas.page_idx)
