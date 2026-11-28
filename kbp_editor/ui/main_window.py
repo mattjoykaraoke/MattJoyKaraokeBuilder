@@ -45,7 +45,12 @@ from .wiping_view import LyricsWipingView
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, initial_file: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        initial_file: Optional[str] = None,
+        initial_audio: Optional[str] = None,
+        initial_vocal: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         _ico = load_app_icon()
@@ -148,14 +153,34 @@ class MainWindow(QMainWindow):
             suf = p_init.suffix.lower()
             if suf == ".mjkp":
                 if self.tap_sync_view.load_draft_file(p_init):
+                    if initial_audio and Path(initial_audio).exists():
+                        if self.audio.load_main(initial_audio):
+                            self._set_main_audio_missing_hint(False)
+                    if initial_vocal and Path(initial_vocal).exists():
+                        self.audio.load_vocal_stem(initial_vocal)
                     self._tabs.setCurrentWidget(self.tap_sync_view)
                     self._refresh_actions()
             elif suf == ".txt":
                 if self.tap_sync_view.load_lyrics_txt(p_init):
+                    if initial_audio and Path(initial_audio).exists():
+                        if self.audio.load_main(initial_audio):
+                            self._set_main_audio_missing_hint(False)
+                    if initial_vocal and Path(initial_vocal).exists():
+                        self.audio.load_vocal_stem(initial_vocal)
                     self._tabs.setCurrentWidget(self.tap_sync_view)
                     self._refresh_actions()
             else:
-                self.open_kbp(initial_file)
+                self.open_kbp(
+                    initial_file,
+                    main_audio_override=initial_audio,
+                    vocal_stem_override=initial_vocal,
+                )
+        else:
+            if initial_audio and Path(initial_audio).exists():
+                if self.audio.load_main(initial_audio):
+                    self._set_main_audio_missing_hint(False)
+            if initial_vocal and Path(initial_vocal).exists():
+                self.audio.load_vocal_stem(initial_vocal)
 
         QTimer.singleShot(2500, self._maybe_auto_check_updates)
 
@@ -999,7 +1024,12 @@ class MainWindow(QMainWindow):
                 f"Could not read vocal stem file:\n{path}\n\nThe file may be corrupted or in an unsupported format.",
             )
 
-    def open_kbp(self, path: str | Path) -> None:
+    def open_kbp(
+        self,
+        path: str | Path,
+        main_audio_override: Optional[str | Path] = None,
+        vocal_stem_override: Optional[str | Path] = None,
+    ) -> None:
         # If another project is already open in this window, automatically open the new file in a fresh window
         if self._has_open_project():
             if self._launch_new_window(path):
@@ -1011,9 +1041,24 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             if "LYRICSV2" in str(exc):
                 if self.tap_sync_view.load_unsynced_kbp(path):
-                    saved_v = self._get_saved_vocal_stem(Path(path), self.audio.main_path or self.tap_sync_view.draft.audio_path)
-                    if saved_v:
-                        self.audio.load_vocal_stem(saved_v)
+                    if main_audio_override and Path(main_audio_override).exists():
+                        if self.audio.load_main(main_audio_override):
+                            self._set_main_audio_missing_hint(False)
+                    vocal_to_load = (
+                        str(Path(vocal_stem_override))
+                        if vocal_stem_override and Path(vocal_stem_override).exists()
+                        else self._get_saved_vocal_stem(
+                            Path(path),
+                            self.audio.main_path or self.tap_sync_view.draft.audio_path,
+                        )
+                    )
+                    if vocal_to_load and self.audio.load_vocal_stem(vocal_to_load):
+                        if vocal_stem_override and Path(vocal_stem_override).exists():
+                            self._save_vocal_stem_for_project(
+                                Path(path),
+                                vocal_to_load,
+                                audio_path=self.audio.main_path or self.tap_sync_view.draft.audio_path,
+                            )
                     self._tabs.setCurrentWidget(self.tap_sync_view)
                     self._refresh_actions()
                 return
@@ -1043,16 +1088,35 @@ class MainWindow(QMainWindow):
         self._rebuild_page_buttons()
 
         audio_loaded = False
-        if proj.header.audio_path:
+        if main_audio_override and Path(main_audio_override).exists():
+            audio_loaded = self.audio.load_main(main_audio_override)
+            if audio_loaded and (
+                not proj.header.audio_path or not Path(proj.header.audio_path).exists()
+            ):
+                proj.header.set_audio_path(str(Path(main_audio_override)))
+        if not audio_loaded and proj.header.audio_path:
             audio_loaded = self.audio.load_main(proj.header.audio_path)
         if not audio_loaded:
             self.audio.clear_main()
         self._set_main_audio_missing_hint(not audio_loaded, proj.header.audio_path)
 
         vocal_loaded = False
-        saved_vocal = self._get_saved_vocal_stem(Path(path), self.audio.main_path or proj.header.audio_path)
-        if saved_vocal:
-            vocal_loaded = self.audio.load_vocal_stem(saved_vocal)
+        loaded_vocal_path: Optional[str] = None
+        if vocal_stem_override and Path(vocal_stem_override).exists():
+            vocal_loaded = self.audio.load_vocal_stem(vocal_stem_override)
+            if vocal_loaded:
+                loaded_vocal_path = str(Path(vocal_stem_override))
+                self._save_vocal_stem_for_project(
+                    Path(path),
+                    loaded_vocal_path,
+                    audio_path=self.audio.main_path or proj.header.audio_path,
+                )
+        if not vocal_loaded:
+            saved_vocal = self._get_saved_vocal_stem(Path(path), self.audio.main_path or proj.header.audio_path)
+            if saved_vocal:
+                vocal_loaded = self.audio.load_vocal_stem(saved_vocal)
+                if vocal_loaded:
+                    loaded_vocal_path = saved_vocal
         if not vocal_loaded:
             self.audio.clear_vocal()
             if self._audio_src_combo.currentIndex() != 0:
@@ -1074,8 +1138,8 @@ class MainWindow(QMainWindow):
         if flushed_gaps > 0:
             bak_info = f", backup: {bak_path.name}" if bak_path is not None else ""
             msg += f" — flushed {flushed_gaps} × 1 cs gap{'s' if flushed_gaps != 1 else ''}{bak_info}"
-        if vocal_loaded and saved_vocal:
-            msg += f" — vocal stem: {Path(saved_vocal).name}"
+        if vocal_loaded and loaded_vocal_path:
+            msg += f" — vocal stem: {Path(loaded_vocal_path).name}"
         if not audio_loaded:
             msg += " — main audio missing/unreadable (click 'Load Main Audio…')"
         self.statusBar().showMessage(msg, 7000 if (flushed_gaps > 0 or not audio_loaded) else 4000)

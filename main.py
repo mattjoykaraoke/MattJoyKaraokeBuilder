@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import sys
 
@@ -9,6 +10,15 @@ from PySide6.QtWidgets import QApplication
 from kbp_editor import APP_NAME
 from kbp_editor.ui.common import load_app_icon
 from kbp_editor.ui.main_window import MainWindow
+
+
+def parse_cli_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("file", nargs="?", default=None)
+    parser.add_argument("--audio", "--main-audio", dest="audio", default=None)
+    parser.add_argument("--vocal", "--vocal-stem", dest="vocal", default=None)
+    args, _unknown = parser.parse_known_args(argv)
+    return args
 
 
 def apply_dark_theme(app: QApplication) -> None:
@@ -32,14 +42,18 @@ def main() -> int:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MattJoy.MattJoyKaraokeBuilder")
         except Exception:
             pass
+    cli_args = parse_cli_args(sys.argv[1:])
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     icon = load_app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
     apply_dark_theme(app)
-    initial_file = sys.argv[1] if len(sys.argv) > 1 else None
-    win = MainWindow(initial_file=initial_file)
+    win = MainWindow(
+        initial_file=cli_args.file,
+        initial_audio=cli_args.audio,
+        initial_vocal=cli_args.vocal,
+    )
     if not icon.isNull():
         win.setWindowIcon(icon)
     win.show()
