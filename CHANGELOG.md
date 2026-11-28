@@ -5,6 +5,20 @@ All notable changes to **Matt Joy Karaoke Builder** will be documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2026-11-27
+
+### Added
+- **16:9 Safe-Area Page Borders & Width Warnings in Tap Sync:**
+  - Added vertical 16:9 safe-area guide borders to the **Tap Sync** rolling teleprompter, scaled 1:1 from the active `.kbp` style template font and margins (`1920×1080` logical width matching the Live Preview).
+  - Renders the active teleprompter line in the active KBP style font (including uppercase mode) with crisp border ticks and a live width percentage readout that flags lines approaching (`≥90%`, amber) or exceeding (`>100%`, red) the 16:9 border.
+  - Highlights near-border and overflowing unsynced lines in the sidebar tree with per-line 16:9 width tooltips (`%` and active font/size), updating automatically when switching `.kbp` style templates.
+- **Double-Click Single-Page Lyrics Editor in Tap Sync:**
+  - Double-clicking any line in the **Tap Sync** teleprompter or any page/line in the sidebar opens a focused **Edit Page Lyrics** dialog (`Ctrl+Enter` to apply) with live 16:9 border-fit feedback for the widest line on the page.
+  - Supports inserting blank lines to split a page into multiple pages (or clearing all text to remove an empty page) while preserving styles, alignment, and existing syllable timestamps on unchanged lines, keeping focus on the edited page.
+- **Undo / Redo for Tap Sync Lyric Edits (`Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z`):**
+  - Added Undo/Redo history for Tap Sync lyric edits (both full **Edit Lyrics** and single-page **Edit Page Lyrics**), wired into the **Edit** menu with descriptive action labels.
+  - Scoped main-window Undo/Redo shortcuts to `WindowShortcut` so modal text editors retain native `Ctrl+Z` / `Ctrl+Y` text editing.
+
 ## [1.1.3] - 2026-11-27
 
 ### Added
